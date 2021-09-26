@@ -1,5 +1,6 @@
 import h5py
-
+import os.path
+import numpy as np
 
 class Data(object):
 
@@ -16,23 +17,42 @@ class Hdf5(object):
     def __init__(self, model_id, file_path, api): #Pass through model object here instead?
         self.model_id = model_id
         self.path = os.path.join(file_path, model_id + ".h5")
-        self._check_h5_exists(module_id, self.path)
-        self.api_exists = self._check_api_exists(self.path, api)
+        self._check_h5_exists()
+        self.api = api
+        self.api_exists = self._check_api_exists()
         if self.api_exists:
-            self.key_indices = self._get_indices_by_key(self.path, api)
+            self.key_indices = self._get_indices_by_key()
 
 
-    #def write_api(self, api, iter):
-        #with h5py.File() as f:
+    def write_api(self, keys, iter):
+        with h5py.File(self.path, "a") as f:
+            new_keys = np.array(keys)
+            np_arr = np.fromiter(iter, 'float64')  # Assume worst case numeric - check after here
+            if self.api_exists:
+                grp = f.get(self.api)
+                grp["Keys"].resize((grp["Keys"].shape[0] + new_keys.shape[0]), axis = 0)
+                grp["Keys"][-new_keys.shape[0]:] = new_keys
 
-    #def read_api(self, api):
-        #with h5py.File(self.path, "r") as f:
+                grp["Values"].resize((grp["Values"].shape[0] + np_arr.shape[0]), axis = 0)
+                grp["Values"][-np_arr.shape[0]:] = np_arr
+            else:
+                grp = f.create_group(self.api)
+                print(new_keys.shape, np_arr.shape)
+                grp.create_dataset("Keys", new_keys, maxshape=(None), chunks=True) #<-- Problem here with maxshape?
+                grp.create_dataset("Values", np_arr, maxshape=(None), chunks=True) #<--
 
+    def read_api(self, api):
+        if self.api_exists:
+            with h5py.File(self.path, "r") as f:
+                return f.get(self.api + "/Values").items()
+        return False
 
-    # Change to h5py file management
-    def _get_indices_by_key(self, path, api):
-        with h5py.File(path, "r") as f:
-            keys = f.get(api).keys()
+    def _resolve_dtype_clash(self, curr_h5, new_data):
+        pass
+
+    def _get_indices_by_key(self):
+        with h5py.File(self.path, "r") as f:
+            keys = f.get(self.api).keys()
             indices = {k:i for i,k in enumerate(keys)}
         return indices
 
@@ -52,13 +72,18 @@ class Hdf5(object):
     def query(self):
         pass
 
-    def _check_h5_exists(self, module_id, file_path):
-        if not os.path.isfile(file_path):
-            f = h5py.File(module_id + ".h5", "w")
-            f.close() #with
+    def _check_h5_exists(self):
+        if not os.path.isfile(self.path):
+            f = h5py.File(os.path.join(self.path), "w")
+            f.close()
 
-    def _check_api_exists(self, path, api):
-        with h5py.File(path, "w") as f:
-            if api in f.keys():
+    def _check_api_exists(self):
+        with h5py.File(self.path, "r") as f:
+            if self.api in f.keys():
                 return True
             return False
+
+if __name__ == "__main__":  #TESTING
+    h = Hdf5("eos4e40", "/home/jason/", "Predict")
+    h.write_api([0,1,2,3,4,5, 6, 7] , iter([10, 20, 30, 40, 50, 60, 60, 70]))
+    #print(h.read_api("Predict"))
