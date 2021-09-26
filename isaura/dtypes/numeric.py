@@ -108,7 +108,6 @@ class NumericDataTyper(object):
     def _is_integer(self):
         for x in self.ary_flat:
             if not np.equal(np.mod(x, 1), 0):
-            #if not isinstance(x, int):
                 return False
         return True
 
