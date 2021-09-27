@@ -27,7 +27,17 @@ class Hdf5(object):
     def write_api(self, keys, iter):
         with h5py.File(self.path, "a") as f:
             new_keys = np.array(keys)
-            np_arr = np.array(list(iter))  #TO DO Change this initial read
+            new_values = list(iter)
+            new_values = [tuple(x) for x in new_values] #TO DO optimise this
+
+            dtypes = ''
+            for i in new_values[0]:
+                dtypes += 'float32, '   #TO DO Edit individual data types with NumericalDataTyper here
+            dtypes = dtypes[:-2]
+
+            np_arr = np.array(new_values, dtype=np.dtype(dtypes))
+
+            #TO DO manage missing data/+inf/-inf
 
             if self.api_exists:
                 grp = f.get(self.api)
@@ -39,7 +49,8 @@ class Hdf5(object):
             else:
                 grp = f.create_group(self.api)
                 grp.create_dataset("Keys", shape=new_keys.shape, data=new_keys, maxshape=(None, new_keys.shape[1]), chunks=True)
-                grp.create_dataset("Values", shape=np_arr.shape, data=np_arr, maxshape=(None,np_arr.shape[1]), chunks=True)
+                grp.create_dataset("Values", shape=np_arr.shape, data=np_arr, maxshape=(None, ), chunks=True)
+                self.api_exists = True
 
     def read_api(self):
         if self.api_exists:
@@ -87,5 +98,6 @@ class Hdf5(object):
 if __name__ == "__main__":  #TESTING
     h = Hdf5("eos4e40", "/home/jason/", "Predict")
     h.write_api([[0,1,2,3,4,5, 6, 7], [11, 12, 13, 14, 15, 16, 17, 18]] , iter([[10, 20, 30, 40, 50, 60, 60, 70], [110, 120, 130, 140, 150, 160, 170, 180]]))
+    #h.write_api([[0, 1, 2], [11, 12, 13]], iter([[10, 20, 30], [110, 120, 130]]))
     for i in h.read_api():
         print(i)
