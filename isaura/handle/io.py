@@ -27,7 +27,8 @@ class Hdf5(object):
     def write_api(self, keys, iter):
         with h5py.File(self.path, "a") as f:
             new_keys = np.array(keys)
-            np_arr = np.fromiter(iter, 'float64')  # Assume worst case numeric - check after here
+            np_arr = np.array(list(iter))  #TO DO Change this initial read
+
             if self.api_exists:
                 grp = f.get(self.api)
                 grp["Keys"].resize((grp["Keys"].shape[0] + new_keys.shape[0]), axis = 0)
@@ -37,14 +38,14 @@ class Hdf5(object):
                 grp["Values"][-np_arr.shape[0]:] = np_arr
             else:
                 grp = f.create_group(self.api)
-                print(new_keys.shape, np_arr.shape)
-                grp.create_dataset("Keys", new_keys, maxshape=(None), chunks=True) #<-- Problem here with maxshape?
-                grp.create_dataset("Values", np_arr, maxshape=(None), chunks=True) #<--
+                grp.create_dataset("Keys", shape=new_keys.shape, data=new_keys, maxshape=(None, new_keys.shape[1]), chunks=True)
+                grp.create_dataset("Values", shape=np_arr.shape, data=np_arr, maxshape=(None,np_arr.shape[1]), chunks=True)
 
-    def read_api(self, api):
+    def read_api(self):
         if self.api_exists:
             with h5py.File(self.path, "r") as f:
-                return f.get(self.api + "/Values").items()
+                for data in f.get(self.api)["Values"]:
+                    yield data
         return False
 
     def _resolve_dtype_clash(self, curr_h5, new_data):
@@ -85,5 +86,6 @@ class Hdf5(object):
 
 if __name__ == "__main__":  #TESTING
     h = Hdf5("eos4e40", "/home/jason/", "Predict")
-    h.write_api([0,1,2,3,4,5, 6, 7] , iter([10, 20, 30, 40, 50, 60, 60, 70]))
-    #print(h.read_api("Predict"))
+    h.write_api([[0,1,2,3,4,5, 6, 7], [11, 12, 13, 14, 15, 16, 17, 18]] , iter([[10, 20, 30, 40, 50, 60, 60, 70], [110, 120, 130, 140, 150, 160, 170, 180]]))
+    for i in h.read_api():
+        print(i)
