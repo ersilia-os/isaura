@@ -1,3 +1,6 @@
+from ..core.base import IsauraBase
+
+
 class Writer(IsauraBase):
 
     def __init__(self, model_id, api_name):

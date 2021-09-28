@@ -23,5 +23,5 @@ class IsauraBase(object):
     def data_path(self):
         return os.path.join(self.repository_path, self.file_name)
 
-    def exists(self):
-        return os.path.exists(self.data_path)
+    def _check_h5_exists(self):
+        return os.path.isfile(self.data_path)
