@@ -48,7 +48,7 @@ class Hdf5(object):
                 grp["Values"][-np_arr.shape[0]:] = np_arr
             else:
                 grp = f.create_group(self.api)
-                grp.create_dataset("Keys", shape=new_keys.shape, data=new_keys, maxshape=(None, new_keys.shape[1]), chunks=True)
+                grp.create_dataset("Keys", shape=new_keys.shape, data=new_keys, maxshape=(None, ), chunks=True)
                 grp.create_dataset("Values", shape=np_arr.shape, data=np_arr, maxshape=(None, ), chunks=True)
                 self.api_exists = True
 
@@ -59,12 +59,15 @@ class Hdf5(object):
                     yield data
         return False
 
+    def _filter_existing(self):
+        pass
+
     def _resolve_dtype_clash(self, curr_h5, new_data):
         pass
 
     def _get_indices_by_key(self):
         with h5py.File(self.path, "r") as f:
-            keys = f.get(self.api).keys()
+            keys = f.get(self.api)["Keys"]
             indices = {k:i for i,k in enumerate(keys)}
         return indices
 
@@ -97,7 +100,6 @@ class Hdf5(object):
 
 if __name__ == "__main__":  #TESTING
     h = Hdf5("eos4e40", "/home/jason/", "Predict")
-    h.write_api([[0,1,2,3,4,5, 6, 7], [11, 12, 13, 14, 15, 16, 17, 18]] , iter([[10, 20, 30, 40, 50, 60, 60, 70], [110, 120, 130, 140, 150, 160, 170, 180]]))
-    #h.write_api([[0, 1, 2], [11, 12, 13]], iter([[10, 20, 30], [110, 120, 130]]))
+    #h.write_api([0,1], iter([[10, 20, 30, 40, 50, 60, 60, 70], [110, 120, 130, 140, 150, 160, 170, 180]]))
     for i in h.read_api():
         print(i)
