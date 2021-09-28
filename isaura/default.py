@@ -14,4 +14,10 @@ LOGGING_FILE = "console.log"
 SILENCE_FILE = ".silence.json"
 VERBOSE_FILE = ".verbose.json"
 
+## filesystem
+
+REPOSITORY_PATH = os.path.join(ISAURA, "repository")
+if not os.path.exists(REPOSITORY_PATH):
+    os.makedirs(REPOSITORY_PATH)
+
 HDF5_EXTENSION = "h5"
