@@ -21,3 +21,6 @@ if not os.path.exists(REPOSITORY_PATH):
     os.makedirs(REPOSITORY_PATH)
 
 HDF5_EXTENSION = "h5"
+
+VALUES = "Values"
+KEYS = "Keys"
