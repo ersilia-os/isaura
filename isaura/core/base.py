@@ -1,4 +1,5 @@
 import os
+import h5py
 from ..default import REPOSITORY_PATH
 from ..default import HDF5_EXTENSION
 from .. import logger
@@ -25,3 +26,9 @@ class IsauraBase(object):
 
     def _check_h5_exists(self):
         return os.path.isfile(self.data_path)
+
+    def _check_api_exists(self, api_name):
+        with h5py.File(self.data_path, "r") as f:
+            if api_name in f.keys():
+                return True
+            return False
