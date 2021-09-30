@@ -14,57 +14,60 @@ class Ranges(object):
     def uint8(self):
         dtype = np.uint8
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def uint16(self):
         dtype = np.uint16
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def uint32(self):
         dtype = np.uint32
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def uint64(self):
         dtype = np.uint64
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def int8(self):
         dtype = np.int8
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def int16(self):
         dtype = np.int16
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def int32(self):
         dtype = np.int32
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def int64(self):
         dtype = np.int64
         info = np.iinfo(dtype)
-        return (dtype, info.min, info.max-3)
+        return (dtype, info.min, info.max-1)
 
     def float16(self):
         dtype = np.float16
         info = np.finfo(dtype)
-        return (dtype, info.min, info.max-3)
+        precision = 3
+        return (dtype, info.min, info.max-1, precision)
 
     def float32(self):
         dtype = np.float32
         info = np.finfo(dtype)
-        return (dtype, info.min, info.max-3)
+        precision = 7
+        return (dtype, info.min, info.max-1, precision)
 
     def float64(self):
         dtype = np.float64
         info = np.finfo(dtype)
-        return (dtype, info.min, info.max-3)
+        precision = 15
+        return (dtype, info.min, info.max-1, precision)
 
     def is_in_range(self, type, min_value, max_value):
         if min_value < type[1]:
@@ -73,22 +76,28 @@ class Ranges(object):
             return False
         return True
 
-    def smallest_dtype(self, data_type, min_value, max_value):  #Determine smallest applicable container
-        dtype = data_type[-1][0]    #Default to largest size
-        for d in data_type:
+    def smallest_dtype(self, type_list, min_value, max_value):  #Determine smallest applicable container
+        dtype = type_list[-1][0]    #Default to largest size
+        for d in type_list:
             if self.is_in_range(d, min_value, max_value):
                 dtype = d[0]
                 break
         return dtype
 
-    def best(self, is_integer, min_value, max_value):   #Split into data types then make call for sizing
-        if is_integer:
-            if min_value > 0:   #Integer and only positive
-                dtype = self.smallest_dtype(self.uints, min_value, max_value)
-            else:               #Integer and negative values
-                dtype = self.smallest_dtype(self.ints, min_value, max_value)
-        else:                   #Floats
-            dtype = self.smallest_dtype(self.floats, min_value, max_value)
+    def best_int(self, min_value, max_value):   #Split into data types then make call for sizing
+        if min_value > 0:
+            dtype = self.smallest_dtype(self.uints, min_value, max_value)
+        else:
+            dtype = self.smallest_dtype(self.ints, min_value, max_value)
+        return dtype
+    
+    def best_float(self, min_value, max_value, max_decimals):
+        float_list = self.floats
+        dtype = float_list[-1][0]  # Default to largest size
+        for f in float_list:
+            if self.is_in_range(f, min_value, max_value) and max_decimals < f[3]: #Check range and precision
+                dtype = f[0]
+                break
         return dtype
 
 
@@ -111,11 +120,23 @@ class NumericDataTyper(object):
                 return False
         return True
 
+    def _count_decimals(self):
+        most_decimals = 0
+        for x in self.ary_flat:
+            x_str = str(x)
+            decimals = len(x_str) - x_str.index(".")-1
+            if decimals > most_decimals:
+                most_decimals = decimals
+        return most_decimals
+
     def actual(self):
         return self._dtype_orig
 
     def best(self):
-        return self._ranges.best(self.is_integer, self.min, self.max)
+        if self.is_integer:
+            return self._ranges.best_int(self.min, self.max)
+        else:
+            return self._ranges.best_float(self.min, self.max, self._count_decimals())
 
     def data_size(self, dt):    #Byte size of data type
         return np.dtype(dt).itemsize

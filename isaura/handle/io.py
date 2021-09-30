@@ -1,6 +1,7 @@
 import h5py
 import os.path
 import numpy as np
+from isaura.dtypes.numeric import NumericDataTyper
 
 class Data(object):
 
@@ -28,16 +29,23 @@ class Hdf5(object):
         with h5py.File(self.path, "a") as f:
             new_keys = np.array(keys)
             new_values = list(iter)
-            new_values = [tuple(x) for x in new_values] #TO DO optimise this
+
+            #TO DO manage empty values here
+            #TO DO filter out values that already exist
 
             dtypes = ''
-            for i in new_values[0]:
-                dtypes += 'float32, '   #TO DO Edit individual data types with NumericalDataTyper here
-            dtypes = dtypes[:-2]
+            for i in np.transpose(new_values):  #TO DO check all Nan cols
+                dtyper = NumericDataTyper(i)
+                dtypes += str(np.dtype(dtyper.best())) + ","
+            dtypes = dtypes[:-1]
 
+            #Loop through new datatypes against current h5 file datatypes
+            #Upcast data if necessary
+
+            new_values = [tuple(x) for x in new_values]
             np_arr = np.array(new_values, dtype=np.dtype(dtypes))
+            print(dtypes)
 
-            #TO DO manage missing data/+inf/-inf
 
             if self.api_exists:
                 grp = f.get(self.api)
@@ -100,6 +108,6 @@ class Hdf5(object):
 
 if __name__ == "__main__":  #TESTING
     h = Hdf5("eos4e40", "/home/jason/", "Predict")
-    #h.write_api([0,1], iter([[10, 20, 30, 40, 50, 60, 60, 70], [110, 120, 130, 140, 150, 160, 170, 180]]))
+    h.write_api([0,1], iter([[10, 20, 30], [1.98455484, 120, -130.2]]))
     for i in h.read_api():
-        print(i)
+        print(i, np.dtype(i))
