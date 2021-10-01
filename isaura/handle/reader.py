@@ -1,7 +1,6 @@
 from ..core.base import IsauraBase
 import h5py
 
-
 class Reader(IsauraBase):
 
     def __init__(self, model_id):
@@ -16,14 +15,16 @@ class Reader(IsauraBase):
     def yield_api(self, api_name):
         if self._check_api_exists(api_name):
             with h5py.File(self.data_path, "r") as f:
-                for data in f.get(api_name)["Values"]:
-                    yield data
+                for key, data in zip(f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]):
+                    yield key, data
             return True
         return False
 
-    def _get_indices_by_key(self):
+    def _get_keys(self, api_name):
         with h5py.File(self.data_path, "r") as f:
-            keys = f.get(self.api)["Keys"]
-            indices = {k:i for i,k in enumerate(keys)}
-        return indices
+            keys = list(f.get(api_name)["Keys"].asstr())
+        return keys
+
+    def _decode(self):
+        pass
 

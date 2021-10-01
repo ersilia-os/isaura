@@ -1,22 +1,35 @@
-
+from ..core.base import IsauraBase
+from ..handle.reader import Reader
+import h5py
+import numpy as np
 
 class Mapper(IsauraBase):
 
-    def __init__(self, model_id):
+    def __init__(self, model_id, api_name):
         IsauraBase.__init__(self, model_id)
-        self.reader = Hdf5Reader(self.data_path)
+        self.reader = Reader(model_id)
+        self.api_name = api_name
 
-    def map_keys(self, keys):
-        keys_set = set(keys)
-        avail_keys = {}
-        for i, key in enumerate(self.reader):
-            if key in keys_set:
-                avail_keys[key] = i
-        unavail_keys = keys_set.difference(avail_keys.keys())
+    def check_keys(self, new_keys):
+        keys_set, keys_list = set(new_keys), list(new_keys)
+        curr_api_keys = set(self.reader._get_keys(self.api_name))
+        avail_keys, unavail_keys = {}, {}
+
+        for k in keys_set:
+            if k not in curr_api_keys:
+                avail_keys[k] = keys_list.index(k)
+        unavail_keys = keys_set.difference(avail_keys)
         result = {
             "available_keys": avail_keys,
             "unavailable_keys": unavail_keys
         }
+
         return result
+
+    def map_keys(self, api_name):
+        with h5py.File(self.data_path, "r") as f:
+            keys = f.get(api_name)["Keys"].asstr()
+            indices = {k:i for i,k in enumerate(keys)}
+        return indices
 
     
