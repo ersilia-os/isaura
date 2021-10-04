@@ -26,10 +26,4 @@ class Mapper(IsauraBase):
 
         return result
 
-    def map_keys(self, api_name):
-        with h5py.File(self.data_path, "r") as f:
-            keys = f.get(api_name)["Keys"].asstr()
-            indices = {k:i for i,k in enumerate(keys)}
-        return indices
-
     

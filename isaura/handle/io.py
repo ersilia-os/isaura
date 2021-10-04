@@ -37,5 +37,6 @@ if __name__ == "__main__":  #TESTING
     w.write("Predict", iter(["c","d"]), iter([[10, np.nan, 30], [1.98455484, 120, -130.2]]))
 
     r = Reader("eos4e40")
-    for key, record in r.yield_api("Predict"):
-        print(str(key), record)
+    #r.read_by_key("Predict", ["c", "d"])
+    #for record in r.read_by_key("Predict", ["c", "e"]):
+        #print(record)
