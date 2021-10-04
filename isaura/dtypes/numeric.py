@@ -54,19 +54,19 @@ class Ranges(object):
     def float16(self):
         dtype = np.float16
         info = np.finfo(dtype)
-        precision = 3
+        precision = info.precision
         return (dtype, info.min, info.max-1, precision)
 
     def float32(self):
         dtype = np.float32
         info = np.finfo(dtype)
-        precision = 7
+        precision = info.precision
         return (dtype, info.min, info.max-1, precision)
 
     def float64(self):
         dtype = np.float64
         info = np.finfo(dtype)
-        precision = 15
+        precision = info.precision
         return (dtype, info.min, info.max-1, precision)
 
     def is_in_range(self, type, min_value, max_value):
@@ -108,15 +108,15 @@ class NumericDataTyper(object):
 
     def __init__(self, ary):
         self.ary_flat = ary.ravel()
-        self.min = np.min(ary)
-        self.max = np.max(ary)
+        self.min = np.nanmin(ary)
+        self.max = np.nanmax(ary)
         self.is_integer = self._is_integer()
         self._ranges = Ranges()
-        self._dtype_orig = np.dtype(ary[0])
+        self._dtype_orig = np.dtype(ary[0]) #Cater for NaNs here
 
     def _is_integer(self):
         for x in self.ary_flat:
-            if not np.equal(np.mod(x, 1), 0):
+            if not np.isnan(x) and not np.equal(np.mod(x, 1), 0): #Not NaN and 0 modulo
                 return False
         return True
 
