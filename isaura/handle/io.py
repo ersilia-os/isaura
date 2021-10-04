@@ -34,7 +34,7 @@ class Hdf5(object):
 
 if __name__ == "__main__":  #TESTING
     w = Writer("eos4e40")
-    w.write("Predict", iter(["c","b"]), iter([[10, 20, 30], [1.98455484, 120, -130.2]]))
+    w.write("Predict", iter(["c","d"]), iter([[10, np.nan, 30], [1.98455484, 120, -130.2]]))
 
     r = Reader("eos4e40")
     for key, record in r.yield_api("Predict"):

@@ -1,6 +1,6 @@
 from ..core.base import IsauraBase
 from ..handle.mapper import Mapper
-from isaura.dtypes.numeric import NumericDataTyper
+#from isaura.dtypes.numeric import NumericDataTyper
 import h5py
 import numpy as np
 
@@ -15,21 +15,25 @@ class Writer(IsauraBase):
         arr_keys = np.array(list(keys), h5py.string_dtype())     #dtype='<S27')   #InChi Keys??
         arr_values = np.array(list(input))
 
+
+
         #TO DO manage empty values here
         #TO DO manage batching/large datasets before here
 
 
-        ### Storage Optimisation Code - Implement Later ###
+        ### Storage Optimisation Code - Implement Fully Later ###
         #new_values = list(input)
-        #dtypes = ''
-        #for i in np.transpose(new_values):  #TO DO check all Nan cols
+        dtypes = []
+        for i in np.transpose(arr_values):
             #dtyper = NumericDataTyper(i)
             #dtypes += str(np.dtype(dtyper.best())) + ","
-        #dtypes = dtypes[:-1]
+            dtypes.append(np.finfo(np.float32))
+        dtypes = dtypes[:-1]
 
-        #ew_values = [tuple(x) for x in new_values]
+        #new_values = [tuple(x) for x in new_values]
         #np_arr = np.array(new_values, dtype=np.dtype(dtypes))
 
+        self._encode(arr_values, dtypes)
 
         if self._check_api_exists(api_name):
             new_keys, new_values = self._filter_keys(api_name, arr_keys, arr_values)
@@ -70,5 +74,9 @@ class Writer(IsauraBase):
 
         return np.array(new_keys), np.array(new_values)
 
-    def _encode(self):
-        pass
+    def _encode(self, data, dtypes):
+        for line in data:
+            for index, element in enumerate(line):
+                if np.isnan(element):
+                    line[index] = dtypes[index].max
+

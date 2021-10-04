@@ -1,5 +1,6 @@
 from ..core.base import IsauraBase
 import h5py
+import numpy as np
 
 class Reader(IsauraBase):
 
@@ -16,7 +17,7 @@ class Reader(IsauraBase):
         if self._check_api_exists(api_name):
             with h5py.File(self.data_path, "r") as f:
                 for key, data in zip(f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]):
-                    yield key, data
+                    yield key, self._decode(data)
             return True
         return False
 
@@ -25,6 +26,9 @@ class Reader(IsauraBase):
             keys = list(f.get(api_name)["Keys"].asstr())
         return keys
 
-    def _decode(self):
-        pass
-
+    def _decode(self, data):
+        d = data
+        for index, element in enumerate(d):
+            if element.dtype.type == np.float32 and element == np.finfo(np.float32).max:
+                d[index] = np.nan
+        return d
