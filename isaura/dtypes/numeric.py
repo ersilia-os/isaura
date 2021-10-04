@@ -100,7 +100,10 @@ class Ranges(object):
                 break
         return dtype
 
-
+    def max_of_type(self, my_dtype):
+        for dt in self.floats:
+            if my_dtype.dtype == dt[0]:
+                return dt[2]
 
 
 

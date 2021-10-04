@@ -1,4 +1,5 @@
 from ..core.base import IsauraBase
+from..dtypes.numeric import Ranges
 import h5py
 import numpy as np
 
@@ -6,6 +7,7 @@ class Reader(IsauraBase):
 
     def __init__(self, model_id):
         IsauraBase.__init__(self, model_id)
+        self.ranges = Ranges()
 
     def read_by_idx(self, api_name, idxs):
         pass
@@ -29,6 +31,6 @@ class Reader(IsauraBase):
     def _decode(self, data):
         d = data
         for index, element in enumerate(d):
-            if element.dtype.type == np.float32 and element == np.finfo(np.float32).max:
+            if element == self.ranges.max_of_type(element):
                 d[index] = np.nan
         return d
