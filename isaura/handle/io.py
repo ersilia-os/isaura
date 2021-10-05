@@ -1,6 +1,8 @@
 import numpy as np
+from isaura.core.base import IsauraBase
 from isaura.handle.reader import Reader
 from isaura.handle.writer import Writer
+from isaura.handle.mapper import Mapper
 
 class Data(object):
 
@@ -11,32 +13,45 @@ class Data(object):
         self.vals = vals
 
 
-class Hdf5(object):
+class Hdf5(IsauraBase):
 
+    def __init__(self, model_id):
+        IsauraBase.__init__(self, model_id)
+        self.r = Reader(self.model_id)
+        self.w = Writer(self.model_id)
+        self.m = Mapper(self.model_id)
 
-    def __init__(self, model_id): #Pass through model object here instead?
-        self.model_id = model_id
+    def read_api(self, api_name):
+        return self.r.yield_api(api_name)
 
-    def write_api(self, keys, iter):
-        pass
+    def list_apis(self):
+        return self.r.get_apis()
 
-    def _filter_existing(self):
-        pass
+    def list_keys(self, api_name):
+        return self.r._get_keys(api_name)
+
+    def read_by_key(self, api_name, key_list):
+        return self.r.read_by_key(api_name, key_list)
+
+    def read_by_index(self, api_name, index_list):
+        return self.r.read_by_idx(api_name, index_list)
+
+    def check_exists(self, api_name, key_list):
+        return self.m.check_keys(api_name, key_list)
+
+    def filter_keys(self, api_name, keys, values):
+        arr_keys = np.array(keys)
+        arr_values = np.array(list(values))
+        return self.w._filter_keys(api_name, keys, values)
+
+    def write_api(self, api_name, keys, values):
+        self.w.write(api_name, keys, values)
 
     def _resolve_dtype_clash(self, curr_h5, new_data):
         pass
 
-    def insert(self, data):
-        pass
-
-    def query(self):
-        pass
-
 if __name__ == "__main__":  #TESTING
-    w = Writer("eos4e40")
-    w.write("Predict", iter(["c","d"]), iter([[10, np.nan, 30], [1.98455484, 120, -130.2]]))
-
-    r = Reader("eos4e40")
-    #r.read_by_key("Predict", ["c", "d"])
-    #for record in r.read_by_key("Predict", ["c", "e"]):
-        #print(record)
+    h = Hdf5("eos4e40")
+    h.write_api("Predict", ["f","e"], [[90, 80, 70], [60, 50, 40]])
+    for line in h.read_api("Predict"):
+        print(line)

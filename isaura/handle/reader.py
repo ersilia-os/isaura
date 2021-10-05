@@ -16,10 +16,10 @@ class Reader(IsauraBase):
 
     def read_by_key(self, api_name, keys):
         with h5py.File(self.data_path, "r") as f:
-            key_index_list = self._index_keys(api_name)
+            key_index_dict = self._index_keys(api_name)
             for k in keys:      #Optimise this with batching?
-                if k in key_index_list.keys():  #If query key is in h5py key list
-                    pos = key_index_list[k]
+                if k in key_index_dict.keys():
+                    pos = key_index_dict[k]
                     yield self._decode(f.get(api_name)["Values"][pos])
 
     def yield_api(self, api_name):
@@ -29,6 +29,10 @@ class Reader(IsauraBase):
                     yield key, self._decode(data)
             return True
         return False
+
+    def get_apis(self):
+        with h5py.File(self.data_path, "r") as f:
+            return list(f.keys())
 
     def _get_keys(self, api_name):
         with h5py.File(self.data_path, "r") as f:

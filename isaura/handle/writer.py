@@ -12,14 +12,10 @@ class Writer(IsauraBase):
         self._create_h5(model_id)
 
     def write(self, api_name, keys, input):
-        arr_keys = np.array(list(keys), h5py.string_dtype())     #dtype='<S27')   #InChi Keys??
+        arr_keys = np.array(list(keys), h5py.string_dtype())
         arr_values = np.array(list(input))
 
-
-
-        #TO DO manage empty values here
         #TO DO manage batching/large datasets before here
-
 
         ### Storage Optimisation Code - Implement Fully Later ###
         #new_values = list(input)
@@ -64,9 +60,9 @@ class Writer(IsauraBase):
             f.close()
 
     def _filter_keys(self, api_name, arr_keys, arr_values):
-        m = Mapper(self.model_id, api_name)
+        m = Mapper(self.model_id)
         new_keys, new_values = [], []
-        filter = m.check_keys(arr_keys)["available_keys"]
+        filter = m.check_keys(api_name, arr_keys)["available_keys"]
         for k, i in zip(filter.keys(), filter.values()):
             if k is not None:
                 new_keys.append(k)
