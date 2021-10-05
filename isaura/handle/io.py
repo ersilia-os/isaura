@@ -47,11 +47,17 @@ class Hdf5(IsauraBase):
     def write_api(self, api_name, keys, values):
         self.w.write(api_name, keys, values)
 
+    def merge(self, old_model, old_api_name, curr_api):
+        reader = Reader(old_model)
+        for key, value in reader.yield_api(old_api_name):   #Inefficient
+            self.w.write(curr_api, key, value)
+
     def _resolve_dtype_clash(self, curr_h5, new_data):
         pass
 
 if __name__ == "__main__":  #TESTING
     h = Hdf5("eos4e40")
-    h.write_api("Predict", ["f","e"], [[90, 80, 70], [60, 50, 40]])
+    h.write_api("Predict", ["y","z"], [[90, np.nan, 70], [61, 51, 41]])
+    h.merge("eos4e40_1", "Predict", "Predict")
     for line in h.read_api("Predict"):
         print(line)

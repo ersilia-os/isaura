@@ -25,11 +25,16 @@ class Writer(IsauraBase):
             #dtypes += str(np.dtype(dtyper.best())) + ","
             dtypes.append(np.finfo(np.float32))
         dtypes = dtypes[:-1]
-
         #new_values = [tuple(x) for x in new_values]
         #np_arr = np.array(new_values, dtype=np.dtype(dtypes))
 
-        self._encode(arr_values, dtypes)
+
+        if len(arr_values.shape) >1:
+            for record in arr_values:
+                self._encode(record, dtypes)
+        else:
+            self._encode(arr_values, dtypes)
+
 
         if self._check_api_exists(api_name):
             new_keys, new_values = self._filter_keys(api_name, arr_keys, arr_values)
@@ -71,8 +76,7 @@ class Writer(IsauraBase):
         return np.array(new_keys), np.array(new_values)
 
     def _encode(self, data, dtypes):
-        for line in data:
-            for index, element in enumerate(line):
-                if np.isnan(element):
-                    line[index] = dtypes[index].max
+        for index, element in enumerate(data):
+            if np.isnan(element):
+                data[index] = dtypes[index].max
 
