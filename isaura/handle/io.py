@@ -4,14 +4,6 @@ from isaura.handle.reader import Reader
 from isaura.handle.writer import Writer
 from isaura.handle.mapper import Mapper
 
-class Data(object):
-
-    def __init__(self, keys, inps, txts, vals):
-        self.keys = keys
-        self.inps = inps
-        self.txts = txts
-        self.vals = vals
-
 
 class Hdf5(IsauraBase):
 
