@@ -11,9 +11,17 @@ class Writer(IsauraBase):
         IsauraBase.__init__(self, model_id)
         self._create_h5(model_id)
 
+    def _unique_keys(self, keys):
+        _, idxs = np.unique(keys, return_index=True)
+        return idxs
+
     def write(self, api_name, keys, input):
         arr_keys = np.array(list(keys), h5py.string_dtype())
         arr_values = np.array(list(input))
+
+        idxs = self._unique_keys(arr_keys)
+        arr_keys = arr_keys[idxs]
+        arr_values = arr_values[idxs]
 
         #TO DO manage batching/large datasets before here
 
@@ -79,4 +87,3 @@ class Writer(IsauraBase):
         for index, element in enumerate(data):
             if np.isnan(element):
                 data[index] = dtypes[index].max
-
