@@ -24,3 +24,4 @@ HDF5_EXTENSION = "h5"
 
 VALUES = "Values"
 KEYS = "Keys"
+FEATURES = "Features"
