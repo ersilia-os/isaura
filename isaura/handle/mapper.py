@@ -10,19 +10,15 @@ class Mapper(IsauraBase):
         self.reader = Reader(model_id)
 
     def check_keys(self, api_name, new_keys):
-        keys_set, keys_list = set(new_keys), list(new_keys)
         curr_api_keys = set(self.reader._get_keys(api_name))
         avail_keys, unavail_keys = {}, {}
-
-        for k in keys_set:
-            if k not in curr_api_keys:
-                avail_keys[k] = keys_list.index(k)
-        unavail_keys = keys_set.difference(avail_keys)
+        for i,k in enumerate(new_keys):
+            if k in curr_api_keys:
+                avail_keys[k] = i
+            else:
+                unavail_keys[k] = i
         result = {
             "available_keys": avail_keys,
             "unavailable_keys": unavail_keys
         }
-
         return result
-
-    

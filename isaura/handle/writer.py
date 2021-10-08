@@ -75,7 +75,7 @@ class Writer(IsauraBase):
     def _filter_keys(self, api_name, arr_keys, arr_values):
         m = Mapper(self.model_id)
         new_keys, new_values = [], []
-        filter = m.check_keys(api_name, arr_keys)["available_keys"]
+        filter = m.check_keys(api_name, arr_keys)["unavailable_keys"]
         for k, i in zip(filter.keys(), filter.values()):
             if k is not None:
                 new_keys.append(k)
