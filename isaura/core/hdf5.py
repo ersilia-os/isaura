@@ -10,8 +10,11 @@ class Hdf5Explorer(Hdf5):
     def __init__(self, model_id):
         Hdf5.__init__(self, model_id=model_id)
 
-    def exists(self):
-        return self._check_h5_exists()
+    def local_h5_exists(self):
+        return self._check_h5_exists(self.local_data_path)
+
+    def public_h5_exists(self):
+        return self._check_h5_exists(self.public_data_path)
 
     def apis(self):
         return self.list_apis()
@@ -27,7 +30,7 @@ class Hdf5ApiExplorer(Hdf5):
         Hdf5.__init__(self, model_id=model_id)
         self.set_curr_api(api_name)
 
-    def exists(self):
+    def api_exists(self):
         return self._check_api_exists(self.api_name)
 
     @property
@@ -43,6 +46,6 @@ class Hdf5ApiExplorer(Hdf5):
 if __name__ == "__main__":  #TESTING
     h = Hdf5Explorer("eos4e40")
     h.set_curr_api("Predict")
-    h.write_api(["y","z"], [[90, np.nan, 70], [61, 51, 41]])
-    for line in h.read_api():
-        print(line)
+    h.write_api(["e","d"], [[90, np.nan, 70], [61, 51, 41]])
+    for i in h.read_api():
+        print(i)

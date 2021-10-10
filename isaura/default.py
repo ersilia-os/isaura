@@ -3,7 +3,7 @@ from pathlib import Path
 import os
 
 # system variables
-ISAURA = os.path.join(str(Path.home()), "isaura")
+ISAURA = os.path.join(str(Path.home()), "eos/isaura")
 if not os.path.exists(ISAURA):
     os.makedirs(ISAURA)
 
@@ -16,7 +16,7 @@ VERBOSE_FILE = ".verbose.json"
 
 ## filesystem
 
-REPOSITORY_PATH = os.path.join(ISAURA, "repository")
+REPOSITORY_PATH = os.path.join(ISAURA, "lake")
 if not os.path.exists(REPOSITORY_PATH):
     os.makedirs(REPOSITORY_PATH)
 

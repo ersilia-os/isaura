@@ -5,9 +5,10 @@ import numpy as np
 
 class Reader(IsauraBase):
 
-    def __init__(self, model_id):
+    def __init__(self, data_path, model_id):
         IsauraBase.__init__(self, model_id)
         self.ranges = Ranges()
+        self.data_path = data_path
 
     def read_by_idx(self, api_name, idxs):
         with h5py.File(self.data_path, "r") as f:
@@ -23,11 +24,10 @@ class Reader(IsauraBase):
                     yield self._decode(f.get(api_name)["Values"][pos])
 
     def yield_api(self, api_name):
-        if self._check_api_exists(api_name):
+        if self._check_api_exists(self.data_path, api_name):
             with h5py.File(self.data_path, "r") as f:
                 for key, data in zip(f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]):
                     yield key, self._decode(data)
-            return True
         return False
 
     def get_apis(self):
@@ -35,14 +35,18 @@ class Reader(IsauraBase):
             return list(f.keys())
 
     def _get_keys(self, api_name):
+        keys = []
         with h5py.File(self.data_path, "r") as f:
-            keys = list(f.get(api_name)["Keys"].asstr())
+            if self._check_api_exists(self.data_path, api_name):
+                keys = list(f.get(api_name)["Keys"].asstr())
         return keys
 
     def _index_keys(self, api_name):
+        indices = {}
         with h5py.File(self.data_path, "r") as f:
-            keys = f.get(api_name)["Keys"].asstr()
-            indices = {k:i for i,k in enumerate(keys)}
+            if self._check_api_exists(self.data_path, api_name):
+                keys = f.get(api_name)["Keys"].asstr()
+                indices = {k:i for i,k in enumerate(keys)}
         return indices
 
     def _decode(self, data):

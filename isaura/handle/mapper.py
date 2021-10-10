@@ -7,10 +7,13 @@ class Mapper(IsauraBase):
 
     def __init__(self, model_id):
         IsauraBase.__init__(self, model_id)
-        self.reader = Reader(model_id)
 
-    def check_keys(self, api_name, new_keys):
-        curr_api_keys = set(self.reader._get_keys(api_name))
+    def check_keys(self, api_name, new_keys):   #Change to display which file keys are in?
+        curr_api_keys = set()
+        for file in self.avail_data_files():
+            r = Reader(file, self.model_id)
+            curr_api_keys.update(r._get_keys(api_name))
+
         avail_keys, unavail_keys = {}, {}
         for i,k in enumerate(new_keys):
             if k in curr_api_keys:

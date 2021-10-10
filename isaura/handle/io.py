@@ -4,14 +4,16 @@ from isaura.handle.writer import Writer
 from isaura.handle.mapper import Mapper
 import numpy as np
 
+
 class Hdf5(IsauraBase):
 
     def __init__(self, model_id):
         IsauraBase.__init__(self, model_id)
-        self.r = Reader(self.model_id)
         self.w = Writer(self.model_id)
         self.m = Mapper(self.model_id)
         self.api_name = ""
+
+    #TO DO optimisiation: if keys found in one file then remove them from search in next file
 
     def set_curr_api(self, api):
         self.api_name = api
@@ -20,22 +22,37 @@ class Hdf5(IsauraBase):
         return self.api_name
 
     def read_api(self):
-        return self.r.yield_api(self.api_name)
+        for file in self._get_readers():
+            for entry in file.yield_api(self.api_name):
+                yield entry
 
     def list_apis(self):
-        return self.r.get_apis()
+        api_set = set()
+        for reader in self._get_readers():
+            api_set.update(reader.get_apis())
+        return api_set
 
     def list_keys(self):
-        return self.r._get_keys(self.api_name)
+        keys = []
+        for reader in self._get_readers():
+            if reader._check_api_exists(reader.data_path, self.api_name):
+                keys.append(reader._get_keys(self.api_name))
+        return keys
 
     def read_by_key(self, key_list):
-        return self.r.read_by_key(self.api_name, key_list)
+        for reader in self._get_readers():
+            for entry in reader.read_by_key(self.api_name, key_list):
+                yield entry
 
-    def read_by_index(self, index_list):
-        return self.r.read_by_idx(api_name, self.index_list)
+    #TO DO Fix read_by_index with file indexing
 
-    def check_keys_exist(self, api_name, key_list):
-        return self.m.check_keys(api_name, key_list)
+    #def read_by_index(self, index_list):
+        #for reader in self._get_readers():
+            #return reader.read_by_idx(api_name, self.index_list)
+        #return False
+
+    def check_keys_exist(self, key_list):
+        return self.m.check_keys(self.api_name, key_list)
 
     def filter_keys(self, keys, values):
         arr_keys = np.array(keys)
@@ -43,12 +60,19 @@ class Hdf5(IsauraBase):
         return self.w._filter_keys(self.api_name, keys, values)
 
     def write_api(self, keys, values):
+        #Batch here with generator input
         self.w.write(self.api_name, keys, values)
 
-    def merge(self, old_model, old_api_name):
-        reader = Reader(old_model)
+    def merge(self, path, old_model, old_api_name):
+        reader = Reader(path, old_model)
         for key, value in reader.yield_api(old_api_name):   #Inefficient
             self.w.write(self.api_name, key, value)
 
     def _resolve_dtype_clash(self, curr_h5, new_data):
         pass
+
+    def _get_readers(self):
+        readers = []
+        for path in self.avail_data_files():
+            readers.append(Reader(path, self.model_id))
+        return readers

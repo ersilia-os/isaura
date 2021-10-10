@@ -43,17 +43,16 @@ class Writer(IsauraBase):
         else:
             self._encode(arr_values, dtypes)
 
-
-        if self._check_api_exists(api_name):
-            new_keys, new_values = self._filter_keys(api_name, arr_keys, arr_values)
+        new_keys, new_values = self._filter_keys(api_name, arr_keys, arr_values)
+        if self._check_api_exists(self.local_data_path, api_name):
             if new_keys.shape != (0,):
                 self._append_api(api_name, new_keys, new_values)
-        else:
-            self._write_new_api(api_name, arr_keys, arr_values)
+        elif new_keys.shape[0] > 0:
+            self._write_new_api(api_name, new_keys, new_values)
 
 
     def _append_api(self, api_name, keys, values):
-        with h5py.File(self.data_path, "a") as f:
+        with h5py.File(self.local_data_path, "a") as f:
             grp = f.get(api_name)
             grp["Keys"].resize((grp["Keys"].shape[0] + keys.shape[0]), axis=0)
             grp["Keys"][-keys.shape[0]:] = keys
@@ -62,26 +61,26 @@ class Writer(IsauraBase):
             grp["Values"][-values.shape[0]:] = values
 
     def _write_new_api(self, api_name, keys, values):
-        with h5py.File(self.data_path, "a") as f:
+        with h5py.File(self.local_data_path, "a") as f:
             grp = f.create_group(api_name)
             grp.create_dataset("Keys", shape=keys.shape, data=keys, maxshape=(None,), chunks=True)
             grp.create_dataset("Values", shape=values.shape, data=values, maxshape=(None, values.shape[1]), chunks=True, dtype='f')
 
     def _create_h5(self, model_id):
-        if not self._check_h5_exists():
-            f = h5py.File(self.data_path, "w")
+        if not self._check_h5_exists(self.local_data_path):
+            f = h5py.File(self.local_data_path, "w")
             f.close()
 
     def _filter_keys(self, api_name, arr_keys, arr_values):
         m = Mapper(self.model_id)
         new_keys, new_values = [], []
         filter = m.check_keys(api_name, arr_keys)["unavailable_keys"]
-        for k, i in zip(filter.keys(), filter.values()):
+        for k, v in zip(filter.keys(), filter.values()):
             if k is not None:
                 new_keys.append(k)
-                new_values.append(arr_values[i])
+                new_values.append(arr_values[v])
 
-        return np.array(new_keys), np.array(new_values)
+        return np.array(new_keys, h5py.string_dtype()), np.array(new_values)
 
     def _encode(self, data, dtypes):
         for index, element in enumerate(data):
