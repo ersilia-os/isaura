@@ -4,7 +4,7 @@ import numpy as np
 class Ranges(object):
     def __init__(self):
         self.uints, self.ints, self.floats = self.data_lists()
-     
+
     def data_lists(self):
         uints = ( self.uint8(), self.uint16(), self.uint32(), self.uint64() )
         ints = ( self.int8(), self.int16(), self.int32(), self.int64() )
@@ -90,7 +90,7 @@ class Ranges(object):
         else:
             dtype = self.smallest_dtype(self.ints, min_value, max_value)
         return dtype
-    
+
     def best_float(self, min_value, max_value, max_decimals):
         float_list = self.floats
         dtype = float_list[-1][0]  # Default to largest size
@@ -100,9 +100,9 @@ class Ranges(object):
                 break
         return dtype
 
-    def max_of_type(self, my_dtype):
+    def max_of_type(self, data):
         for dt in self.floats:
-            if my_dtype.dtype == dt[0]:
+            if data.dtype == dt[0]:
                 return dt[2]
 
 

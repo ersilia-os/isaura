@@ -3,6 +3,7 @@ from..dtypes.numeric import Ranges
 import h5py
 import numpy as np
 
+
 class Reader(IsauraBase):
 
     def __init__(self, data_path, model_id):
@@ -12,16 +13,19 @@ class Reader(IsauraBase):
 
     def read_by_idx(self, api_name, idxs):
         with h5py.File(self.data_path, "r") as f:
-            for i in idxs:      #Optimise this with batching?
-                yield self._decode(f.get(api_name)["Values"][i])
+            grp = f.get(api_name)
+            values = grp["Values"][idxs]
+            return self._decode(values)
 
-    def read_by_key(self, api_name, keys):
-        with h5py.File(self.data_path, "r") as f:
-            key_index_dict = self._index_keys(api_name)
-            for k in keys:      #Optimise this with batching?
-                if k in key_index_dict.keys():
-                    pos = key_index_dict[k]
-                    yield self._decode(f.get(api_name)["Values"][pos])
+    def read_by_key(self, api_name, keys, iter=False):
+        key_index_dict = self._index_keys(api_name)
+        idxs = [key_index_dict[k] for k in keys]
+        values = self.read_by_idx(api_name, idxs)
+        if not iter:
+            return values
+        else:
+            for i in range(values.shape[0]):
+                yield values[i]
 
     def _get_features(self, api_name):
         with h5py.File(self.data_path, "r") as f:
@@ -55,8 +59,6 @@ class Reader(IsauraBase):
         return indices
 
     def _decode(self, data):
-        d = data
-        for index, element in enumerate(d):
-            if element == self.ranges.max_of_type(element):
-                d[index] = np.nan
-        return d
+        max_of_type = self.ranges.max_of_type(data)
+        data[data == max_of_type] = np.nan
+        return data
