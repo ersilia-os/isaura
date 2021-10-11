@@ -13,18 +13,23 @@ class Reader(IsauraBase):
     def read_by_idx(self, api_name, idxs):
         with h5py.File(self.data_path, "r") as f:
             grp = f.get(api_name)
-            values = grp["Values"][idxs]
-            return self._decode(values)
-
-    def read_by_key(self, api_name, keys, iter=False):
-        key_index_dict = self._index_keys(api_name)
-        idxs = [key_index_dict[k] for k in keys]
-        values = self.read_by_idx(api_name, idxs)
-        if not iter:
+            values = self._decode(grp["Values"][idxs])
             return values
-        else:
-            for i in range(values.shape[0]):
-                yield values[i]
+
+    def read_by_key(self, api_name, keys):
+        key_index_dict = self._index_keys(api_name)
+        found_keys = []
+        idxs = []
+        for k in keys:
+            if k in key_index_dict:
+                idxs += [key_index_dict[k]]
+                found_keys += [k]
+        values = self.read_by_idx(api_name, idxs)
+        result = {
+            "keys": found_keys,
+            "values": values
+        }
+        return result
 
     def _get_features(self, api_name):
         with h5py.File(self.data_path, "r") as f:

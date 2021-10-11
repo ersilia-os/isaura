@@ -39,9 +39,15 @@ class Hdf5(IsauraBase):
         return keys
 
     def read_by_key(self, key_list):
+        results_dict = {}
         for reader in self._get_readers():
-            for entry in reader.read_by_key(self.api_name, key_list):
-                yield entry
+            result = reader.read_by_key(self.api_name, key_list)
+            keys = result["keys"]
+            values = result["values"]
+            for i in range(len(keys)):
+                results_dict[keys[i]] = values[i]
+        for k in key_list:
+            yield results_dict[k]
 
     # TO DO Fix read_by_index with file indexing
 
