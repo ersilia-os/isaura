@@ -6,14 +6,13 @@ import numpy as np
 
 
 class Hdf5(IsauraBase):
-
     def __init__(self, model_id):
         IsauraBase.__init__(self, model_id)
         self.w = Writer(self.model_id)
         self.m = Mapper(self.model_id)
         self.api_name = ""
 
-    #TO DO optimisiation: if keys found in one file then remove them from search in next file
+    # TO DO optimisiation: if keys found in one file then remove them from search in next file
 
     def set_curr_api(self, api):
         self.api_name = api
@@ -44,12 +43,12 @@ class Hdf5(IsauraBase):
             for entry in reader.read_by_key(self.api_name, key_list):
                 yield entry
 
-    #TO DO Fix read_by_index with file indexing
+    # TO DO Fix read_by_index with file indexing
 
-    #def read_by_index(self, index_list):
-        #for reader in self._get_readers():
-            #return reader.read_by_idx(api_name, self.index_list)
-        #return False
+    # def read_by_index(self, index_list):
+    # for reader in self._get_readers():
+    # return reader.read_by_idx(api_name, self.index_list)
+    # return False
 
     def check_keys_exist(self, key_list):
         return self.m.check_keys(self.api_name, key_list)
@@ -60,12 +59,12 @@ class Hdf5(IsauraBase):
         return self.w._filter_keys(self.api_name, keys, values)
 
     def write_api(self, keys, values):
-        #Batch here with generator input
+        # Batch here with generator input
         self.w.write(self.api_name, keys, values)
 
     def merge(self, path, old_model, old_api_name):
         reader = Reader(path, old_model)
-        for key, value in reader.yield_api(old_api_name):   #Inefficient
+        for key, value in reader.yield_api(old_api_name):  # Inefficient
             self.w.write(self.api_name, key, value)
 
     def get_features(self):

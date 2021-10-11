@@ -1,11 +1,10 @@
 from ..core.base import IsauraBase
-from..dtypes.numeric import Ranges
+from ..dtypes.numeric import Ranges
 import h5py
 import numpy as np
 
 
 class Reader(IsauraBase):
-
     def __init__(self, data_path, model_id):
         IsauraBase.__init__(self, model_id)
         self.ranges = Ranges()
@@ -35,7 +34,9 @@ class Reader(IsauraBase):
     def yield_api(self, api_name):
         if self._check_api_exists(self.data_path, api_name):
             with h5py.File(self.data_path, "r") as f:
-                for key, data in zip(f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]):
+                for key, data in zip(
+                    f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]
+                ):
                     yield key, self._decode(data)
         return False
 
@@ -55,7 +56,7 @@ class Reader(IsauraBase):
         with h5py.File(self.data_path, "r") as f:
             if self._check_api_exists(self.data_path, api_name):
                 keys = f.get(api_name)["Keys"].asstr()
-                indices = {k:i for i,k in enumerate(keys)}
+                indices = {k: i for i, k in enumerate(keys)}
         return indices
 
     def _decode(self, data):

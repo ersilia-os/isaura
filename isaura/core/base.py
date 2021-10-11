@@ -6,7 +6,6 @@ from .. import logger
 
 
 class IsauraBase(object):
-
     def __init__(self, model_id, verbose=True):
         self.logger = logger
         if verbose:

@@ -1,12 +1,12 @@
 from ..core.base import IsauraBase
 from ..handle.mapper import Mapper
-#from isaura.dtypes.numeric import NumericDataTyper
+
+# from isaura.dtypes.numeric import NumericDataTyper
 import h5py
 import numpy as np
 
 
 class Writer(IsauraBase):
-
     def __init__(self, model_id):
         IsauraBase.__init__(self, model_id)
         self._create_h5(model_id)
@@ -23,21 +23,20 @@ class Writer(IsauraBase):
         arr_keys = arr_keys[idxs]
         arr_values = arr_values[idxs]
 
-        #TO DO manage batching/large datasets before here
+        # TO DO manage batching/large datasets before here
 
         ### Storage Optimisation Code - Implement Fully Later ###
-        #new_values = list(input)
+        # new_values = list(input)
         dtypes = []
         for i in np.transpose(arr_values):
-            #dtyper = NumericDataTyper(i)
-            #dtypes += str(np.dtype(dtyper.best())) + ","
+            # dtyper = NumericDataTyper(i)
+            # dtypes += str(np.dtype(dtyper.best())) + ","
             dtypes.append(np.finfo(np.float32))
         dtypes = dtypes[:-1]
-        #new_values = [tuple(x) for x in new_values]
-        #np_arr = np.array(new_values, dtype=np.dtype(dtypes))
+        # new_values = [tuple(x) for x in new_values]
+        # np_arr = np.array(new_values, dtype=np.dtype(dtypes))
 
-
-        if len(arr_values.shape) >1:
+        if len(arr_values.shape) > 1:
             for record in arr_values:
                 self._encode(record, dtypes)
         else:
@@ -50,15 +49,14 @@ class Writer(IsauraBase):
         elif new_keys.shape[0] > 0:
             self._write_new_api(api_name, new_keys, new_values)
 
-
     def _append_api(self, api_name, keys, values):
         with h5py.File(self.local_data_path, "a") as f:
             grp = f.get(api_name)
             grp["Keys"].resize((grp["Keys"].shape[0] + keys.shape[0]), axis=0)
-            grp["Keys"][-keys.shape[0]:] = keys
+            grp["Keys"][-keys.shape[0] :] = keys
 
             grp["Values"].resize((grp["Values"].shape[0] + values.shape[0]), axis=0)
-            grp["Values"][-values.shape[0]:] = values
+            grp["Values"][-values.shape[0] :] = values
 
     def _write_features_api(self, api_name, features):
         with h5py.File(self.local_data_path, "a") as f:
@@ -71,8 +69,17 @@ class Writer(IsauraBase):
     def _write_new_api(self, api_name, keys, values):
         with h5py.File(self.local_data_path, "a") as f:
             grp = f.create_group(api_name)
-            grp.create_dataset("Keys", shape=keys.shape, data=keys, maxshape=(None,), chunks=True)
-            grp.create_dataset("Values", shape=values.shape, data=values, maxshape=(None, values.shape[1]), chunks=True, dtype='f')
+            grp.create_dataset(
+                "Keys", shape=keys.shape, data=keys, maxshape=(None,), chunks=True
+            )
+            grp.create_dataset(
+                "Values",
+                shape=values.shape,
+                data=values,
+                maxshape=(None, values.shape[1]),
+                chunks=True,
+                dtype="f",
+            )
 
     def _create_h5(self, model_id):
         if not self._check_h5_exists(self.local_data_path):

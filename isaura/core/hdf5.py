@@ -6,7 +6,6 @@ import numpy as np
 
 
 class Hdf5Explorer(Hdf5):
-
     def __init__(self, model_id):
         Hdf5.__init__(self, model_id=model_id)
 
@@ -18,14 +17,13 @@ class Hdf5Explorer(Hdf5):
 
     def apis(self):
         return self.list_apis()
-            
+
     @property
     def size(self):
         return os.path.getsize(self.data_path)
 
 
 class Hdf5ApiExplorer(Hdf5):
-
     def __init__(self, model_id, api_name):
         Hdf5.__init__(self, model_id=model_id)
         self.set_curr_api(api_name)
@@ -43,9 +41,10 @@ class Hdf5ApiExplorer(Hdf5):
         with h5py.File(self.data_path, "rb") as f:
             return f[self.api_name][data].dtype
 
-if __name__ == "__main__":  #TESTING
+
+if __name__ == "__main__":  # TESTING
     h = Hdf5Explorer("eos4e40")
     h.set_curr_api("Predict")
-    h.write_api(["e","d"], [[90, np.nan, 70], [61, 51, 41]])
+    h.write_api(["e", "d"], [[90, np.nan, 70], [61, 51, 41]])
     for i in h.read_api():
         print(i)
