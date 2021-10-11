@@ -18,10 +18,6 @@ class Hdf5Explorer(Hdf5):
     def apis(self):
         return self.list_apis()
 
-    @property
-    def size(self):
-        return os.path.getsize(self.data_path)
-
 
 class Hdf5ApiExplorer(Hdf5):
     def __init__(self, model_id, api_name):
@@ -32,14 +28,11 @@ class Hdf5ApiExplorer(Hdf5):
         return self._check_api_exists(self.api_name)
 
     @property
-    def shape(self):
-        with h5py.File(self.data_path, "rb") as f:
-            return f[self.api_name][data].shape
-
-    @property
     def dtype(self):
-        with h5py.File(self.data_path, "rb") as f:
-            return f[self.api_name][data].dtype
+        for data_path in self.avail_data_files():
+            with h5py.File(data_path, "r") as f:
+                g = f.get(self.api_name)
+                return g["Values"].dtype
 
 
 if __name__ == "__main__":  # TESTING
