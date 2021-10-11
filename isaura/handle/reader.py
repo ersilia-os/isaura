@@ -23,6 +23,11 @@ class Reader(IsauraBase):
                     pos = key_index_dict[k]
                     yield self._decode(f.get(api_name)["Values"][pos])
 
+    def _get_features(self, api_name):
+        with h5py.File(self.data_path, "r") as f:
+            features = list(f.get(api_name)["Features"].asstr())
+        return features
+
     def yield_api(self, api_name):
         if self._check_api_exists(self.data_path, api_name):
             with h5py.File(self.data_path, "r") as f:

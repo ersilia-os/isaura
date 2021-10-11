@@ -68,6 +68,13 @@ class Hdf5(IsauraBase):
         for key, value in reader.yield_api(old_api_name):   #Inefficient
             self.w.write(self.api_name, key, value)
 
+    def get_features(self):
+        for reader in self._get_readers():
+            return reader._get_features(self.api_name)
+
+    def write_features(self, features):
+        self.w._write_features_api(self.api_name, features)
+
     def _resolve_dtype_clash(self, curr_h5, new_data):
         pass
 

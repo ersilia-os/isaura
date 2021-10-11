@@ -60,6 +60,14 @@ class Writer(IsauraBase):
             grp["Values"].resize((grp["Values"].shape[0] + values.shape[0]), axis=0)
             grp["Values"][-values.shape[0]:] = values
 
+    def _write_features_api(self, api_name, features):
+        with h5py.File(self.local_data_path, "a") as f:
+            grp = f.get(api_name)
+            keys = grp.keys()
+            if "Features" not in keys:
+                arr_features = np.array(list(features), h5py.string_dtype())
+                grp.create_dataset("Features", data=arr_features)
+
     def _write_new_api(self, api_name, keys, values):
         with h5py.File(self.local_data_path, "a") as f:
             grp = f.create_group(api_name)
