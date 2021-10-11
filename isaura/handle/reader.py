@@ -11,9 +11,14 @@ class Reader(IsauraBase):
         self.data_path = data_path
 
     def read_by_idx(self, api_name, idxs):
+        idxs = np.array(idxs)
+        mapping = np.argsort(idxs)
+        mapping_inv = np.argsort(mapping)
+        idxs_sorted = idxs[mapping]
         with h5py.File(self.data_path, "r") as f:
             grp = f.get(api_name)
-            values = self._decode(grp["Values"][idxs])
+            values = self._decode(grp["Values"][idxs_sorted])
+            values = values[mapping_inv]
             return values
 
     def read_by_key(self, api_name, keys):
