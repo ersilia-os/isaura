@@ -33,11 +33,3 @@ class Hdf5ApiExplorer(Hdf5):
             with h5py.File(data_path, "r") as f:
                 g = f.get(self.api_name)
                 return g["Values"].dtype
-
-
-if __name__ == "__main__":  # TESTING
-    h = Hdf5Explorer("eos4e40")
-    h.set_curr_api("Predict")
-    h.write_api(["e", "d"], [[90, np.nan, 70], [61, 51, 41]])
-    for i in h.read_api():
-        print(i)

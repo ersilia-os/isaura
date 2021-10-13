@@ -30,10 +30,7 @@ class Reader(IsauraBase):
                 idxs += [key_index_dict[k]]
                 found_keys += [k]
         values = self.read_by_idx(api_name, idxs)
-        result = {
-            "keys": found_keys,
-            "values": values
-        }
+        result = {"keys": found_keys, "values": values}
         return result
 
     def _get_features(self, api_name):
@@ -48,6 +45,16 @@ class Reader(IsauraBase):
                     f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]
                 ):
                     yield key, self._decode(data)
+        return False
+
+    def read_api(self, api_name):
+        if self._check_api_exists(self.data_path, api_name):
+            with h5py.File(self.data_path, "r") as f:
+                keys, values = (
+                    np.array(f.get(api_name)["Keys"].asstr()),
+                    np.array(f.get(api_name)["Values"]),
+                )
+                return keys, self._decode(values)
         return False
 
     def get_apis(self):
@@ -71,5 +78,6 @@ class Reader(IsauraBase):
 
     def _decode(self, data):
         max_of_type = self.ranges.max_of_type(data)
+        data = data.astype(np.float32)
         data[data == max_of_type] = np.nan
         return data

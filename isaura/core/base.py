@@ -24,10 +24,6 @@ class IsauraBase(object):
         return self.model_id + "_public." + HDF5_EXTENSION
 
     @property
-    def public_file_name(self):
-        return self.model_id + "_public." + HDF5_EXTENSION
-
-    @property
     def local_data_path(self):
         return os.path.join(self.repository_path, self.local_file_name)
 

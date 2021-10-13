@@ -10,6 +10,7 @@ class Writer(IsauraBase):
     def __init__(self, model_id):
         IsauraBase.__init__(self, model_id)
         self._create_h5(model_id)
+        self.dtype = np.float32
 
     def _unique_keys(self, keys):
         _, idxs = np.unique(keys, return_index=True)
@@ -27,20 +28,21 @@ class Writer(IsauraBase):
 
         ### Storage Optimisation Code - Implement Fully Later ###
         # new_values = list(input)
-        dtypes = []
-        for i in np.transpose(arr_values):
-            # dtyper = NumericDataTyper(i)
-            # dtypes += str(np.dtype(dtyper.best())) + ","
-            dtypes.append(np.finfo(np.float32))
-        dtypes = dtypes[:-1]
+        # dtypes = []
+        # for i in np.transpose(arr_values):
+        # dtyper = NumericDataTyper(i)
+        # dtypes += str(np.dtype(dtyper.best())) + ","
+        # dtypes.append(self._get_dtype_info(self.dtype))
+        # dtypes = dtypes[:-1]
+
         # new_values = [tuple(x) for x in new_values]
         # np_arr = np.array(new_values, dtype=np.dtype(dtypes))
 
         if len(arr_values.shape) > 1:
             for record in arr_values:
-                self._encode(record, dtypes)
+                self._encode(record, self.dtype)
         else:
-            self._encode(arr_values, dtypes)
+            self._encode(arr_values, self.dtype)
 
         new_keys, new_values = self._filter_keys(api_name, arr_keys, arr_values)
         if self._check_api_exists(self.local_data_path, api_name):
@@ -78,7 +80,7 @@ class Writer(IsauraBase):
                 data=values,
                 maxshape=(None, values.shape[1]),
                 chunks=True,
-                dtype="f",
+                dtype=self.dtype,
             )
 
     def _create_h5(self, model_id):
@@ -97,7 +99,25 @@ class Writer(IsauraBase):
 
         return np.array(new_keys, h5py.string_dtype()), np.array(new_values)
 
-    def _encode(self, data, dtypes):
+    def _encode(self, data, dtype):
         for index, element in enumerate(data):
             if np.isnan(element):
-                data[index] = dtypes[index].max
+                data[index] = dtype.max
+
+    def _get_dtype_info(self, dtype):
+        dtype_char = np.sctype2char(dtype)
+        if dtype_char == "f":
+            return np.finfo(dtype)
+        elif dtype_char == "i":
+            return np.iinfo(dtype)
+
+    def change_api_name(self, curr_api, new_api):
+        with h5py.File(self.local_data_path, "a") as f:
+            f.move(curr_api, new_api)
+
+    def remove_api(self, api_name):
+        with h5py.File(self.local_data_path, "a") as f:
+            del f[api_name]
+
+    def set_dtype(self, new_dtype):
+        self.dtype = new_dtype

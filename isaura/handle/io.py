@@ -1,7 +1,8 @@
-from isaura.core.base import IsauraBase
-from isaura.handle.reader import Reader
-from isaura.handle.writer import Writer
-from isaura.handle.mapper import Mapper
+from ..core.base import IsauraBase
+from ..handle.reader import Reader
+from ..handle.writer import Writer
+from ..handle.mapper import Mapper
+from ..handle.retyper import Retyper
 import numpy as np
 
 
@@ -68,10 +69,14 @@ class Hdf5(IsauraBase):
         # Batch here with generator input
         self.w.write(self.api_name, keys, values)
 
-    def merge(self, path, old_model, old_api_name):
+    def retype_local(self):
+        rt = Retyper(self.local_data_path, self.model_id, self.api_name)
+        rt.retype()
+
+    def append(self, path, old_model, old_api_name):
         reader = Reader(path, old_model)
-        for key, value in reader.yield_api(old_api_name):  # Inefficient
-            self.w.write(self.api_name, key, value)
+        keys, values = reader.read_api(old_api_name)
+        self.w.write(self.api_name, keys, values)
 
     def get_features(self):
         for reader in self._get_readers():
@@ -79,9 +84,6 @@ class Hdf5(IsauraBase):
 
     def write_features(self, features):
         self.w._write_features_api(self.api_name, features)
-
-    def _resolve_dtype_clash(self, curr_h5, new_data):
-        pass
 
     def _get_readers(self):
         readers = []

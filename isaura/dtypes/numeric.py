@@ -119,7 +119,7 @@ class NumericDataTyper(object):
         self.max = np.nanmax(ary)
         self.is_integer = self._is_integer()
         self._ranges = Ranges()
-        self._dtype_orig = np.dtype(ary[0])  # Cater for NaNs here
+        self._dtype_orig = ary[0].dtype
 
     def _is_integer(self):
         for x in self.ary_flat:
@@ -149,3 +149,6 @@ class NumericDataTyper(object):
 
     def data_size(self, dt):  # Byte size of data type
         return np.dtype(dt).itemsize
+
+    def find_new_type(self, dtype1, dtype2):
+        return np.promote_types(dtype1, dtype2)
