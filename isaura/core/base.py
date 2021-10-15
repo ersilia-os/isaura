@@ -5,6 +5,7 @@ from ..default import HDF5_EXTENSION
 from .. import logger
 import subprocess
 
+
 class IsauraBase(object):
     def __init__(self, model_id, verbose=True):
         self.logger = logger

@@ -9,7 +9,9 @@ import os
 
 
 class Appender(IsauraBase):
-    def __init__(self, curr_path, curr_model_id, curr_api, split=True):  # File intended to add to
+    def __init__(
+        self, curr_path, curr_model_id, curr_api, split=True
+    ):  # File intended to add to
         IsauraBase.__init__(self, model_id=curr_model_id)
         self.curr_api = curr_api
         self.curr_path = curr_path
@@ -47,9 +49,16 @@ class Appender(IsauraBase):
                 w.write_append(self.curr_api, filtered_keys, filtered_values)
 
             else:
-                w = Writer(self.model_id, path=self.curr_path[:-3] + "_add." + HDF5_EXTENSION)
+                w = Writer(
+                    self.model_id, path=self.curr_path[:-3] + "_add." + HDF5_EXTENSION
+                )
                 w.set_dtype(new_dtype)
-                filtered_pub_keys, filtered_pub_values = w._filter_single_file(self.curr_path, self.curr_api, list(filtered_keys), list(filtered_values))
+                filtered_pub_keys, filtered_pub_values = w._filter_single_file(
+                    self.curr_path,
+                    self.curr_api,
+                    list(filtered_keys),
+                    list(filtered_values),
+                )
                 w.write_append(self.curr_api, filtered_pub_keys, filtered_pub_values)
 
             self.repack_secrets(path, api_name, secret_keys, secret_values)

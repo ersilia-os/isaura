@@ -32,7 +32,9 @@ class Writer(IsauraBase):
 
     def write_append(self, api_name, keys, input):
         arr_keys, arr_values = self._format_encode(keys, input)
-        new_keys, new_values = self._filter_single_file(self.path, api_name, arr_keys, arr_values)
+        new_keys, new_values = self._filter_single_file(
+            self.path, api_name, arr_keys, arr_values
+        )
         if self._check_api_exists(self.path, api_name):
             if new_keys.shape != (0,):
                 self._append_api(api_name, new_keys, new_values)

@@ -93,7 +93,9 @@ class Hdf5(IsauraBase):
     def append_excl_file(self, append_from_path, append_to_path, secrets_path):
         r = Reader(secrets_path, self.model_id)
         a = Appender(append_to_path, self.model_id, self.api_name, split=False)
-        a.append_from(append_from_path, self.model_id, self.api_name, r._get_keys(self.api_name))
+        a.append_from(
+            append_from_path, self.model_id, self.api_name, r._get_keys(self.api_name)
+        )
 
     def get_features(self):
         for reader in self._get_readers():
