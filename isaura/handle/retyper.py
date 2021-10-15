@@ -18,15 +18,18 @@ class Retyper(IsauraBase):
         self.suffix = "_old"
 
     def retype(self):
+        curr_dtype = self.reader.get_dtype(self.api_name)
         keys, data = self.reader.read_api(self.api_name)
-        new_dtype = self._best_dtype(data)
-        if new_dtype != data.dtype.type:
-            self.recast(keys, data, new_dtype)
-            self._compare(self.data_path[:-3] + "_backup.h5")
+
+        if type(data) != type(None):
+            new_dtype = self._best_dtype(data)
+            if new_dtype != curr_dtype:
+                self.recast(keys, data, new_dtype)
+                self._clean(self.data_path[:-3] + "_backup.h5")
 
     def recast(self, keys, data, new_dtype):
         self.run_cmd("cp " + self.data_path + " " + self._backup_path())
-        writer = Writer(self.model_id)
+        writer = Writer(self.model_id, path=self.data_path)
         writer.change_api_name(self.api_name, self.api_name + self.suffix)
         writer.set_dtype(new_dtype)
         writer.write(self.api_name, keys, data)
@@ -35,7 +38,7 @@ class Retyper(IsauraBase):
         os.rename(self.data_path, self._temp_path())
         self.run_cmd("h5repack " + self._temp_path() + " " + self.data_path)
 
-    def _compare(self, old_path):
+    def _clean(self, old_path):
         try:
             old_r = Reader(old_path, self.model_id)
             new_r = Reader(self.data_path, self.model_id)

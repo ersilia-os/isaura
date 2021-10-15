@@ -55,7 +55,7 @@ class Reader(IsauraBase):
                     np.array(f.get(api_name)["Values"]),
                 )
                 return keys, self._decode(values)
-        return False
+        return None, None
 
     def get_apis(self):
         with h5py.File(self.data_path, "r") as f:
@@ -81,3 +81,10 @@ class Reader(IsauraBase):
         data = data.astype(np.float32)
         data[data == max_of_type] = np.nan
         return data
+
+    def get_dtype(self, api_name):
+        if self._check_api_exists(self.data_path, api_name):
+            with h5py.File(self.data_path, "r") as f:
+                value = f.get(api_name)["Values"][0]
+                return value.dtype.type
+        return None

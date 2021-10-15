@@ -149,6 +149,3 @@ class NumericDataTyper(object):
 
     def data_size(self, dt):  # Byte size of data type
         return np.dtype(dt).itemsize
-
-    def find_new_type(self, dtype1, dtype2):
-        return np.promote_types(dtype1, dtype2)

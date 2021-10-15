@@ -7,9 +7,15 @@ import numpy as np
 
 
 class Writer(IsauraBase):
-    def __init__(self, model_id):
+    def __init__(self, model_id, path=""):
         IsauraBase.__init__(self, model_id)
-        self._create_h5(model_id)
+        if path == "":
+            self.path = self.local_data_path
+        else:
+            self.path = path
+
+        if self.path == self.local_data_path:
+            self._create_h5(model_id)
         self.dtype = np.float32
 
     def _unique_keys(self, keys):
@@ -52,7 +58,7 @@ class Writer(IsauraBase):
             self._write_new_api(api_name, new_keys, new_values)
 
     def _append_api(self, api_name, keys, values):
-        with h5py.File(self.local_data_path, "a") as f:
+        with h5py.File(self.path, "a") as f:
             grp = f.get(api_name)
             grp["Keys"].resize((grp["Keys"].shape[0] + keys.shape[0]), axis=0)
             grp["Keys"][-keys.shape[0] :] = keys
@@ -61,7 +67,7 @@ class Writer(IsauraBase):
             grp["Values"][-values.shape[0] :] = values
 
     def _write_features_api(self, api_name, features):
-        with h5py.File(self.local_data_path, "a") as f:
+        with h5py.File(self.path, "a") as f:
             grp = f.get(api_name)
             keys = grp.keys()
             if "Features" not in keys:
@@ -69,7 +75,7 @@ class Writer(IsauraBase):
                 grp.create_dataset("Features", data=arr_features)
 
     def _write_new_api(self, api_name, keys, values):
-        with h5py.File(self.local_data_path, "a") as f:
+        with h5py.File(self.path, "a") as f:
             grp = f.create_group(api_name)
             grp.create_dataset(
                 "Keys", shape=keys.shape, data=keys, maxshape=(None,), chunks=True
@@ -112,11 +118,11 @@ class Writer(IsauraBase):
             return np.iinfo(dtype)
 
     def change_api_name(self, curr_api, new_api):
-        with h5py.File(self.local_data_path, "a") as f:
+        with h5py.File(self.path, "a") as f:
             f.move(curr_api, new_api)
 
     def remove_api(self, api_name):
-        with h5py.File(self.local_data_path, "a") as f:
+        with h5py.File(self.path, "a") as f:
             del f[api_name]
 
     def set_dtype(self, new_dtype):
