@@ -6,7 +6,6 @@ from ..default import HDF5_EXTENSION
 import numpy as np
 import h5py
 import os
-import subprocess
 
 
 class Retyper(IsauraBase):
@@ -23,6 +22,15 @@ class Retyper(IsauraBase):
 
         if type(data) != type(None):
             new_dtype = self._best_dtype(data)
+            if new_dtype != curr_dtype:
+                self.recast(keys, data, new_dtype)
+                self._clean(self.data_path[:-3] + "_backup.h5")
+
+    def retype_with_dtype(self, new_dtype):
+        curr_dtype = self.reader.get_dtype(self.api_name)
+        keys, data = self.reader.read_api(self.api_name)
+
+        if type(data) != type(None):
             if new_dtype != curr_dtype:
                 self.recast(keys, data, new_dtype)
                 self._clean(self.data_path[:-3] + "_backup.h5")
@@ -58,9 +66,6 @@ class Retyper(IsauraBase):
 
     def restore_backup(self):
         pass
-
-    def run_cmd(self, cmd):
-        subprocess.Popen(cmd, shell=True, env=os.environ).wait()
 
     def _best_dtype(self, data):
         dtyper = NumericDataTyper(data)

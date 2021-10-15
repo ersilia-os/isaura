@@ -15,7 +15,14 @@ class Mapper(IsauraBase):
         for file in self.avail_data_files():
             r = Reader(file, self.model_id)
             curr_api_keys.update(r._get_keys(api_name))
+        return self._filter(curr_api_keys, new_keys)
 
+    def filter_file(self, file_path, api_name, new_keys):
+        r = Reader(file_path, self.model_id)
+        curr_api_keys = r._get_keys(api_name)
+        return self._filter(curr_api_keys, new_keys)
+
+    def _filter(self, curr_api_keys, new_keys):
         avail_keys, unavail_keys = {}, {}
         for i, k in enumerate(new_keys):
             if k in curr_api_keys:

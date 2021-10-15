@@ -14,8 +14,7 @@ class Writer(IsauraBase):
         else:
             self.path = path
 
-        if self.path == self.local_data_path:
-            self._create_h5(model_id)
+        self._create_h5(self.path)
         self.dtype = np.float32
 
     def _unique_keys(self, keys):
@@ -23,35 +22,18 @@ class Writer(IsauraBase):
         return idxs
 
     def write(self, api_name, keys, input):
-        arr_keys = np.array(list(keys), h5py.string_dtype())
-        arr_values = np.array(list(input))
-
-        idxs = self._unique_keys(arr_keys)
-        arr_keys = arr_keys[idxs]
-        arr_values = arr_values[idxs]
-
-        # TO DO manage batching/large datasets before here
-
-        ### Storage Optimisation Code - Implement Fully Later ###
-        # new_values = list(input)
-        # dtypes = []
-        # for i in np.transpose(arr_values):
-        # dtyper = NumericDataTyper(i)
-        # dtypes += str(np.dtype(dtyper.best())) + ","
-        # dtypes.append(self._get_dtype_info(self.dtype))
-        # dtypes = dtypes[:-1]
-
-        # new_values = [tuple(x) for x in new_values]
-        # np_arr = np.array(new_values, dtype=np.dtype(dtypes))
-
-        if len(arr_values.shape) > 1:
-            for record in arr_values:
-                self._encode(record, self.dtype)
-        else:
-            self._encode(arr_values, self.dtype)
-
+        arr_keys, arr_values = self._format_encode(keys, input)
         new_keys, new_values = self._filter_keys(api_name, arr_keys, arr_values)
-        if self._check_api_exists(self.local_data_path, api_name):
+        if self._check_api_exists(self.path, api_name):
+            if new_keys.shape != (0,):
+                self._append_api(api_name, new_keys, new_values)
+        elif new_keys.shape[0] > 0:
+            self._write_new_api(api_name, new_keys, new_values)
+
+    def write_append(self, api_name, keys, input):
+        arr_keys, arr_values = self._format_encode(keys, input)
+        new_keys, new_values = self._filter_single_file(self.path, api_name, arr_keys, arr_values)
+        if self._check_api_exists(self.path, api_name):
             if new_keys.shape != (0,):
                 self._append_api(api_name, new_keys, new_values)
         elif new_keys.shape[0] > 0:
@@ -89,15 +71,41 @@ class Writer(IsauraBase):
                 dtype=self.dtype,
             )
 
-    def _create_h5(self, model_id):
-        if not self._check_h5_exists(self.local_data_path):
-            f = h5py.File(self.local_data_path, "w")
+    def _create_h5(self, path):
+        if not self._check_h5_exists(path):
+            f = h5py.File(path, "w")
             f.close()
+
+    def _format_encode(self, keys, input):
+        arr_keys = np.array(list(keys), h5py.string_dtype())
+        arr_values = np.array(list(input))
+
+        idxs = self._unique_keys(arr_keys)
+        arr_keys = arr_keys[idxs]
+        arr_values = arr_values[idxs]
+
+        if len(arr_values.shape) > 1:
+            for record in arr_values:
+                self._encode(record, self.dtype)
+        else:
+            self._encode(arr_values, self.dtype)
+        return arr_keys, arr_values
 
     def _filter_keys(self, api_name, arr_keys, arr_values):
         m = Mapper(self.model_id)
         new_keys, new_values = [], []
         filter = m.check_keys(api_name, arr_keys)["unavailable_keys"]
+        for k, v in zip(filter.keys(), filter.values()):
+            if k is not None:
+                new_keys.append(k)
+                new_values.append(arr_values[v])
+
+        return np.array(new_keys, h5py.string_dtype()), np.array(new_values)
+
+    def _filter_single_file(self, file_path, api_name, arr_keys, arr_values):
+        m = Mapper(self.model_id)
+        new_keys, new_values = [], []
+        filter = m.filter_file(file_path, api_name, arr_keys)["unavailable_keys"]
         for k, v in zip(filter.keys(), filter.values()):
             if k is not None:
                 new_keys.append(k)

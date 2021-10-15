@@ -3,7 +3,7 @@ import h5py
 from ..default import REPOSITORY_PATH
 from ..default import HDF5_EXTENSION
 from .. import logger
-
+import subprocess
 
 class IsauraBase(object):
     def __init__(self, model_id, verbose=True):
@@ -47,3 +47,6 @@ class IsauraBase(object):
             if api_name in f.keys():
                 return True
             return False
+
+    def run_cmd(self, cmd):
+        subprocess.Popen(cmd, shell=True, env=os.environ).wait()

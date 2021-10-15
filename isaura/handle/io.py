@@ -82,8 +82,18 @@ class Hdf5(IsauraBase):
         rt = Retyper(path, self.model_id, self.api_name)
         rt.retype()
 
-    def append_split(self, curr_path, path_to_append, secret_keys):
-        pass
+    def append(self, append_from_path, append_to_path, secret_keys):
+        a = Appender(append_to_path, self.model_id, self.api_name, split=False)
+        a.append_from(append_from_path, self.model_id, self.api_name, secret_keys)
+
+    def append_split(self, append_from_path, append_to_path, secret_keys):
+        a = Appender(append_to_path, self.model_id, self.api_name, split=True)
+        a.append_from(append_from_path, self.model_id, self.api_name, secret_keys)
+
+    def append_excl_file(self, append_from_path, append_to_path, secrets_path):
+        r = Reader(secrets_path, self.model_id)
+        a = Appender(append_to_path, self.model_id, self.api_name, split=False)
+        a.append_from(append_from_path, self.model_id, self.api_name, r._get_keys(self.api_name))
 
     def get_features(self):
         for reader in self._get_readers():
