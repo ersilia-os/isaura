@@ -3,7 +3,7 @@ from pathlib import Path
 import os
 
 # system variables
-ISAURA = os.path.join(str(Path.home()), "eos/isaura")
+ISAURA = os.path.join(str(Path.home()), "eos", "isaura")
 if not os.path.exists(ISAURA):
     os.makedirs(ISAURA)
 

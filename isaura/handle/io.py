@@ -22,11 +22,6 @@ class Hdf5(IsauraBase):
     def get_curr_api(self):
         return self.api_name
 
-    def read_api(self):
-        for file in self._get_readers():
-            for entry in file.yield_api(self.api_name):
-                yield entry
-
     def list_apis(self):
         api_set = set()
         for reader in self._get_readers():
@@ -44,6 +39,8 @@ class Hdf5(IsauraBase):
         results_dict = {}
         for reader in self._get_readers():
             result = reader.read_by_key(self.api_name, key_list)
+            if result is None:
+                continue
             keys = result["keys"]
             values = result["values"]
             for i in range(len(keys)):

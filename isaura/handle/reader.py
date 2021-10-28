@@ -17,6 +17,8 @@ class Reader(IsauraBase):
         idxs_sorted = idxs[mapping]
         with h5py.File(self.data_path, "r") as f:
             grp = f.get(api_name)
+            if grp is None:
+                return None
             values = self._decode(grp["Values"][idxs_sorted])
             values = values[mapping_inv]
             return values
@@ -30,6 +32,8 @@ class Reader(IsauraBase):
                 idxs += [key_index_dict[k]]
                 found_keys += [k]
         values = self.read_by_idx(api_name, idxs)
+        if values is None:
+            return None
         result = {"keys": found_keys, "values": values}
         return result
 
