@@ -22,7 +22,7 @@ class Hdf5Explorer(Hdf5):
     def info(self):
         i = {}
         for api_name in self.apis():
-            api = Hdf5ApiExplorer(model_id = self.model_id, api_name=api_name)
+            api = Hdf5ApiExplorer(model_id=self.model_id, api_name=api_name)
             i[api_name] = api.info()
         return i
 
@@ -56,7 +56,9 @@ class Hdf5ApiExplorer(Hdf5):
                         "keys": g["Keys"].shape,
                         "features": g["Features"].shape,
                         "keys_head": [x.decode("utf-8") for x in g["Keys"][:head]],
-                        "features_head": [x.decode("utf-8") for x in g["Features"][:head]],
+                        "features_head": [
+                            x.decode("utf-8") for x in g["Features"][:head]
+                        ],
                         "dtype": g["Values"].dtype.name,
                     }
             i[fn] = res

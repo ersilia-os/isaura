@@ -2,6 +2,7 @@ from ..core.base import IsauraBase
 from .reader import Reader
 from .writer import Writer
 from .retyper import Retyper
+from .repacker import Repacker
 from ..dtypes.numeric import NumericDataTyper
 from ..default import HDF5_EXTENSION
 import numpy as np
@@ -19,7 +20,7 @@ class Appender(IsauraBase):
         self.curr_dtype = self.curr_reader.get_dtype(self.curr_api)
         self.split = split
         self.is_empty = False
-        self.suffix = "_old"
+
         if type(self.curr_dtype) == type(None):  # If file empty, choose smallest dtype
             self.curr_dtype = np.uint8
             self.is_empty = True
@@ -60,26 +61,6 @@ class Appender(IsauraBase):
                     list(filtered_values),
                 )
                 w.write_append(self.curr_api, filtered_pub_keys, filtered_pub_values)
-
-            self.repack_secrets(path, api_name, secret_keys, secret_values)
-
-    def repack_secrets(self, data_path, api_name, keys, data):
-        self.run_cmd("cp " + data_path + " " + self._backup_path(data_path))
-        writer = Writer(self.model_id, path=data_path)
-        writer.change_api_name(api_name, api_name + self.suffix)
-        writer.write_append(api_name, keys, data)
-        writer.remove_api(api_name + self.suffix)
-
-        os.rename(data_path, self._temp_path(data_path))
-        self.run_cmd("h5repack " + self._temp_path(data_path) + " " + data_path)
-        os.remove(self._temp_path(data_path))
-        os.remove(self._backup_path(data_path))
-
-    def _backup_path(self, data_path):
-        return data_path[:-3] + "_backup." + HDF5_EXTENSION
-
-    def _temp_path(self, data_path):
-        return data_path[:-3] + self.suffix + "." + HDF5_EXTENSION
 
     def _check_new_dtype(self, data):
         if type(data) != type(None):
