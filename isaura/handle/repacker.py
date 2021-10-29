@@ -16,6 +16,7 @@ class Repacker(IsauraBase):
         writer.change_api_name(api_name, api_name + self.suffix)
         if len(keys) > 0:
             writer.write_append(api_name, keys, data)
+            self._write_features(writer, api_name)
         writer.remove_api(api_name + self.suffix)
         self.repack()
 
@@ -26,6 +27,11 @@ class Repacker(IsauraBase):
         )
         os.remove(self._temp_path(self.data_path))
         os.remove(self._backup_path(self.data_path))
+
+    def _write_features(self, writer, api_name):
+        r = Reader(self._backup_path, self.model_id)
+        features = r._get_features(api_name)
+        writer._write_features_api(api_name, features)
 
     def _backup_path(self, data_path):
         return data_path[:-3] + "_backup." + HDF5_EXTENSION

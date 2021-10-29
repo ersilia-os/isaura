@@ -125,7 +125,9 @@ class Hdf5(IsauraBase):
 
     def get_features(self):
         for reader in self._get_readers():
-            return reader._get_features(self.api_name)
+            features = reader._get_features(self.api_name)
+            if features is not None:
+                return features
 
     def write_features(self, features):
         self.w._write_features_api(self.api_name, features)

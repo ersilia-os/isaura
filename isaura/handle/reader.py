@@ -44,6 +44,8 @@ class Reader(IsauraBase):
     def _get_features(self, api_name):
         with h5py.File(self.data_path, "r") as f:
             grp = f.get(api_name)
+            if grp is None:
+                return None
             features = self._asstr(grp, "Features")
         return features
 

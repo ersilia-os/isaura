@@ -35,13 +35,6 @@ class Hdf5ApiExplorer(Hdf5):
     def api_exists(self):
         return self._check_api_exists(self.api_name)
 
-    @property
-    def dtype(self):
-        for data_path in self.avail_data_files():
-            with h5py.File(data_path, "r") as f:
-                g = f.get(self.api_name)
-                return g["Values"].dtype
-
     def info(self, head=10):
         i = {}
         for data_path in self.avail_data_files():
