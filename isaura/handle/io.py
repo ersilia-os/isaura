@@ -3,6 +3,7 @@ from ..handle.reader import Reader
 from ..handle.writer import Writer
 from ..handle.mapper import Mapper
 from ..handle.retyper import Retyper
+from ..handle.repacker import Repacker
 from ..handle.appender import Appender
 import numpy as np
 
@@ -32,7 +33,7 @@ class Hdf5(IsauraBase):
         keys = []
         for reader in self._get_readers():
             if reader._check_api_exists(reader.data_path, self.api_name):
-                keys.append(reader._get_keys(self.api_name))
+                keys.extend(reader._get_keys(self.api_name))
         return keys
 
     def read_by_key(self, key_list):
@@ -83,16 +84,44 @@ class Hdf5(IsauraBase):
         a = Appender(append_to_path, self.model_id, self.api_name, split=False)
         a.append_from(append_from_path, self.model_id, self.api_name, secret_keys)
 
-    def append_split(self, append_from_path, append_to_path, secret_keys):
+    def append_local_to_public(self, secret_keys=[]):
+        a = Appender(self.public_data_path, self.model_id, self.api_name, split=False)
+        a.append_from(self.local_data_path, self.model_id, self.api_name, secret_keys)
+        self.remove_local_duplicates()
+
+    def append_split(
+        self, append_from_path, append_to_path, secret_keys
+    ):  # Separate output file
         a = Appender(append_to_path, self.model_id, self.api_name, split=True)
         a.append_from(append_from_path, self.model_id, self.api_name, secret_keys)
 
-    def append_excl_file(self, append_from_path, append_to_path, secrets_path):
+    def append_excl_file(
+        self, append_from_path, append_to_path, secrets_path
+    ):  # Exclude keys from file instead of a list
         r = Reader(secrets_path, self.model_id)
         a = Appender(append_to_path, self.model_id, self.api_name, split=False)
         a.append_from(
             append_from_path, self.model_id, self.api_name, r._get_keys(self.api_name)
         )
+        self.remove_local_duplicates()
+
+    def remove_local_duplicates(self):
+        local_r = Reader(self.local_data_path, self.model_id)
+        m = Mapper(self.model_id)
+        filter = m.filter_file(
+            self.public_data_path, self.api_name, local_r._get_keys(self.api_name)
+        )
+        if len(filter["available_keys"]) > 0:
+            keep_keys = list(filter["unavailable_keys"].keys())
+            rp = Repacker(self.local_data_path, self.model_id)
+            if len(keep_keys) > 0:
+                rp.repack_data(
+                    self.api_name,
+                    keep_keys,
+                    local_r.read_by_key(self.api_name, keep_keys)["values"],
+                )
+            else:
+                rp.repack_data(self.api_name, [], [])
 
     def get_features(self):
         for reader in self._get_readers():
