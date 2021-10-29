@@ -41,7 +41,10 @@ class Appender(IsauraBase):
             ) = self.filter_secret_keys(keys, values, exclude_list)
 
             if self.split == False:
-                if not self.is_empty and self._dtype_clash(
+                if self.is_empty:
+                    self.append_features_list()
+
+                elif not self.is_empty and self._dtype_clash(
                     self.curr_dtype, new_dtype
                 ):  # If append_to file has data and incoming data is incompatible with that file
                     self.retype_data(new_dtype)
@@ -61,6 +64,11 @@ class Appender(IsauraBase):
                     list(filtered_values),
                 )
                 w.write_append(self.curr_api, filtered_pub_keys, filtered_pub_values)
+
+    def append_features_list(self):
+        featuress = self.curr_reader._get_features(self.curr_api)
+        w = Writer(self.model_id)
+        w._write_features_api(self.curr_api, features)
 
     def _check_new_dtype(self, data):
         if type(data) != type(None):
