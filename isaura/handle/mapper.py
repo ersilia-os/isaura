@@ -14,7 +14,8 @@ class Mapper(IsauraBase):
         curr_api_keys = set()
         for file in self.avail_data_files():
             r = Reader(file, self.model_id)
-            curr_api_keys.update(r._get_keys(api_name))
+            keys = r._get_keys(api_name)
+            curr_api_keys.update(keys)
         return self._filter(curr_api_keys, new_keys)
 
     def filter_file(self, file_path, api_name, new_keys):

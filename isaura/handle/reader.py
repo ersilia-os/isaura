@@ -10,6 +10,10 @@ class Reader(IsauraBase):
         self.ranges = Ranges()
         self.data_path = data_path
 
+    def _asstr(self, grp, name):
+        v = grp[name][:]
+        return [x.decode("utf-8") for x in v]
+
     def read_by_idx(self, api_name, idxs):
         idxs = np.array(idxs)
         mapping = np.argsort(idxs)
@@ -39,24 +43,17 @@ class Reader(IsauraBase):
 
     def _get_features(self, api_name):
         with h5py.File(self.data_path, "r") as f:
-            features = list(f.get(api_name)["Features"].asstr())
+            grp = f.get(api_name)
+            features = self._asstr(grp, "Features")
         return features
-
-    def yield_api(self, api_name):
-        if self._check_api_exists(self.data_path, api_name):
-            with h5py.File(self.data_path, "r") as f:
-                for key, data in zip(
-                    f.get(api_name)["Keys"].asstr(), f.get(api_name)["Values"]
-                ):
-                    yield key, self._decode(data)
-        return False
 
     def read_api(self, api_name):
         if self._check_api_exists(self.data_path, api_name):
             with h5py.File(self.data_path, "r") as f:
+                grp = f.get(api_name)
                 keys, values = (
-                    np.array(f.get(api_name)["Keys"].asstr()),
-                    np.array(f.get(api_name)["Values"]),
+                    np.array(self._asstr(grp, "Keys")),
+                    np.array(grp["Values"]),
                 )
                 return keys, self._decode(values)
         return None, None
@@ -67,17 +64,16 @@ class Reader(IsauraBase):
 
     def _get_keys(self, api_name):
         keys = []
-        with h5py.File(self.data_path, "r") as f:
-            if self._check_api_exists(self.data_path, api_name):
-                keys = list(f.get(api_name)["Keys"].asstr())
+        if self._check_api_exists(self.data_path, api_name):
+            with h5py.File(self.data_path, "r") as f:
+                grp = f.get(api_name)
+                keys = self._asstr(grp, "Keys")
         return keys
 
     def _index_keys(self, api_name):
         indices = {}
-        with h5py.File(self.data_path, "r") as f:
-            if self._check_api_exists(self.data_path, api_name):
-                keys = f.get(api_name)["Keys"].asstr()
-                indices = {k: i for i, k in enumerate(keys)}
+        keys = self._get_keys(api_name)
+        indices = {k: i for i, k in enumerate(keys)}
         return indices
 
     def _decode(self, data):
