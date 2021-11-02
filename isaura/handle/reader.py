@@ -1,5 +1,5 @@
 from ..core.base import IsauraBase
-from ..dtypes.numeric import Ranges
+from ..dtypes.numeric import Ranges, TypeMask
 import h5py
 import numpy as np
 
@@ -79,9 +79,9 @@ class Reader(IsauraBase):
         return indices
 
     def _decode(self, data):
-        max_of_type = self.ranges.max_of_type(data)
+        mask_value = TypeMask(data.dtype).mask
         data = data.astype(np.float32)
-        data[data == max_of_type] = np.nan
+        data[data == mask_value] = np.nan
         return data
 
     def get_dtype(self, api_name):

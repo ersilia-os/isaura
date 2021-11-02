@@ -149,3 +149,13 @@ class NumericDataTyper(object):
 
     def data_size(self, dt):  # Byte size of data type
         return np.dtype(dt).itemsize
+
+
+class TypeMask(object):
+    def __init__(self, dtype):
+        self.dtype = dtype
+        try:
+            info = np.iinfo(self.dtype)
+        except:
+            info = np.finfo(self.dtype)
+        self.mask = info.max

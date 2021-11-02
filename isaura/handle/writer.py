@@ -2,6 +2,7 @@ from ..core.base import IsauraBase
 from ..handle.mapper import Mapper
 
 # from isaura.dtypes.numeric import NumericDataTyper
+from ..dtypes.numeric import TypeMask
 import h5py
 import numpy as np
 
@@ -15,7 +16,7 @@ class Writer(IsauraBase):
             self.path = path
 
         self._create_h5(self.path)
-        self.dtype = np.float32
+        self.set_dtype(np.float32)
 
     def _unique_keys(self, keys):
         _, idxs = np.unique(keys, return_index=True)
@@ -118,7 +119,7 @@ class Writer(IsauraBase):
     def _encode(self, data, dtype):
         for index, element in enumerate(data):
             if np.isnan(element):
-                data[index] = dtype.max
+                data[index] = self.mask_value
 
     def _get_dtype_info(self, dtype):
         dtype_char = np.sctype2char(dtype)
@@ -137,3 +138,4 @@ class Writer(IsauraBase):
 
     def set_dtype(self, new_dtype):
         self.dtype = new_dtype
+        self.mask_value = TypeMask(new_dtype).mask
