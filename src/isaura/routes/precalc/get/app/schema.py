@@ -5,11 +5,12 @@ from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
-from rivets.schemas.common import RequestContext
+from isaura.routes.schemas.common import RequestContext
 
 
 class Precalc(BaseModel):
     """Precalulated predictions"""
+
     pass
 
 
@@ -30,7 +31,6 @@ class QueryType(Enum):
 
     GET_ALL_PRECALC = "get_all_precalc"
     GET_PRECALC_BY_ID = "get_precalc_by_id"
-    
 
 
 class QueryParams(BaseModel):
