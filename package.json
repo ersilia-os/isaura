@@ -1,0 +1,29 @@
+{
+  "name": "isaura",
+  "version": "0.1.0",
+  "description": "Isaura data lake for pre-computed Ersilia properties",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ersilia-os/isaura.git"
+  },
+  "keywords": [
+    "aws",
+    "cdk",
+    "IaaC",
+    "datalake",
+    "ersilia"
+  ],
+  "author": "Ersilia",
+  "license": "GPL-3.0-or-later",
+  "bugs": {
+    "url": "https://github.com/ersilia-os/isaura/issues"
+  },
+  "homepage": "https://github.com/ersilia-os/isaura#readme",
+  "dependencies": {
+    "aws-cdk": "^2.50.0"
+  }
+}

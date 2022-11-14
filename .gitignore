@@ -129,3 +129,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# node
+node_modules
+.venv_dev
+.venv_prod
+cdk.out
