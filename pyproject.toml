@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "isaura"
-version = "0.6.0"
+version = "0.7.0"
 description = "Isaura data lake for pre-computed Ersilia properties"
 authors = ["Ersilia "]
 license = "GPLv3"
