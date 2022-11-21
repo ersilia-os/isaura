@@ -19,7 +19,7 @@ class Precalc(BaseModel):
     """Schema for Preclac object."""
 
     model_id: str = Field(alias="pk")
-    input_hash: str = Field(alias="sk")
+    input_key: str = Field(alias="sk")
     value: Dict
 
     @validator("value")
@@ -27,6 +27,15 @@ class Precalc(BaseModel):
         return json.loads(
             json.dumps(v, default=decimal_json_decoder), parse_float=Decimal
         )
+
+    @property
+    def precalc_id(self: "Precalc") -> str:
+        """Get precalc id str.
+
+        Returns:
+            str: precalc_id
+        """
+        return f"{self.model_id}#{self.input_key}"
 
     class Config:
         ignore_extra = False
