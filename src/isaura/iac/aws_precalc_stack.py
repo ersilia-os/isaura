@@ -4,7 +4,13 @@ from pathlib import Path
 from os import path, makedirs
 import shutil
 
-from aws_cdk import aws_dynamodb as dynamodb, aws_lambda as λ, aws_logs as logs, Stack
+from aws_cdk import (
+    aws_dynamodb as dynamodb,
+    aws_lambda as λ,
+    aws_logs as logs,
+    Stack,
+    CfnOutput,
+)
 
 from aws_cdk.aws_s3 import Bucket, HttpMethods as S3HttpMethod
 
@@ -118,4 +124,30 @@ class IsauraMainStack(Stack):
             ),
             log_retention=logs.RetentionDays.THREE_DAYS,
         )
+        status_heartbeat_λ_url = status_heartbeat_λ.add_function_url(
+            auth_type=λ.FunctionUrlAuthType.NONE
+        )
         isaura_table.grant_read_data(status_heartbeat_λ)
+
+        precalc_get_λ = λ.Function(
+            scope=self,
+            id="isaura_lambda_precalc_get",
+            function_name="isaura_lambda_precalc_get",
+            runtime=λ.Runtime.PYTHON_3_8,
+            handler="app.handler.get",
+            layers=[isaura_lambda_layer],
+            code=λ.Code.from_asset(
+                path.abspath(
+                    Path(__file__).parents[1].joinpath("routes/precalc/get").absolute()
+                )
+            ),
+            log_retention=logs.RetentionDays.THREE_DAYS,
+        )
+        precalc_get_λ_url = precalc_get_λ.add_function_url(
+            auth_type=λ.FunctionUrlAuthType.NONE
+        )
+        isaura_table.grant_read_data(precalc_get_λ)
+
+        CfnOutput(self, "region", value=self.region)
+        CfnOutput(self, "statusLambdaUrl", value=status_heartbeat_λ_url.url)
+        CfnOutput(self, "precalcGetLambdaUrl", value=precalc_get_λ_url.url)
