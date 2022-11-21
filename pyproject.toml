@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "isaura"
-version = "0.1.0"
+version = "0.6.0"
 description = "Isaura data lake for pre-computed Ersilia properties"
 authors = ["Ersilia "]
 license = "GPLv3"
@@ -11,6 +11,7 @@ boto3 = "^1.26.8"
 pydantic = { extras = ["dotenv"], version = "^1.10.2" }
 aws-lambda-powertools = { extras = ["pydantic"], version = "^2.2.0" }
 loguru = "^0.6.0"
+h5py = "^3.7.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
