@@ -1,3 +1,4 @@
+from http import HTTPStatus
 from typing import Any, Dict
 
 from aws_lambda_powertools.logging import Logger
@@ -6,36 +7,58 @@ from aws_lambda_powertools.utilities.typing import LambdaContext
 from pydantic import ValidationError
 
 from isaura.blocs.precalc import read_precalc
-from isaura.utils import get_dynamo_table
 
 
 # NOTE: Relative import is important due to how lambdas work
 # !WARN: Do not change to absolute imports
-from .schema import ResponseSchema, RequestSchema
+from .schema import ResponseSchema, ResponseBodySchema, RequestSchema
 
 
 # Setup handler state
 logger = Logger(service="isaura_precalc_get", level="INFO")
-isaura_table = get_dynamo_table("isaura")
 
 
 # API handler
 def get(event: Dict[str, Any], context: LambdaContext) -> ResponseSchema:
-    """Get handler."""
+    """Get handler.
+
+    Args:
+        event (Dict[str, Any]): Lamda event
+        context (LambdaContext): Lambda context
+
+    Returns:
+        ResponseSchema: API response
+    """
     try:
         req = parse(event, RequestSchema)
     except ValidationError as e:
         logger.exception("Validation Error")
-        return ResponseSchema(e)
+        return ResponseSchema(
+            statusCode=HTTPStatus.BAD_REQUEST,
+            headers={"Content-Type": "application/json"},
+            body=ResponseBodySchema(
+                msg="FAILED", items=[], last_eval_key=None, errors=e
+            ),
+        ).dict()
 
     query_params = req.queryStringParameters
-    token = req.requestContext.authorizer.jwt
-
     try:
-        precalc_list = read_precalc(isaura_table, token, query_params)
+        precalc_list, last_eval_key = read_precalc(query_params)
     except BaseException as e:
         # TODO: log error to a central service
         logger.exception("Query resolve error")
-        return ResponseSchema(e)
+        return ResponseSchema(
+            statusCode=HTTPStatus.BAD_REQUEST,
+            headers={"Content-Type": "application/json"},
+            body=ResponseBodySchema(
+                msg="FAILED", items=[], last_eval_key=None, errors=e
+            ),
+        ).dict()
 
-    return ResponseSchema(precalc_list)
+    return ResponseSchema(
+        statusCode=HTTPStatus.OK,
+        headers={"Content-Type": "application/json"},
+        body=ResponseBodySchema(
+            msg="OK", items=precalc_list, last_eval_key=last_eval_key, errors=[]
+        ),
+    ).dict()
