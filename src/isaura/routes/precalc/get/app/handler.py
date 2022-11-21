@@ -37,7 +37,7 @@ def get(event: Dict[str, Any], context: LambdaContext) -> ResponseSchema:
             statusCode=HTTPStatus.BAD_REQUEST,
             headers={"Content-Type": "application/json"},
             body=ResponseBodySchema(
-                msg="FAILED", items=[], last_eval_key=None, errors=e
+                msg="FAILED", items=[], last_eval_key=None, errors=e.json()
             ),
         ).dict()
 
@@ -59,6 +59,6 @@ def get(event: Dict[str, Any], context: LambdaContext) -> ResponseSchema:
         statusCode=HTTPStatus.OK,
         headers={"Content-Type": "application/json"},
         body=ResponseBodySchema(
-            msg="OK", items=precalc_list, last_eval_key=last_eval_key, errors=[]
+            msg="OK", items=precalc_list, last_eval_key=last_eval_key, errors=""
         ),
     ).dict()

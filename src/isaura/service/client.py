@@ -46,7 +46,7 @@ class IsauraClient:
     def __init__(self: "IsauraClient", api_url: str) -> None:
         self.api_url = api_url
 
-    def get_all_precals(
+    def get_all_precalcs(
         self: "IsauraClient", last_eval_key: Optional[str] = None
     ) -> ResponseBodySchema:
         """Get all precals.
@@ -69,8 +69,8 @@ class IsauraClient:
             errors=resp.json()["errors"],
         )
 
-    def get_precals_by_id(self: "IsauraClient", precalc_id: str) -> ResponseBodySchema:
-        """Get all precals.
+    def get_precalc_by_id(self: "IsauraClient", precalc_id: str) -> ResponseBodySchema:
+        """Get precalc by id.
 
         Args:
             precalc_id (str): model_id#input_key.
@@ -92,7 +92,7 @@ class IsauraClient:
             errors=resp.json()["errors"],
         )
 
-    def get_precals_by_model_id(
+    def get_precalcs_by_model_id(
         self: "IsauraClient", model_id: str
     ) -> ResponseBodySchema:
         """Get all precals.
@@ -117,7 +117,7 @@ class IsauraClient:
             errors=resp.json()["errors"],
         )
 
-    def get_precals_by_input_key(
+    def get_precalcs_by_input_key(
         self: "IsauraClient", model_id_list: List[str], input_key: str
     ) -> ResponseBodySchema:
         """Get all precals.
@@ -129,17 +129,14 @@ class IsauraClient:
         Returns:
             ResponseBodySchema: Api response.
         """
-        params = QueryParams(
-            query_type=QueryType.GET_PRECALC_BY_INPUT_KEY,
-            last_eval_key=None,
-            model_id_list=model_id_list,
-            input_key=input_key,
-        )
+        items = []
+        for model_id in model_id_list:
+            resp = self.get_precalc_by_id(f"{model_id}#{input_key}")
+            items.append(resp.items[0])
 
-        resp = requests.get(url=self.api_url, params=params.dict())
         return ResponseBodySchema(
-            msg=resp.json()["msg"],
-            items=parse_obj_as(List[Precalc], resp.json()["items"]),
-            last_eval_key=resp.json()["last_eval_key"],
-            errors=resp.json()["errors"],
+            msg=resp.msg,
+            items=items,
+            last_eval_key=None,
+            errors=resp.errors,
         )
