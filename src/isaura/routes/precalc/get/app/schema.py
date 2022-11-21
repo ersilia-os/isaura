@@ -3,27 +3,9 @@
 from enum import Enum
 from typing import Any, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
-from isaura.routes.schemas.common import RequestContext
-
-
-class Precalc(BaseModel):
-    """Precalulated predictions"""
-
-    pass
-
-
-class FilterParams(BaseModel):
-    """Filter parameters."""
-
-    precalc_id: str
-
-
-class OrderByEnum(Enum):
-    """OrderBy Enum."""
-
-    CREATION_TIMESTAMP = "CREATION_TIMESTAMP"
+from isaura.routes.schemas.common import Precalc
 
 
 class QueryType(Enum):
@@ -31,6 +13,8 @@ class QueryType(Enum):
 
     GET_ALL_PRECALC = "get_all_precalc"
     GET_PRECALC_BY_ID = "get_precalc_by_id"
+    GET_PRECALC_BY_MODEL_ID = "get_precalc_by_model_id"
+    GET_PRECALC_BY_INPUT_KEY = "get_precalc_by_input_key"
 
 
 class QueryParams(BaseModel):
@@ -39,13 +23,19 @@ class QueryParams(BaseModel):
     query_type: QueryType
     last_eval_key: Optional[int]
     precalc_id: Optional[str]
+    model_id: Optional[str]
+    input_key: Optional[str]
+    model_id_list: Optional[List[str]]
+
+    @validator("query_type")
+    def convert_query_type_to_str(cls, v):
+        return v.value
 
 
 class RequestSchema(BaseModel):
     """Request schema."""
 
     queryStringParameters: QueryParams
-    requestContext: RequestContext
 
 
 class ResponseBodySchema(BaseModel):
@@ -53,6 +43,7 @@ class ResponseBodySchema(BaseModel):
 
     msg: str
     items: List[Precalc]
+    last_eval_key: Optional[str]
     errors: Any
 
 
