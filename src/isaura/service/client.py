@@ -68,3 +68,78 @@ class IsauraClient:
             last_eval_key=resp.json()["last_eval_key"],
             errors=resp.json()["errors"],
         )
+
+    def get_precals_by_id(self: "IsauraClient", precalc_id: str) -> ResponseBodySchema:
+        """Get all precals.
+
+        Args:
+            precalc_id (str): model_id#input_key.
+
+        Returns:
+            ResponseBodySchema: Api response.
+        """
+        params = QueryParams(
+            query_type=QueryType.GET_PRECALC_BY_ID,
+            last_eval_key=None,
+            precalc_id=precalc_id,
+        )
+
+        resp = requests.get(url=self.api_url, params=params.dict())
+        return ResponseBodySchema(
+            msg=resp.json()["msg"],
+            items=parse_obj_as(List[Precalc], resp.json()["items"]),
+            last_eval_key=resp.json()["last_eval_key"],
+            errors=resp.json()["errors"],
+        )
+
+    def get_precals_by_model_id(
+        self: "IsauraClient", model_id: str
+    ) -> ResponseBodySchema:
+        """Get all precals.
+
+        Args:
+            model_id (str): model ID.
+
+        Returns:
+            ResponseBodySchema: Api response.
+        """
+        params = QueryParams(
+            query_type=QueryType.GET_PRECALC_BY_MODEL_ID,
+            last_eval_key=None,
+            model_id=model_id,
+        )
+
+        resp = requests.get(url=self.api_url, params=params.dict())
+        return ResponseBodySchema(
+            msg=resp.json()["msg"],
+            items=parse_obj_as(List[Precalc], resp.json()["items"]),
+            last_eval_key=resp.json()["last_eval_key"],
+            errors=resp.json()["errors"],
+        )
+
+    def get_precals_by_input_key(
+        self: "IsauraClient", model_id_list: List[str], input_key: str
+    ) -> ResponseBodySchema:
+        """Get all precals.
+
+        Args:
+            model_id_list (str): List of model IDs.
+            input_key (str): ID of the molecule.
+
+        Returns:
+            ResponseBodySchema: Api response.
+        """
+        params = QueryParams(
+            query_type=QueryType.GET_PRECALC_BY_INPUT_KEY,
+            last_eval_key=None,
+            model_id_list=model_id_list,
+            input_key=input_key,
+        )
+
+        resp = requests.get(url=self.api_url, params=params.dict())
+        return ResponseBodySchema(
+            msg=resp.json()["msg"],
+            items=parse_obj_as(List[Precalc], resp.json()["items"]),
+            last_eval_key=resp.json()["last_eval_key"],
+            errors=resp.json()["errors"],
+        )
