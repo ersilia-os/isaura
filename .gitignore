@@ -135,3 +135,4 @@ node_modules
 .venv_dev
 .venv_prod
 cdk.out
+scratch
