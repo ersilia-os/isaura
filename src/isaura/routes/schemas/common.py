@@ -40,3 +40,4 @@ class Precalc(BaseModel):
     class Config:
         ignore_extra = False
         allow_population_by_field_name = True
+        orm_mode = True
