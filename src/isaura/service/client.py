@@ -1,11 +1,16 @@
 """Isaura clients."""
 
+import json
+from pathlib import Path
 from typing import List, Optional
 
 import requests
 from pydantic import parse_obj_as
+from sqlalchemy import create_engine, delete, select
+from sqlalchemy.orm import sessionmaker
 
-
+from isaura.local.mixins import DBModel
+from isaura.local.models import PrecalcDB
 from isaura.routes.precalc.get.app.schema import (
     ResponseBodySchema,
     QueryParams,
@@ -13,6 +18,9 @@ from isaura.routes.precalc.get.app.schema import (
 )
 from isaura.routes.schemas.common import Precalc
 from isaura.utils.aws import get_dynamo_table
+from isaura.utils.dirs import get_workspace_path
+
+default_workspace_path = get_workspace_path()
 
 
 class IsauraAdminClient:
@@ -140,3 +148,119 @@ class IsauraClient:
             last_eval_key=None,
             errors=resp.errors,
         )
+
+
+class IsauraLocalClient:
+    """Client to interact with local cache."""
+
+    def __init__(
+        self, db_path: Path = default_workspace_path.joinpath("isaura_local.db")
+    ) -> None:
+        db_engine = create_engine(f"sqlite:///{db_path}")
+        self.DBSession = sessionmaker(db_engine)
+        DBModel.metadata.create_all(db_engine)
+
+    def insert(self: "IsauraLocalClient", precalc_list: List[Precalc]) -> None:
+        """Add precals to local sqlitedb in batches.
+
+        Args:
+            precalc_list (List[Precalc]): List of Precalc objects
+        """
+        with self.DBSession() as session:
+            precalc_db_list = [
+                PrecalcDB(precalc_id=precalc.precalc_id, **json.loads(precalc.json()))
+                for precalc in precalc_list
+            ]
+            PrecalcDB.bulk_create(precalc_db_list, session)
+
+    def delete(self: "IsauraLocalClient", precalc_id_list: List[str]) -> None:
+        """Remove precals from local sqlitedb in batches.
+
+        Args:
+            precalc_id_list (List[Precalc]): List of Precalc Ids to delete.
+        """
+        stmt = delete(PrecalcDB).where(PrecalcDB.precalc_id.in_(precalc_id_list))
+        print(stmt)
+        with self.DBSession() as session:
+            session.execute(stmt)
+            session.commit()
+
+    def get_all_precalcs(
+        self: "IsauraLocalClient", page: int = 0, limit: int = 100
+    ) -> List[Precalc]:
+        """Get all precals.
+
+        Args:
+            page (int): page key for pagination. Defaults to 0.
+            limit (int): Items to return per page.
+
+        Returns:
+            List[Precalc]: List of fetched precalcs.
+        """
+        stmt = select(PrecalcDB).limit(limit).offset(page * limit)
+        with self.DBSession() as session:
+            precalc_db_list: List[PrecalcDB] = session.execute(stmt).scalars().all()
+            return [Precalc.from_orm(obj) for obj in precalc_db_list]
+
+    def get_precalc_by_id(self: "IsauraLocalClient", precalc_id: str) -> List[Precalc]:
+        """Get precalc by id.
+
+        Args:
+            precalc_id (str): model_id#input_key.
+
+        Returns:
+            List[Precalc]: List of fetched precalcs.
+        """
+        stmt = select(PrecalcDB).where(PrecalcDB.precalc_id == precalc_id)
+
+        with self.DBSession() as session:
+            precalc_db_list: List[PrecalcDB] = session.execute(stmt).scalars().all()
+            return [Precalc.from_orm(obj) for obj in precalc_db_list]
+
+    def get_precalc_by_model_id(
+        self: "IsauraLocalClient", model_id: str, page: int = 0, limit: int = 100
+    ) -> List[Precalc]:
+        """Get precalc by id.
+
+        Args:
+            model_id (str): model_id.
+            page (int): page key for pagination. Defaults to 0.
+            limit (int): Items to return per page.
+
+        Returns:
+            List[Precalc]: List of fetched precalcs.
+        """
+        stmt = (
+            select(PrecalcDB)
+            .where(PrecalcDB.model_id == model_id)
+            .limit(limit)
+            .offset(page * limit)
+        )
+
+        with self.DBSession() as session:
+            precalc_db_list: List[PrecalcDB] = session.execute(stmt).scalars().all()
+            return [Precalc.from_orm(obj) for obj in precalc_db_list]
+
+    def get_precalc_by_input_key(
+        self: "IsauraLocalClient", input_key: str, page: int = 0, limit: int = 100
+    ) -> List[Precalc]:
+        """Get precalc by id.
+
+        Args:
+            input_key (str): input_key.
+            page (int): page key for pagination. Defaults to 0.
+            limit (int): Items to return per page.
+
+        Returns:
+            List[Precalc]: List of fetched precalcs.
+        """
+        stmt = (
+            select(PrecalcDB)
+            .where(PrecalcDB.input_key == input_key)
+            .limit(limit)
+            .offset(page * limit)
+        )
+
+        with self.DBSession() as session:
+            precalc_db_list: List[PrecalcDB] = session.execute(stmt).scalars().all()
+            return [Precalc.from_orm(obj) for obj in precalc_db_list]
