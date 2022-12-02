@@ -47,7 +47,7 @@ poetry install
 poetry build
 
 # In production environment
-pip install -f dist/[lastest built wheel]
+pip install dist/[lastest built wheel]
 ```
 
 ### Bootstrap CDK
