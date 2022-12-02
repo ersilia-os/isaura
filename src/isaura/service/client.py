@@ -77,11 +77,14 @@ class IsauraClient:
             errors=resp.json()["errors"],
         )
 
-    def get_precalc_by_id(self: "IsauraClient", precalc_id: str) -> ResponseBodySchema:
+    def get_precalc_by_id(
+        self: "IsauraClient", precalc_id: str, only_keys: bool = False
+    ) -> ResponseBodySchema:
         """Get precalc by id.
 
         Args:
             precalc_id (str): model_id#input_key.
+            only_keys (bool): Only fetch keys if present.
 
         Returns:
             ResponseBodySchema: Api response.
@@ -90,6 +93,7 @@ class IsauraClient:
             query_type=QueryType.GET_PRECALC_BY_ID,
             last_eval_key=None,
             precalc_id=precalc_id,
+            only_keys=only_keys,
         )
 
         resp = requests.get(url=self.api_url, params=params.dict())

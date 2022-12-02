@@ -2,7 +2,7 @@
 
 from decimal import Decimal
 import json
-from typing import Dict
+from typing import Dict, Optional
 
 from pydantic import BaseModel, Field, validator
 
@@ -20,7 +20,7 @@ class Precalc(BaseModel):
 
     model_id: str = Field(alias="pk")
     input_key: str = Field(alias="sk")
-    value: Dict
+    value: Optional[Dict]
 
     @validator("value")
     def convert_float_to_decimals(cls, v):

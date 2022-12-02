@@ -43,9 +43,16 @@ def read_precalc(query_params: QueryParams) -> Tuple[List[Precalc], str]:
                 model=QueryParams,
             )
             raise e
+
+        if query_params.only_keys:
+            projection = "pk,sk"
+        else:
+            projection = ""
+
         res = dynamo_table_client.query(
             KeyConditionExpression=Key("pk").eq(query_params.precalc_id.split("#")[0])
-            & Key("sk").eq(query_params.precalc_id.split("#")[1])
+            & Key("sk").eq(query_params.precalc_id.split("#")[1]),
+            ProjectionExpression=projection,
         )
     elif query_type == QueryType.GET_PRECALC_BY_MODEL_ID:
         if query_params.model_id is None:

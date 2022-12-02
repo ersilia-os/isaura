@@ -25,6 +25,7 @@ class QueryParams(BaseModel):
     precalc_id: Optional[str]
     model_id: Optional[str]
     input_key: Optional[str]
+    only_keys: Optional[bool] = False
 
     @validator("query_type")
     def convert_query_type_to_str(cls, v):
