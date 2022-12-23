@@ -134,8 +134,9 @@ npm install
 python -m build
 
 # activate prod venv and install packaage
+source .venv_prod/bin/activate
 pip install dist/[lastest built wheel]
-
+deactivate
 # This is required so that our lambda functions can use isaura package
 ```
 
