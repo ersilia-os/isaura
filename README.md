@@ -11,57 +11,11 @@ This repository provides an interface to the precalculated data available from t
 - Python >=v3.8
 - Nodejs >=v18.12.1
 
-### Create two python virtual env
-
-`.venv_dev` is used for development and local usage.
-
-`.venv_prod` is used for creating lambda layers for production use.
+### Create a conda environment
 
 ```bash
-# ! This is important. Do not use conda or any other venv alternatives
-python -m venv .venv_dev
-python -m venv .venv_prod
-```
-
-### Install poetry
-
-Do this for dev environments
-
-```bash
-pip install poetry
-```
-
-### Install CDK CLI dependencies
-
-```bash
-npm install
-```
-
-### Install Python dependencies
-
-```bash
-# In dev environment
-poetry install
-
-# build isaura package for prod env
-poetry build
-
-# In production environment
-pip install dist/[lastest built wheel]
-```
-
-### Bootstrap CDK
-
-This only needs to be done once for an aws account.
-
-```bash
-npx cdk bootstrap
-```
-
-### Deploy Isaura infrastructure
-
-```bash
-npx cdk deploy
+conda env create -f eny.yaml
+conda activate isaura
 ```
 
 ## Isaura clients
@@ -150,4 +104,51 @@ precalcs = local_client.get_precalcs_by_model_id(model_id="")
 
 # Get precalc by input key
 precalcs = local_client.get_precalcs_by_input_key(input_key = "")
+```
+
+## Provision AWS infrastructure
+
+This is only required if you want to host you own remote cache.
+
+### Create a python virtual env
+
+`.venv_prod` is used for creating lambda layers used by lamda function on aws.
+Do not use this virtual envirinment for anything else.
+
+```bash
+# ! This is important. Do not use conda or any other venv alternatives
+python -m venv .venv_prod
+```
+
+### Install CDK CLI dependencies
+
+```bash
+npm install
+```
+
+### Install Python dependencies
+
+```bash
+
+# build isaura package for prod env
+python -m build
+
+# activate prod venv and install packaage
+pip install dist/[lastest built wheel]
+
+# This is required so that our lambda functions can use isaura package
+```
+
+### Bootstrap CDK
+
+This only needs to be done once for an aws account.
+
+```bash
+npx cdk bootstrap
+```
+
+### Deploy Isaura infrastructure
+
+```bash
+npx cdk deploy
 ```

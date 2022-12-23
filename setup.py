@@ -3,9 +3,6 @@ import setuptools
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-with open("requirements.txt") as f:
-    install_requires = f.read().splitlines()
-
 setuptools.setup(
     name="isaura",
     version="0.0.1",
@@ -15,8 +12,9 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/ersilia-os/isaura",
-    project_urls={"GitBook": "https://ersilia.gitbook.io/ersilia/",},
-    install_requires=install_requires,
+    project_urls={
+        "GitBook": "https://ersilia.gitbook.io/ersilia/",
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
