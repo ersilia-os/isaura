@@ -14,7 +14,7 @@ This repository provides an interface to the precalculated data available from t
 ### Create a conda environment
 
 ```bash
-conda env create -f eny.yaml
+conda env create -f env.yaml
 conda activate isaura
 ```
 
