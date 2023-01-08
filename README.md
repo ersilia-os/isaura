@@ -53,7 +53,7 @@ Please look at sections below for more detailed examples and documentation of th
 
 ### Isaura remote client
 
-User client interacts with remote cache to perform read functions. No AWS account is required. read API is open for public use.
+Remote client interacts with remote cache to perform read functions. Find the programming API below.
 
 ```python
 from isaura.service.client import IsauraRemoteClient
