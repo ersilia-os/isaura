@@ -4,57 +4,69 @@ A library to cache precalculated properties of biomedical entities on remote inf
 
 This repository provides an interface to the precalculated data available from the Ersilia Model Hub. At the moment, Isaura is focused on chemical descriptors.
 
-## Getting Started
+## Quick start guide
 
-### Requirement for local development
-
-- Python >=v3.8
-- Nodejs >=v18.12.1
-
-### Create a conda environment
+### 1. Create a conda environment and activate it
 
 ```bash
 conda env create -f env.yaml
 conda activate isaura
 ```
 
-## Isaura clients
+### 2. Clone the repository and install it with pip
 
-This library provide user friendly clients to interact with remote and local cache.
+```bash
+git clone https://github.com/ersilia-os/isaura.git
+cd isaura
+pip install -e .
+```
 
-### Isaura Admin client
-
-Admin client interacts with remote cache to perform insert and delete functions. An AWS account with permissions to isaura dynamo table is required to use admin client.
+### 3. Once Isaura is installed, you can start using Isaura Clients to fetch pre calculations from ersilia and store it in your local cache. First create an `IsauraRemoteClient` to fetch pre calculations from ersilia
 
 ```python
+from isaura.service.client import IsauraRemoteClient
 
-from isaura.routes.schemas.common import Precalc
-from isaura.service.client import IsauraAdminClient
+# Initialize the user client with the API url
+# Find the url for Ersilia Precalc API [here]
+remote_client = IsauraRemoteClient(url = [Ersilia Precalc API URL])
 
-admin_client = IsauraAdminClient()
+# Client returns a `ResponseBodySchema` object
+resp = remote_client.get_all_precalcs()
+precalcs = resp.items
+```
+
+### 4. Create an `IsauraLocalClient` to store pre calculations fetched from ersilia locally
+
+```python
+from isaura.service.client import IsauraLocalClient
+
+# This will initialize a local sqlite3 database at ~/.local/eos/isaura_local.db
+local_client = IsauraLocalClient()
 
 # Use the Precalc class to create precalc objects
 precalc = Precalc(model_id = "model id", input_key = "input key", value = {"out" : "model output value"})
 
 # Insert precalcs in bulk
-admin_client.insert([precalc])
-
-# Delete precalc in bulk with precalc ids
-admin_client.delete([precalc.precalc_id])
+local_client.insert([precalc for precalc in precalcs])
 ```
 
-### Isaura user client
+Please look at sections below for more detailed examples and documentation of the programming API.
+
+## Isaura clients
+
+### Isaura remote client
 
 User client interacts with remote cache to perform read functions. No AWS account is required. read API is open for public use.
 
 ```python
-from isaura.service.client import IsauraClient
+from isaura.service.client import IsauraRemoteClient
 
 # Initialize the user client with the API url
-user_client = IsauraClient(url = "")
+# Find the url for Ersilia Precalc API [here]
+remote_client = IsauraRemoteClient(url = [Ersilia Precalc API URL])
 
 # Client returns a `ResponseBodySchema` object
-resp = user_client.get_all_precalcs(last_eval_key=None)
+resp = remote_client.get_all_precalcs(last_eval_key=None)
 precalcs = resp.items
 
 # If last_eval_key is not `None` then more data is available
@@ -62,16 +74,16 @@ precalcs = resp.items
 last_eval_key = resp.last_eval_key
 
 # Get precalc by id
-resp = user_client.get_precalc_by_id(precalc_id="")
+resp = remote_client.get_precalc_by_id(precalc_id="")
 precalc = resp.items[0]
 
 # Get precalcs by model id
-resp = user_client.get_precalcs_by_model_id(model_id="")
+resp = remote_client.get_precalcs_by_model_id(model_id="")
 precalcs = resp.items
 
 # Get precalc by input key
 # A model id list is required
-resp = user_client.get_precalcs_by_input_key(model_id_list=[], input_key = "")
+resp = remote_client.get_precalcs_by_input_key(model_id_list=[], input_key = "")
 precalcs = resp.items
 ```
 
@@ -83,7 +95,12 @@ Local client interacts with local cache to perform read, write and delete functi
 from isaura.routes.schemas.common import Precalc
 from isaura.service.client import IsauraLocalClient
 
-local_client = IsauraLocalClient()
+# Local database can be created at a custom path
+# Defaults to ~/.local/eos/isaura_local.db
+local_client = IsauraLocalClient(db_path=[path to db])
+
+# Reset the local database
+local_client.reset()
 
 # Use the Precalc class to create precalc objects
 precalc = Precalc(model_id = "model id", input_key = "input key", value = {"out" : "model output value"})
@@ -106,9 +123,34 @@ precalcs = local_client.get_precalcs_by_model_id(model_id="")
 precalcs = local_client.get_precalcs_by_input_key(input_key = "")
 ```
 
+### Isaura Admin client
+
+Admin client interacts with remote cache to perform insert and delete functions. An AWS account with permissions to isaura dynamo table is required to use admin client.
+
+> You can skip this section if you only want to fetch precalculations hosted by Ersilia.
+
+```python
+
+from isaura.routes.schemas.common import Precalc
+from isaura.service.client import IsauraAdminClient
+
+admin_client = IsauraAdminClient()
+
+# Use the Precalc class to create precalc objects
+precalc = Precalc(model_id = "model id", input_key = "input key", value = {"out" : "model output value"})
+
+# Insert precalcs in bulk
+admin_client.insert([precalc])
+
+# Delete precalc in bulk with precalc ids
+admin_client.delete([precalc.precalc_id])
+```
+
 ## Provision AWS infrastructure
 
-This is only required if you want to host you own remote cache.
+This section explains how to host your own aws infrastructure for remote cahce (Do you want to host your own DynamoDB and pay for it?).
+
+**If you just want to use the pre calculations hosted by Ersilia then you can skip this section.**
 
 ### Create a python virtual env
 
@@ -153,3 +195,7 @@ npx cdk bootstrap
 ```bash
 npx cdk deploy
 ```
+
+## License
+
+This repository is open-sourced under [the GPL-3 License](https://github.com/ersilia-os/ersilia/blob/master/LICENSE). Please [cite us](https://github.com/ersilia-os/ersilia/blob/master/CITATION.cff) if you use it.
