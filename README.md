@@ -43,9 +43,6 @@ from isaura.service.client import IsauraLocalClient
 # This will initialize a local sqlite3 database at ~/.local/eos/isaura_local.db
 local_client = IsauraLocalClient()
 
-# Use the Precalc class to create precalc objects
-precalc = Precalc(model_id = "model id", input_key = "input key", value = {"out" : "model output value"})
-
 # Insert precalcs in bulk
 local_client.insert([precalc for precalc in precalcs])
 ```
