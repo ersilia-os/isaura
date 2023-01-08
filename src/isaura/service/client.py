@@ -160,9 +160,14 @@ class IsauraLocalClient:
     def __init__(
         self, db_path: Path = default_workspace_path.joinpath("isaura_local.db")
     ) -> None:
-        db_engine = create_engine(f"sqlite:///{db_path}")
-        self.DBSession = sessionmaker(db_engine)
-        DBModel.metadata.create_all(db_engine)
+        self.db_engine = create_engine(f"sqlite:///{db_path}")
+        self.DBSession = sessionmaker(self.db_engine)
+        DBModel.metadata.create_all(self.db_engine)
+
+    def reset(self: "IsauraLocalClient") -> None:
+        """Reset the local cache database."""
+        DBModel.metadata.drop_all(self.db_engine)
+        DBModel.metadata.create_all(self.db_engine)
 
     def insert(self: "IsauraLocalClient", precalc_list: List[Precalc]) -> None:
         """Add precals to local sqlitedb in batches.
