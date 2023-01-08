@@ -50,12 +50,12 @@ class IsauraAdminClient:
                 )
 
 
-class IsauraClient:
-    def __init__(self: "IsauraClient", api_url: str) -> None:
+class IsauraRemoteClient:
+    def __init__(self: "IsauraRemoteClient", api_url: str) -> None:
         self.api_url = api_url
 
     def get_all_precalcs(
-        self: "IsauraClient", last_eval_key: Optional[str] = None
+        self: "IsauraRemoteClient", last_eval_key: Optional[str] = None
     ) -> ResponseBodySchema:
         """Get all precals.
 
@@ -78,7 +78,7 @@ class IsauraClient:
         )
 
     def get_precalc_by_id(
-        self: "IsauraClient", precalc_id: str, only_keys: bool = False
+        self: "IsauraRemoteClient", precalc_id: str, only_keys: bool = False
     ) -> ResponseBodySchema:
         """Get precalc by id.
 
@@ -105,7 +105,7 @@ class IsauraClient:
         )
 
     def get_precalcs_by_model_id(
-        self: "IsauraClient", model_id: str
+        self: "IsauraRemoteClient", model_id: str
     ) -> ResponseBodySchema:
         """Get all precals.
 
@@ -130,7 +130,7 @@ class IsauraClient:
         )
 
     def get_precalcs_by_input_key(
-        self: "IsauraClient", model_id_list: List[str], input_key: str
+        self: "IsauraRemoteClient", model_id_list: List[str], input_key: str
     ) -> ResponseBodySchema:
         """Get all precals.
 
