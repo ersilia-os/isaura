@@ -149,6 +149,18 @@ This section explains how to host your own aws infrastructure for remote cahce (
 
 **If you just want to use the pre calculations hosted by Ersilia then you can skip this section.**
 
+### Requirements
+
+- Python >=v3.7
+- Nodejs >=v18.12.1
+
+### Create a conda environment and activate it
+
+```bash
+conda env create -f env.yaml
+conda activate isaura
+```
+
 ### Create a python virtual env
 
 `.venv_prod` is used for creating lambda layers used by lamda function on aws.
