@@ -6,22 +6,40 @@ This repository provides an interface to the precalculated data available from t
 
 ## Quick start guide
 
-### 1. Create a conda environment and activate it
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/ersilia-os/isaura.git
+cd isaura
+```
+### 2. Create a conda environment and activate it
 
 ```bash
 conda env create -f env.yaml
 conda activate isaura
 ```
 
-### 2. Clone the repository and install it with pip
+### 3. Clone the repository and install it with pip
 
 ```bash
-git clone https://github.com/ersilia-os/isaura.git
-cd isaura
 pip install -e .
 ```
 
-### 3. Once Isaura is installed, you can start using Isaura Clients to fetch pre calculations from ersilia and store it in your local cache. First create an `IsauraRemoteClient` to fetch pre calculations from ersilia
+### 4. Use Isaura to store pre-calculations locally
+Create an `IsauraLocalClient` to store pre calculations fetched from the Ersilia Model Hub locally
+
+```python
+from isaura.service.client import IsauraLocalClient
+
+# This will initialize a local sqlite3 database at ~/.local/eos/isaura_local.db
+local_client = IsauraLocalClient()
+
+# Insert precalcs in bulk
+local_client.insert([precalc for precalc in precalcs])
+```
+
+### 4. Fetch pre-calculations from online server
+Once Isaura is installed, you can start using Isaura Clients to fetch pre calculations from the Ersilia remote server and store them in your local cache. First create an `IsauraRemoteClient` to fetch pre calculations from ersilia
 
 ```python
 from isaura.service.client import IsauraRemoteClient
@@ -33,18 +51,6 @@ remote_client = IsauraRemoteClient(url = [Ersilia Precalc API URL])
 # Client returns a `ResponseBodySchema` object
 resp = remote_client.get_all_precalcs()
 precalcs = resp.items
-```
-
-### 4. Create an `IsauraLocalClient` to store pre calculations fetched from ersilia locally
-
-```python
-from isaura.service.client import IsauraLocalClient
-
-# This will initialize a local sqlite3 database at ~/.local/eos/isaura_local.db
-local_client = IsauraLocalClient()
-
-# Insert precalcs in bulk
-local_client.insert([precalc for precalc in precalcs])
 ```
 
 Please look at sections below for more detailed examples and documentation of the programming API.
