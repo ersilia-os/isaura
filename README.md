@@ -40,7 +40,7 @@ local_client.insert([precalc for precalc in precalcs])
 
 _If you are looking for the old isaura version to locally store precalculations in .h5 format, please use the release v0.1_
 
-### 4. Fetch pre-calculations from online server
+### 5. Fetch pre-calculations from online server
 Once Isaura is installed, you can start using Isaura Clients to fetch pre calculations from the Ersilia remote server and store them in your local cache. First create an `IsauraRemoteClient` to fetch pre calculations from ersilia
 
 ```python
