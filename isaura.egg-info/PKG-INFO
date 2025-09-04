@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: isaura
+Version: 0.1.0
+Summary: A lake of precalculated properties of biomedical entities based on the Ersilia Model Hub
+Author-email: Miquel Duran Frigola <miquel@ersilia.io>, Abel Legese Shibiru <abel@ersilia.io>
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: loguru>=0.7.3
+Requires-Dist: mypy>=1.17.1
+Requires-Dist: pymilvus>=2.6.0
+Requires-Dist: redis>=6.4.0
+Requires-Dist: requests>=2.32.5
+Requires-Dist: rich>=14.1.0
+Requires-Dist: rich-click>=1.8.9
+Requires-Dist: ruff>=0.12.9
+Requires-Dist: tqdm>=4.67.1
