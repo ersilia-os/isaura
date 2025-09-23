@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 isaura/__init__.py
 isaura/cli.py
+isaura/helpers.py
 isaura.egg-info/PKG-INFO
 isaura.egg-info/SOURCES.txt
 isaura.egg-info/dependency_links.txt
@@ -12,14 +13,14 @@ isaura/fetch/__init__.py
 isaura/fetch/approximate.py
 isaura/fetch/cloud.py
 isaura/fetch/dev.py
+isaura/fetch/interfaces.py
 isaura/fetch/local.py
 isaura/inspection/__init__.py
 isaura/inspection/entries.py
 isaura/inspection/tranches.py
+isaura/manage/migrate.py
+isaura/manage/remove.py
 isaura/register/__init__.py
 isaura/register/cloud.py
+isaura/register/dev.py
 isaura/register/local.py
-isaura/utils/__init__.py
-isaura/utils/helpers.py
-isaura/utils/logging.py
-isaura/utils/vars.py

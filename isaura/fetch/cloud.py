@@ -12,10 +12,14 @@ from isaura.helpers import (
 )
 
 
-class GetPrecalCloud:
-  def __init__(self, model_id: str, file_name: str = None, nsmaples: int = 1000):
+class GetStoreCloud:
+  def __init__(
+    self, model_id: str, version: str, file_name: str = None, n_samples: int = -1
+  ):
     super().__init__()
-    self.nsamples = nsmaples
+    self.version = version
+    assert self.version is not None, "version should not be empty!"
+    self.n_samples = n_samples
     self.model_id = model_id
     self.file_name = file_name
     self.request_id = None
@@ -38,7 +42,7 @@ class GetPrecalCloud:
       "requestid": self.request_id,
       "modelid": self.model_id,
       "fetchtype": self.fetch_type,
-      "nsamples": self.nsamples,
+      "nsamples": self.n_samples,
       "dim": len(self.schema[0]),
     }
     job_id = self.api.post_json(f"{API_BASE}/submit", json=payload)["jobId"]
@@ -47,7 +51,9 @@ class GetPrecalCloud:
 
     start = time.time()
     while True:
-      status = self.api.get_json(f"{API_BASE}/status", params={"jobId": job_id})["status"]
+      status = self.api.get_json(f"{API_BASE}/status", params={"jobId": job_id})[
+        "status"
+      ]
 
       logger.info(f"Job status: {status}")
 
@@ -87,12 +93,16 @@ class GetPrecalCloud:
 
     logger.info("⬇ No reorder list provided; writing to Milvus")
 
-    with download_progress(desc="⬇ downloading shards", total_bytes=total_size, transient=True) as (
+    with download_progress(
+      desc="⬇ downloading shards", total_bytes=total_size, transient=True
+    ) as (
       progress,
       task,
     ):
       for shard in gz_shards:
-        process_shard(shard, self.api, batch_size=batch_size, progress=progress, task=task)
+        process_shard(
+          shard, self.api, batch_size=batch_size, progress=progress, task=task
+        )
 
 
 class ApiClient:

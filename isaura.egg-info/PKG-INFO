@@ -5,9 +5,15 @@ Summary: A lake of precalculated properties of biomedical entities based on the 
 Author-email: Miquel Duran Frigola <miquel@ersilia.io>, Abel Legese Shibiru <abel@ersilia.io>
 Requires-Python: >=3.12
 Description-Content-Type: text/markdown
+Requires-Dist: boto3>=1.40.35
+Requires-Dist: duckdb>=1.3.2
 Requires-Dist: loguru>=0.7.3
 Requires-Dist: mypy>=1.17.1
+Requires-Dist: pandas>=2.3.2
+Requires-Dist: pyarrow>=21.0.0
+Requires-Dist: pybloom-live>=4.0.0
 Requires-Dist: pymilvus>=2.6.0
+Requires-Dist: rdkit>=2025.3.6
 Requires-Dist: redis>=6.4.0
 Requires-Dist: requests>=2.32.5
 Requires-Dist: rich>=14.1.0

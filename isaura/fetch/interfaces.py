@@ -1,10 +1,14 @@
-class GetPrecalcByTrances:
+class GetCollectionByName:
   pass
 
 
-class GetPrecalcBySmiles:
+class GetStoreByTranch:
   pass
 
 
-class GetPrecalcAll:
+class GetStoreByInput:
+  pass
+
+
+class GetStoreAll:
   pass

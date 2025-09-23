@@ -1,4 +1,4 @@
-from isaura.fetch.cloud import GetPrecalCloud
+from isaura.fetch.cloud import GetStoreCloud
 
-gcp = GetPrecalCloud("eos3b5e")
+gcp = GetStoreCloud("eos3b5e")
 gcp.fetch()
