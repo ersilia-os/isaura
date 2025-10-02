@@ -17,7 +17,7 @@ from rich.progress import Progress
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
 
-ROTATION = "10 MB"
+# logger
 
 logger.remove()
 
@@ -27,6 +27,75 @@ logger.level("WARNING", color="<white><bold><bg yellow>")
 logger.level("ERROR", color="<white><bold><bg red>")
 logger.level("CRITICAL", color="<white><bold><bg red>")
 logger.level("SUCCESS", color="<black><bold><bg green>")
+
+
+# Enums
+
+
+class JobStatus:
+  PENDING = "PENDING"
+  RUNNING = "RUNNING"
+  FAILED = "FAILED"
+  SUCCEEDED = "SUCCEEDED"
+
+
+# Constants
+
+ROTATION = "10 MB"
+REDIS_EXPIRATION = 3600 * 24 * 7
+REDIS_PORT = 6379
+REDIS_CONTAINER_NAME = "redis"
+REDIS_IMAGE = "redis:latest"
+REDIS_HOST = "127.0.0.1"
+DEFAULT_API_NAME = "run"
+S3_BUCKET_URL = "https://ersilia-models.s3.eu-central-1.amazonaws.com"
+S3_BUCKET_URL_ZIP = "https://ersilia-models-zipped.s3.eu-central-1.amazonaws.com"
+INFERENCE_STORE_API_URL = (
+  "https://5x2fkcjtei.execute-api.eu-central-1.amazonaws.com/dev/precalculations"
+)
+API_BASE = "https://hov95ejni7.execute-api.eu-central-1.amazonaws.com/dev/predict"
+GITHUB_ORG = "ersilia-os"
+GITHUB_CONTENT_URL = f"https://raw.githubusercontent.com/{GITHUB_ORG}"
+GITHUB_ERSILIA_REPO = "ersilia"
+PREDEFINED_COLUMN_FILE = "model/framework/columns/run_columns.csv"
+TIMEOUT = 3600
+MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
+LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
+
+# Env variables
+
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
+MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
+CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
+BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
+DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
+
+
+# helpers
+
+
+def tranche_coordinates(smiles):
+  mol = Chem.MolFromSmiles(smiles)
+  if mol is None:
+    raise ValueError("Invalid SMILES")
+  mw = Descriptors.MolWt(mol)
+  logp = Crippen.MolLogP(mol)
+  for i, edge in enumerate(MW_BINS):
+    if mw <= edge:
+      col = i
+      break
+  else:
+    col = len(MW_BINS)
+  for j, edge in enumerate(LOGP_BINS):
+    if logp <= edge:
+      row = j
+      break
+  else:
+    row = len(LOGP_BINS)
+  return row, col, mw, logp
 
 
 def get_schema(model_id):
@@ -144,7 +213,6 @@ def process_shard(
     values.append(vals)
     if len(smiles) >= batch_size:
       pass
-    # we do something here
 
 
 T = TypeVar("T")
@@ -164,6 +232,27 @@ def make_download_progress(transient: bool = True) -> Progress:
 
 @contextmanager
 def download_progress(
+  desc: str, total_bytes: Optional[int] = None, transient: bool = True
+):
+  with make_download_progress(transient=transient) as progress:
+    task_id = progress.add_task("download", total=total_bytes or 0, desc=desc)
+    yield progress, task_id
+
+
+def make_fetching_progress(transient: bool = True) -> Progress:
+  return Progress(
+    SpinnerColumn(),
+    TextColumn("[bold cyan]{task.fields[desc]}[/]"),
+    BarColumn(),
+    DownloadColumn(binary_units=True),
+    TransferSpeedColumn(),
+    TimeRemainingColumn(),
+    transient=transient,
+  )
+
+
+@contextmanager
+def fetching_progress(
   desc: str, total_bytes: Optional[int] = None, transient: bool = True
 ):
   with make_download_progress(transient=transient) as progress:
@@ -223,65 +312,3 @@ class Logger:
 
 
 logger = Logger()
-
-
-# Enums
-class JobStatus:
-  PENDING = "PENDING"
-  RUNNING = "RUNNING"
-  FAILED = "FAILED"
-  SUCCEEDED = "SUCCEEDED"
-
-
-REDIS_EXPIRATION = 3600 * 24 * 7
-REDIS_PORT = 6379
-REDIS_CONTAINER_NAME = "redis"
-REDIS_IMAGE = "redis:latest"
-REDIS_HOST = "127.0.0.1"
-DEFAULT_API_NAME = "run"
-S3_BUCKET_URL = "https://ersilia-models.s3.eu-central-1.amazonaws.com"
-S3_BUCKET_URL_ZIP = "https://ersilia-models-zipped.s3.eu-central-1.amazonaws.com"
-INFERENCE_STORE_API_URL = (
-  "https://5x2fkcjtei.execute-api.eu-central-1.amazonaws.com/dev/precalculations"
-)
-API_BASE = "https://hov95ejni7.execute-api.eu-central-1.amazonaws.com/dev/predict"
-GITHUB_ORG = "ersilia-os"
-GITHUB_CONTENT_URL = f"https://raw.githubusercontent.com/{GITHUB_ORG}"
-GITHUB_ERSILIA_REPO = "ersilia"
-PREDEFINED_COLUMN_FILE = "model/framework/columns/run_columns.csv"
-TIMEOUT = 3600
-
-
-MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
-LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
-
-
-def tranche_coordinates(smiles):
-  mol = Chem.MolFromSmiles(smiles)
-  if mol is None:
-    raise ValueError("Invalid SMILES")
-  mw = Descriptors.MolWt(mol)
-  logp = Crippen.MolLogP(mol)
-  for i, edge in enumerate(MW_BINS):
-    if mw <= edge:
-      col = i
-      break
-  else:
-    col = len(MW_BINS)
-  for j, edge in enumerate(LOGP_BINS):
-    if logp <= edge:
-      row = j
-      break
-  else:
-    row = len(LOGP_BINS)
-  return row, col, mw, logp
-
-
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
-MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
-CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
-BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
-DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
