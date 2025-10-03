@@ -1,0 +1,450 @@
+import boto3, duckdb, json, os, pickle, tempfile, uuid
+
+import pandas as pd
+import pyarrow.parquet as pq
+
+from isaura.helpers import (
+  MINIO_ENDPOINT,
+  MINIO_ACCESS_KEY,
+  MINIO_SECRET_KEY,
+  AWS_REGION,
+  STORE_DIRECTORY,
+  MAX_ROWS_PER_FILE,
+  CHECKPOINT_EVERY,
+  BLOOM_FILENAME,
+  logger,
+)
+
+from botocore.config import Config
+from collections import defaultdict
+
+from pybloom_live import ScalableBloomFilter
+
+
+class S3Store:
+  def __init__(self, endpoint=None, access=None, secret=None, region=None):
+    self.endpoint = endpoint or MINIO_ENDPOINT
+    self.access = access or MINIO_ACCESS_KEY
+    self.secret = secret or MINIO_SECRET_KEY
+    self.region = region or AWS_REGION
+    cfg = {"signature_version": "s3v4", "s3": {"addressing_style": "path"}}
+    kwargs = dict(
+      aws_access_key_id=self.access,
+      aws_secret_access_key=self.secret,
+      config=Config(**cfg),
+    )
+    if self.endpoint and self.endpoint.startswith("http"):
+      kwargs["endpoint_url"] = self.endpoint
+    if not self.endpoint or not self.endpoint.startswith("http"):
+      kwargs["region_name"] = self.region
+    self.client = boto3.client("s3", **kwargs)
+
+  def ensure_bucket(self, bucket):
+    try:
+      self.client.head_bucket(Bucket=bucket)
+      return
+    except Exception:
+      if not self.endpoint or not self.endpoint.startswith("http"):
+        try:
+          self.client.create_bucket(
+            Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": self.region}
+          )
+          return
+        except Exception:
+          pass
+      self.client.create_bucket(Bucket=bucket)
+
+  def head_object(self, bucket, key):
+    return self.client.head_object(Bucket=bucket, Key=key)
+
+  def download_file(self, bucket, key, local):
+    self.client.download_file(bucket, key, local)
+
+  def upload_file(self, local, bucket, key):
+    self.client.upload_file(local, bucket, key)
+
+  def list_keys(self, bucket, prefix):
+    p = self.client.get_paginator("list_objects_v2")
+    for page in p.paginate(Bucket=bucket, Prefix=prefix):
+      for obj in page.get("Contents", []):
+        yield obj
+
+  def delete_prefix(self, bucket, prefix):
+    batch = []
+    deleted = 0
+    for obj in self.list_keys(bucket, prefix):
+      batch.append({"Key": obj["Key"]})
+      if len(batch) == 1000:
+        self.client.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+        deleted += len(batch)
+        batch = []
+    if batch:
+      self.client.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+      deleted += len(batch)
+    return deleted
+
+
+class DuckDBS3:
+  def __init__(self, endpoint=None, access=None, secret=None, region=None):
+    self.endpoint = endpoint or MINIO_ENDPOINT
+    self.access = access or MINIO_ACCESS_KEY
+    self.secret = secret or MINIO_SECRET_KEY
+    self.region = region or AWS_REGION
+    self.con = duckdb.connect(database=":memory:")
+    self.con.execute("INSTALL httpfs; LOAD httpfs;")
+    use_ssl = not (self.endpoint and self.endpoint.startswith("http://"))
+    if self.endpoint and self.endpoint.startswith("http"):
+      ep = self.endpoint.replace("http://", "").replace("https://", "")
+      self.con.execute("SET s3_endpoint=?", [ep])
+    self.con.execute("SET s3_access_key_id=?", [self.access])
+    self.con.execute("SET s3_secret_access_key=?", [self.secret])
+    self.con.execute("SET s3_region=?", [self.region])
+    self.con.execute("SET s3_use_ssl=?", [use_ssl])
+    self.con.execute("SET s3_url_style='path'")
+
+
+class BloomIndex:
+  def __init__(
+    self,
+    store,
+    bucket,
+    base_prefix,
+    local_dir,
+    bloom_filename=BLOOM_FILENAME,
+    error_rate=0.001,
+    initial_capacity=1_000_000,
+  ):
+    self.store = store
+    self.bucket = bucket
+    self.base = base_prefix.strip("/")
+    self.bloom_key = f"{self.base}/bloom.pkl"
+    self.index_key = f"{self.base}/index.json"
+    self.local_bloom = os.path.join(local_dir, bloom_filename)
+    self.local_index = os.path.join(local_dir, "index.json")
+    os.makedirs(local_dir, exist_ok=True)
+    try:
+      self.store.download_file(self.bucket, self.bloom_key, self.local_bloom)
+      with open(self.local_bloom, "rb") as f:
+        self.sbf = pickle.load(f)
+      logger.info(f"loaded bloom {self.bucket}/{self.bloom_key}")
+    except Exception:
+      self.sbf = ScalableBloomFilter(
+        mode=ScalableBloomFilter.SMALL_SET_GROWTH,
+        initial_capacity=initial_capacity,
+        error_rate=error_rate,
+      )
+      logger.info("created new bloom")
+    try:
+      self.store.download_file(self.bucket, self.index_key, self.local_index)
+      with open(self.local_index, "r", encoding="utf-8") as f:
+        self.index = json.load(f)
+      logger.info(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
+    except Exception:
+      self.index = {}
+      logger.info("created new index")
+    self._added = 0
+
+  def seen(self, v):
+    return v in self.sbf
+
+  def rc(self, v):
+    return self.index.get(v)
+
+  def register(self, v, rc=None):
+    self.sbf.add(v)
+    if rc is not None and v not in self.index:
+      self.index[v] = list(rc)
+    self._added += 1
+    if self._added >= CHECKPOINT_EVERY:
+      self.persist()
+
+  def persist(self):
+    tb = f"{self.local_bloom}.tmp"
+    with open(tb, "wb") as f:
+      pickle.dump(self.sbf, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tb, self.local_bloom)
+    try:
+      self.store.upload_file(self.local_bloom, self.bucket, self.bloom_key)
+    except Exception as e:
+      logger.warning(f"bloom upload failed: {e}")
+    ti = f"{self.local_index}.tmp"
+    with open(ti, "w", encoding="utf-8") as f:
+      json.dump(self.index, f, separators=(",", ":"), ensure_ascii=False)
+    os.replace(ti, self.local_index)
+    try:
+      self.store.upload_file(self.local_index, self.bucket, self.index_key)
+    except Exception as e:
+      logger.warning(f"index upload failed: {e}")
+    self._added = 0
+
+
+class TrancheState:
+  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows):
+    self.store = store
+    self.bucket = bucket
+    self.base = base_prefix
+    self.tmpdir = tmpdir
+    self.max_rows = max_rows
+    self.state = {}
+
+  def prefix(self, r, c):
+    return f"{self.base}/tranche_{r}_{c}"
+
+  def list_chunks(self, r, c):
+    p = self.prefix(r, c) + "/"
+    keys = []
+    for obj in self.store.list_keys(self.bucket, p):
+      k = obj["Key"]
+      if k.endswith(".parquet") and "/chunk_" in k:
+        keys.append(k)
+    return sorted(keys)
+
+  def chunk_idx(self, key):
+    b = os.path.basename(key)
+    n = os.path.splitext(b)[0]
+    try:
+      return int(n.split("_")[1])
+    except:
+      return 1
+
+  def rows_in_remote(self, key):
+    local = os.path.join(self.tmpdir, f"inspect_{uuid.uuid4().hex}.parquet")
+    try:
+      self.store.download_file(self.bucket, key, local)
+      try:
+        pf = pq.ParquetFile(local)
+        return pf.metadata.num_rows
+      except:
+        return len(pd.read_parquet(local))
+    except:
+      return 0
+    finally:
+      try:
+        os.remove(local)
+      except:
+        pass
+
+  def ensure(self, r, c):
+    t = (r, c)
+    if t in self.state:
+      return
+    keys = self.list_chunks(r, c)
+    if not keys:
+      self.state[t] = {"next": 1, "open": None, "rows": 0}
+      return
+    last = keys[-1]
+    n = self.rows_in_remote(last)
+    idx = self.chunk_idx(last)
+    if n < self.max_rows:
+      self.state[t] = {"next": idx, "open": last, "rows": n}
+    else:
+      self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
+
+  def write_chunk(self, df, r, c, idx, mode="new", existing_local=None):
+    p = self.prefix(r, c)
+    os_key = f"{p}/chunk_{idx}.parquet"
+    local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
+    if mode == "append" and existing_local:
+      old = pd.read_parquet(existing_local)
+      df = pd.concat([old, df], ignore_index=True)
+    df.to_parquet(local, index=False)
+    self.store.upload_file(local, self.bucket, os_key)
+    if not existing_local:
+      try:
+        os.remove(local)
+      except:
+        pass
+    return os_key
+
+  def flush(self, r, c, buf):
+    if not buf:
+      return
+    self.ensure(r, c)
+    st = self.state[(r, c)]
+    df = pd.DataFrame(buf)
+    rem = len(df)
+    i = 0
+    if st["open"]:
+      tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
+      try:
+        self.store.download_file(self.bucket, st["open"], tmp)
+        space = self.max_rows - st["rows"]
+        take = min(space, rem)
+        if take > 0:
+          part = df.iloc[i : i + take]
+          self.write_chunk(part, r, c, st["next"], mode="append", existing_local=tmp)
+          st["rows"] += take
+          rem -= take
+          i += take
+        if st["rows"] >= self.max_rows:
+          st["next"] += 1
+          st["open"] = None
+          st["rows"] = 0
+      finally:
+        try:
+          os.remove(tmp)
+        except:
+          pass
+    while rem > 0:
+      take = min(self.max_rows, rem)
+      part = df.iloc[i : i + take]
+      os_key = self.write_chunk(part, r, c, st["next"], mode="new")
+      if take < self.max_rows:
+        st["open"] = os_key
+        st["rows"] = take
+      else:
+        st["next"] += 1
+        st["open"] = None
+        st["rows"] = 0
+      rem -= take
+      i += take
+
+
+class _SinkWriter:
+  def __init__(self, store, bucket, model_id, model_version, tmpdir):
+    self.store = store
+    self.bucket = bucket
+    self.model_id = model_id
+    self.model_version = model_version
+    self.base = f"{model_id}/{model_version}/tranches"
+    self.tmpdir = tmpdir
+    self.max_rows = MAX_ROWS_PER_FILE
+    self.store.ensure_bucket(self.bucket)
+    self.bi = BloomIndex(self.store, self.bucket, self.base, tmpdir)
+    self.tranche = TrancheState(self.store, self.bucket, self.base, tmpdir, self.max_rows)
+    self.buffers = defaultdict(list)
+
+  def add_rows(self, r, c, df):
+    if df.empty:
+      return 0
+    new_rows = []
+    for _, row in df.iterrows():
+      smi = row["input"]
+      if smi and not self.bi.seen(smi):
+        new_rows.append(dict(row))
+        self.bi.register(smi, rc=(r, c))
+    if not new_rows:
+      return 0
+    self.buffers[(r, c)].extend(new_rows)
+    if len(self.buffers[(r, c)]) >= self.max_rows:
+      self.tranche.flush(r, c, self.buffers[(r, c)])
+      self.buffers[(r, c)].clear()
+    return len(new_rows)
+
+  def finalize(self, metadata_local=None):
+    for k in list(self.buffers.keys()):
+      if self.buffers[k]:
+        r, c = k
+        self.tranche.flush(r, c, self.buffers[k])
+        self.buffers[k].clear()
+    self.bi.persist()
+    if metadata_local:
+      try:
+        self.store.upload_file(metadata_local, self.bucket, f"{self.base}/metadata.json")
+      except Exception:
+        pass
+
+
+class _BaseTransfer:
+  def __init__(self, model_id, model_version, project_name, store=None):
+    self.model_id = model_id
+    self.model_version = model_version
+    self.project = project_name
+    self.base = f"{model_id}/{model_version}"
+    self.tranches = f"{self.base}/tranches"
+    self.store = store or S3Store()
+    self.tmpdir = tempfile.mkdtemp(prefix="isaura_xfer_", dir=STORE_DIRECTORY)
+    self.duck = DuckDBS3(
+      endpoint=self.store.endpoint,
+      access=self.store.access,
+      secret=self.store.secret,
+      region=self.store.region,
+    )
+
+  def _download_if_exists(self, key, local):
+    try:
+      self.store.download_file(self.project, key, local)
+      return True
+    except Exception:
+      return False
+
+  def _load_metadata(self):
+    m1 = f"{self.base}/metadata.json"
+    m2 = f"{self.tranches}/metadata.json"
+    local = os.path.join(self.tmpdir, "metadata.json")
+    if self._download_if_exists(m1, local) or self._download_if_exists(m2, local):
+      with open(local, "r", encoding="utf-8") as f:
+        return local, json.load(f)
+    raise RuntimeError("metadata.json not found")
+
+  def _load_index(self):
+    key = f"{self.tranches}/index.json"
+    local = os.path.join(self.tmpdir, "index_src.json")
+    if not self._download_if_exists(key, local):
+      raise RuntimeError("index.json not found")
+    with open(local, "r", encoding="utf-8") as f:
+      return json.load(f), local
+
+  def _group(self, inputs, index_dict):
+    miss = [s for s in inputs if s not in index_dict]
+    if miss:
+      raise RuntimeError(
+        f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
+      )
+    g = defaultdict(set)
+    for s in inputs:
+      r, c = index_dict[s]
+      g[(int(r), int(c))].add(s)
+    return g
+
+  def _select_rows(self, r, c, wanted, input_col="input"):
+    files = f"s3://{self.project}/{self.tranches}/tranche_{r}_{c}/chunk_*.parquet"
+    dfw = pd.DataFrame({input_col: list(wanted)})
+    view = f"w_{r}_{c}_{uuid.uuid4().hex[:6]}"
+    self.duck.con.register(view, dfw)
+    q = f"SELECT t.* FROM read_parquet('{files}') t INNER JOIN {view} w ON t.{input_col}=w.{input_col}"
+    out = self.duck.con.execute(q).fetchdf()
+    self.duck.con.unregister(view)
+    return out
+
+  def _delete_tranches_tree(self):
+    prefix = f"{self.tranches}/"
+    n = self.store.delete_prefix(self.project, prefix)
+    return n
+
+  def _copy_to_buckets(self, meta_local, meta_list):
+    priv = [
+      (d.get("input") or "").strip()
+      for d in meta_list
+      if (d.get("access_level") or "").lower() == "private" and (d.get("input") or "").strip()
+    ]
+    pub = [
+      (d.get("input") or "").strip()
+      for d in meta_list
+      if (d.get("access_level") or "").lower() == "public" and (d.get("input") or "").strip()
+    ]
+    index, idx_local = self._load_index()
+    gp = self._group(priv, index) if priv else {}
+    gu = self._group(pub, index) if pub else {}
+    w_priv = (
+      _SinkWriter(self.store, "isaura-private", self.model_id, self.model_version, self.tmpdir)
+      if gp
+      else None
+    )
+    w_pub = (
+      _SinkWriter(self.store, "isaura-public", self.model_id, self.model_version, self.tmpdir)
+      if gu
+      else None
+    )
+    tp, tu = 0, 0
+    for (r, c), want in gp.items():
+      df = self._select_rows(r, c, want)
+      tp += w_priv.add_rows(r, c, df)
+    for (r, c), want in gu.items():
+      df = self._select_rows(r, c, want)
+      tu += w_pub.add_rows(r, c, df)
+    if w_priv:
+      w_priv.finalize(metadata_local=meta_local)
+    if w_pub:
+      w_pub.finalize(metadata_local=meta_local)
+    return tp, tu

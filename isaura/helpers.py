@@ -59,11 +59,15 @@ GITHUB_CONTENT_URL = f"https://raw.githubusercontent.com/{GITHUB_ORG}"
 GITHUB_ERSILIA_REPO = "ersilia"
 PREDEFINED_COLUMN_FILE = "model/framework/columns/run_columns.csv"
 TIMEOUT = 3600
+
+# Tranche bins
+
 MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
 LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
 # Env variables
 
+AWS_REGION = os.getenv("AWS_REGION", "eu-east-1")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
@@ -101,9 +105,7 @@ def tranche_coordinates(smiles):
 def get_schema(model_id):
   st = time.perf_counter()
   try:
-    response = requests.get(
-      f"{GITHUB_CONTENT_URL}/{model_id}/main/{PREDEFINED_COLUMN_FILE}"
-    )
+    response = requests.get(f"{GITHUB_CONTENT_URL}/{model_id}/main/{PREDEFINED_COLUMN_FILE}")
   except requests.RequestException:
     logger.warning("Couldn't fetch column name from github!")
     return None
@@ -155,9 +157,7 @@ def get_size(client, url: str, default: int = 0) -> int:
     return int(default or 0)
 
 
-def collect_gz_shards(
-  shards: Iterable[Dict[str, Any]], client
-) -> Tuple[List[Dict[str, Any]], int]:
+def collect_gz_shards(shards: Iterable[Dict[str, Any]], client) -> Tuple[List[Dict[str, Any]], int]:
   gz = [s for s in shards if is_gz_shard(s)]
   total = 0
   for s in gz:
@@ -191,9 +191,7 @@ def flush(smiles: List[str], values: List[List[float]]) -> None:
     values.clear()
 
 
-def process_shard(
-  shard: Dict[str, Any], client, batch_size: int, progress=None, task=None
-) -> None:
+def process_shard(shard: Dict[str, Any], client, batch_size: int, progress=None, task=None) -> None:
   buf = io.BytesIO()
   for chunk in client.download_stream(shard["url"]):
     if not chunk:
@@ -231,9 +229,7 @@ def make_download_progress(transient: bool = True) -> Progress:
 
 
 @contextmanager
-def download_progress(
-  desc: str, total_bytes: Optional[int] = None, transient: bool = True
-):
+def download_progress(desc: str, total_bytes: Optional[int] = None, transient: bool = True):
   with make_download_progress(transient=transient) as progress:
     task_id = progress.add_task("download", total=total_bytes or 0, desc=desc)
     yield progress, task_id
@@ -252,9 +248,7 @@ def make_fetching_progress(transient: bool = True) -> Progress:
 
 
 @contextmanager
-def fetching_progress(
-  desc: str, total_bytes: Optional[int] = None, transient: bool = True
-):
+def fetching_progress(desc: str, total_bytes: Optional[int] = None, transient: bool = True):
   with make_download_progress(transient=transient) as progress:
     task_id = progress.add_task("download", total=total_bytes or 0, desc=desc)
     yield progress, task_id
