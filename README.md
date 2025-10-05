@@ -70,8 +70,8 @@ Open your browser and go to:
 Login using:
 
 ```
-Username: admin
-Password: supersecretkey123
+Username: minioadmin
+Password: minioadmin
 ```
 
 ---
@@ -96,7 +96,7 @@ brew install minio/stable/mc
 
 ---
 
-## Configure the MinIO Client
+#### Configure the MinIO Client
 
 Add your local MinIO server as a host:
 
