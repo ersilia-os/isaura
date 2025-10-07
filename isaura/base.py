@@ -466,18 +466,3 @@ class _BaseTransfer:
     if w_pub:
       w_pub.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
     return tp, tu
-
-
-class IsauraDump:
-  def __init__(self, project_name, output_dir):
-    self.project_name = project_name
-    self.output_dir = output_dir
-    self.s3 = boto3.client(
-      "s3",
-      endpoint_url=MINIO_ENDPOINT,
-      aws_access_key_id=MINIO_ACCESS_KEY,
-      aws_secret_access_key=MINIO_SECRET_KEY,
-      config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-    )
-    os.makedirs(self.output_dir, exist_ok=True)
-    logger.info(f"dump init bucket={self.project_name} out={self.output_dir}")
