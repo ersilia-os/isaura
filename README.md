@@ -115,7 +115,8 @@ mc alias set local http://localhost:9000 minioadmin minioadmin
 | `catalog` | —     | —                                                                     | `-pn/--project-name`, `-f/--filter`                                                                                                                  | List models present in a project (bucket), optionally filtered by an id prefix.                                                                    |                        |                                                                           |
 
 ### Brief CLI usage examples
-> Buckets: are just a storage directory for model calcultaion (just a term used by the minio).
+> Buckets: are just a storage directory for model calcultaion (just a term used by the minio). 
+
 | **Example**                      | **Command**                                                                                                   | **Description**                                                                                           |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | 🧾 **Write results calculation**           | `isaura write -i data/inputs.csv -m eos9876 -v v2 -pn oncology-public --access public`                        | Upload/write outputs for the given model and version using a CSV as input.                                |
