@@ -101,7 +101,16 @@ brew install minio/stable/mc
 ```bash
 mc alias set local http://localhost:9000 minioadmin minioadmin
 ```
+- Example command to list the projects for `local`:
+
+```bash
+mc ls local
+```
+
+You can find more detailed docs [here](https://github.com/minio/mc?tab=readme-ov-file) on how to use `mc`.
+
 More usage docs can be found from [here](https://github.com/minio/mc?tab=readme-ov-file)
+
 ### Command at a Glance
 
 | Command   | Alias | Required Options                                                      | Optional Options                                                                                                                                     | What it does                                                                                                                                       |                        |                                                                           |
