@@ -109,8 +109,6 @@ mc ls local
 
 You can find more detailed docs [here](https://github.com/minio/mc?tab=readme-ov-file) on how to use `mc`.
 
-More usage docs can be found from [here](https://github.com/minio/mc?tab=readme-ov-file)
-
 ### Command at a Glance
 
 | Command   | Alias | Required Options                                                      | Optional Options                                                                                                                                     | What it does                                                                                                                                       |                        |                                                                           |
