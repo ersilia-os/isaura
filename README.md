@@ -98,6 +98,12 @@ brew install minio/stable/mc
 
 #### Configure the MinIO Client
 
+```bash
+mc alias set local http://localhost:9000 minioadmin minioadmin
+```
+
+### Command at a Glance
+
 | Command   | Alias | Required Options                                                      | Optional Options                                                                                                                                     | What it does                                                                                                                                       |                        |                                                                           |
 | --------- | ----- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------- |
 | `write`   | —     | `-i/--input-file`, `-m/--model`                                       | `-pn/--project-name`, `--access [public                                                                                                              | private                                                                                                                                            | both]`, `-v/--version` | Upload/write outputs for the given model & version using rows from a CSV. |
@@ -107,4 +113,17 @@ brew install minio/stable/mc
 | `remove`  | `rm`  | `-m/--model`, `-v/--version`, `-pn/--project-name`, `-y/--yes`        | —                                                                                                                                                    | Permanently delete artifacts for a model/version from a project. Safety-guarded by `--yes`.                                                        |                        |                                                                           |
 | `inspect` | —     | (none strictly; behavior changes with flags)                          | `what` argument (`inputs`, default: `inputs`), `-m/--model`, `-v/--version`, `-pn/--project-name`, `--access`, `-i/--input-file`, `-o/--output-file` | Inspect available items or validate inputs. With `-i`, validates inputs and writes a report; without `-i`, lists available entries.                |                        |                                                                           |
 | `catalog` | —     | —                                                                     | `-pn/--project-name`, `-f/--filter`                                                                                                                  | List models present in a project (bucket), optionally filtered by an id prefix.                                                                    |                        |                                                                           |
+
+### Brief CLI usage examples
+
+| **Example**                      | **Command**                                                                                                   | **Description**                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| 🧾 **Write artifacts**           | `isaura write -i data/inputs.csv -m eos9876 -v v2 -pn oncology-public --access public`                        | Upload/write outputs for the given model and version using a CSV as input.                                |
+| 📥 **Read results**              | `isaura read -i data/inputs.csv -m eos9876 -v v2 -pn oncology-public -o data/outputs.csv`                     | Read results corresponding to inputs and save them to an output CSV file.                                 |
+| 📂 **Copy artifacts locally**    | `isaura copy -m eos9876 -v v2 -pn oncology-private -o ./dump/eos9876-v2/`                                     | Copy all model artifacts from a project to a local directory.                                             |
+| 🚚 **Move artifacts**            | `isaura move -m eos9876 -v v2 -pn oncology-private`                                                           | Move or relocate artifacts for a specific model/version within the project.                               |
+| 🗑️ **Remove artifacts**         | `isaura remove -m eos9876 -v v2 -pn oncology-private --yes`                                                   | Permanently delete all artifacts for a model/version from a project (requires confirmation with `--yes`). |
+| 🔍 **Inspect inputs (validate)** | `isaura inspect inputs -m eos9876 -v v2 -pn oncology-public -i data/inputs.csv -o reports/inspect_report.csv` | Validate input data for a model and output a report.                                                      |
+| 📋 **List available items**      | `isaura inspect -m eos9876 -v v2 --access both -o reports/available.csv`                                      | List all available inputs or files related to a model/version.                                            |
+| 📚 **Catalog project models**    | `isaura catalog -pn oncology-public -f eos98`                                                                 | Display all models within a project, optionally filtered by a prefix.                                     |
 
