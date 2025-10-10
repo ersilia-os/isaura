@@ -76,7 +76,7 @@ Password: minioadmin
 
 ---
 
-### Step 5: Install MinIO Client (mc)
+### Step 5: Install MinIO Client (mc) for fine grained control and management over the object store
 
 The MinIO Client (`mc`) is a command-line tool to interact with MinIO or any S3-compatible storage.
 
@@ -101,7 +101,7 @@ brew install minio/stable/mc
 ```bash
 mc alias set local http://localhost:9000 minioadmin minioadmin
 ```
-
+More usage docs can be found from [here](https://github.com/minio/mc?tab=readme-ov-file)
 ### Command at a Glance
 
 | Command   | Alias | Required Options                                                      | Optional Options                                                                                                                                     | What it does                                                                                                                                       |                        |                                                                           |
