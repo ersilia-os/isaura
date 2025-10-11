@@ -1,6 +1,6 @@
 <div id="top"></div>
 <p align="center">
-  <img src="/asset/zairachem_logo.png" height="250" alt="Zairachem logo">
+  <img src="/assets/isaura.png" height="250" alt="Isuara logo">
 </p>
 <h2 align="center"> The Isaura data store</h2>
 
