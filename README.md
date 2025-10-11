@@ -1,6 +1,6 @@
 <div id="top"></div>
 <p align="center">
-  <img src="/assets/isaura.png" height="250" alt="Isuara logo">
+  <img src="/assets/isaura.png" height="220" alt="Isuara logo">
 </p>
 <h2 align="center"> The Isaura data store</h2>
 
@@ -17,14 +17,14 @@ uv sync
 source .venv/bin/activate
 ```
 ### 2. Install Minio (high performance object store) as below
-### Prerequisites
+#### Prerequisites
 
 - [Docker](https://www.docker.com/get-started) installed and running
 - A terminal (Linux, macOS, or WSL on Windows)
 
 ---
 
-### Step 1: Pull the MinIO Docker Image
+#### Step 1: Pull the MinIO Docker Image
 
 ```bash
 docker pull minio/minio
@@ -42,7 +42,7 @@ mkdir -p ~/minio-data
 
 ---
 
-### Step 3: Run MinIO Server with Environment Variables
+#### Step 3: Run MinIO Server with Environment Variables
 
 Replace the example keys with your own secure values.
 
@@ -66,7 +66,7 @@ docker run -d \
 
 ---
 
-### Step 4: Access the Web Console
+#### Step 4: Access the Web Console
 
 Open your browser and go to:
 👉 [http://localhost:9001](http://localhost:9001)
@@ -80,7 +80,7 @@ Password: minioadmin
 
 ---
 
-### Step 5: Install MinIO Client (mc) for fine grained control and management over the object store
+#### Step 5: Install MinIO Client (mc) for fine grained control and management over the object store
 
 The MinIO Client (`mc`) is a command-line tool to interact with MinIO or any S3-compatible storage.
 
