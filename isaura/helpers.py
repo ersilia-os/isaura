@@ -48,6 +48,7 @@ STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
+INPUT_C = ["inputs", "smiles"]
 DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
 DEFAULT_PRIVATE_BUCKET_NAME = os.getenv("DEFAULT_PRIVATE_BUCKET_NAME", "isaura-private")
 

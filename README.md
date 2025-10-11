@@ -4,7 +4,7 @@
 </p>
 <h2 align="center"> The Isaura data store</h2>
 
-This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub.
+This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub. Initial benchmark is made and can be found [here](BENCHMARK.md).
 
 ## Quick start guide
 First install a high-performance python project manager called `uv` based on this [manual](https://docs.astral.sh/uv/getting-started/installation/)

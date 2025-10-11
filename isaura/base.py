@@ -84,15 +84,24 @@ class MinioStore:
 
 
 class DuckDBMinio:
+  _instance, _init = None, None
+
+  def __new__(cls, *a, **kw):
+    if not cls._instance:
+      cls._instance = super().__new__(cls)
+    return cls._instance
+
   def __init__(self, endpoint=None, access=None, secret=None, threads=None):
-    endpoint = endpoint or MINIO_ENDPOINT
-    access = access or MINIO_ACCESS_KEY
-    secret = secret or MINIO_SECRET_KEY
-    use_ssl = not endpoint.startswith("http://")
+    if DuckDBMinio._init:
+      return
+    DuckDBMinio._init = True
+    endpoint = endpoint or os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+    access = access or os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    secret = secret or os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    use_ssl = endpoint.startswith("https://")
     ep = endpoint.replace("http://", "").replace("https://", "")
     self.con = duckdb.connect(database=":memory:")
-    threads = threads or max(2, (os.cpu_count() or 2))
-    self.con.execute(f"PRAGMA threads={threads};")
+    self.con.execute(f"PRAGMA threads={threads or max(2, os.cpu_count() or 2)};")
     self.con.execute("INSTALL httpfs; LOAD httpfs;")
     self.con.execute("SET s3_access_key_id=?", [access])
     self.con.execute("SET s3_secret_access_key=?", [secret])
@@ -100,6 +109,13 @@ class DuckDBMinio:
     self.con.execute("SET s3_region='us-east-1'")
     self.con.execute("SET s3_use_ssl=?", [use_ssl])
     self.con.execute("SET s3_url_style='path'")
+
+  def close(self):
+    if getattr(self, "con", None):
+      self.con.close()
+      self.con = None
+      DuckDBMinio._instance = None
+      DuckDBMinio._init = False
 
 
 class BloomIndex:

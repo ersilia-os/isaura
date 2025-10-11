@@ -9,6 +9,7 @@ from isaura.helpers import (
   CHECKPOINT_EVERY,
   BLOOM_FILENAME,
   MAX_ROWS,
+  INPUT_C,
   logger,
   tranche_coordinates,
   write_access_file,
@@ -120,7 +121,7 @@ class IsauraWriter:
   def _set_schema(self, row):
     if self.schema_cols is None:
       self.schema_cols = list(row.keys())
-      logger.info(f"writer schema: {self.schema_cols}")
+      logger.info(f"writer schema: {self.schema_cols[:10]}")
 
   def _flush_if_needed(self, r, c):
     buf = self.buffers[(r, c)]
@@ -135,7 +136,7 @@ class IsauraWriter:
       reader = csv.DictReader(f)
       for row in reader:
         self._set_schema(row)
-        smi = (row.get("input") or "").strip()
+        smi = (row.get("input") or row.get("smiles")).strip()
         if not smi:
           continue
         if self.allowed_inputs is not None and smi not in self.allowed_inputs:
@@ -176,33 +177,21 @@ class IsauraWriter:
 
 class IsauraReader:
   def __init__(
-    self,
-    model_id,
-    model_version,
-    input_csv,
-    bucket=None,
-    store=None,
-    endpoint=None,
-    access=None,
-    secret=None,
+    self, model_id, model_version, input_csv, bucket=None, store=None, endpoint=None, access=None, secret=None
   ):
     self.model_id = model_id
     self.model_version = model_version
     self.input_csv = input_csv
     self.bucket = bucket or PUB
-    self.base_prefix = f"{model_id}/{model_version}/tranches"
-    self.index_key = f"{self.base_prefix}/index.json"
+    self.base = f"{model_id}/{model_version}/tranches"
+    self.index_key = f"{self.base}/index.json"
     self.store = store or MinioStore(endpoint=endpoint, access=access, secret=secret)
     self.tmpdir = tempfile.mkdtemp(prefix="isaura_reader_", dir=STORE_DIRECTORY)
-    self.duck = DuckDBMinio(
-      endpoint=self.store.endpoint,
-      access=self.store.access,
-      secret=self.store.secret,
-    )
-    logger.info(f"reader init bucket={self.bucket} base={self.base_prefix} csv={self.input_csv}")
+    self.duck = DuckDBMinio(endpoint=self.store.endpoint, access=self.store.access, secret=self.store.secret)
+    logger.info(f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv}")
 
-  def _tranche_prefix(self, r, c):
-    return f"{self.base_prefix}/tranche_{r}_{c}"
+  def _hive_prefix(self, r, c):
+    return f"{self.base}/row={r}/col={c}"
 
   def _load_index(self):
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
@@ -216,47 +205,73 @@ class IsauraReader:
       except:
         pass
 
-  def read(self, input_col="input", output_csv=None):
-    t0 = time.time()
-    wanted = []
+  def _group_inputs(self, wanted, index):
+    miss = [s for s in wanted if s not in index]
+    if miss:
+      raise RuntimeError(
+        f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
+      )
+    g = defaultdict(set)
+    for s in wanted:
+      r, c = index[s]
+      g[(int(r), int(c))].add(s)
+    return g
+
+  def _sizes_for_groups(self, groups):
+    sizes = {}
+    total = 0
+    for r, c in groups.keys():
+      pref = self._hive_prefix(r, c) + "/"
+      s = 0
+      for obj in self.store.list_keys(self.bucket, pref):
+        k = obj["Key"]
+        if k.endswith(".parquet") and "/chunk_" in k:
+          s += int(obj.get("Size", 0))
+      sizes[(r, c)] = s
+      total += s
+    return sizes, total
+
+  def read(self, output_csv=None, transient_progress=True):
+    t0, wanted, header = time.time(), [], set()
     with open(self.input_csv, newline="", encoding="utf-8") as f:
       for row in csv.DictReader(f):
-        v = (row.get(input_col) or "").strip()
+        h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+        v = (row.get(h)).strip()
         if v:
           wanted.append(v)
+        if h not in header:
+          header.add(h)
+    print(f"Header:{header} | {list(header)[0]}")
+    header = list(header)[0]
     if not wanted:
       return pd.DataFrame()
     index = self._load_index()
-    missing = [s for s in wanted if s not in index]
-    if missing:
-      raise RuntimeError(
-        f"inputs not indexed: {missing[:5]}{'...' if len(missing) > 5 else ''} total_missing={len(missing)}"
-      )
-    groups = defaultdict(set)
-    for s in wanted:
-      r, c = index[s]
-      groups[(int(r), int(c))].add(s)
-    results = []
+    groups = self._group_inputs(wanted, index)
+    sizes, total_bytes = self._sizes_for_groups(groups)
     order_map = {s: i for i, s in enumerate(wanted)}
-    for (r, c), smi_set in groups.items():
-      files_glob = f"s3://{self.bucket}/{self._tranche_prefix(r, c)}/chunk_*.parquet"
-      dfw = pd.DataFrame({input_col: list(smi_set)})
-      view = f"w_{r}_{c}_{uuid.uuid4().hex[:6]}"
-      self.duck.con.register(view, dfw)
-      q = f"SELECT t.* FROM read_parquet('{files_glob}') t INNER JOIN {view} w ON t.{input_col}=w.{input_col}"
-      part = self.duck.con.execute(q).fetchdf()
-      self.duck.con.unregister(view)
-      if not part.empty:
-        part["__o"] = part[input_col].map(order_map)
-        results.append(part)
+    results = []
+    desc = f"Fetching hive partitions {self.model_id}/{self.model_version} ({len(wanted)} inputs)"
+    with progress(desc, total_bytes or 0, transient=transient_progress) as (prog, task_id):
+      for (r, c), _ in groups.items():
+        files = f"s3://{self.bucket}/{self._hive_prefix(r, c)}/chunk_*.parquet"
+        q = f"SELECT * FROM read_parquet('{files}', hive_partitioning=1)"
+        part = self.duck.con.execute(q).fetchdf()
+        if not part.empty:
+          part["__o"] = part[header].map(order_map)
+          results.append(part)
+        if total_bytes:
+          prog.update(task_id, advance=sizes.get((r, c), 0))
     out = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     if not out.empty and "__o" in out.columns:
       out = out.sort_values("__o").drop(columns="__o").reset_index(drop=True)
     if output_csv:
       out.to_csv(output_csv, index=False)
+      logger.info(f"wrote csv rows={len(out)} path={output_csv}")
     elapsed = time.time() - t0
     rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
-    logger.info(f"read matched={len(out)} elapsed={elapsed:.2f}s rate={rate:.1f}/s")
+    logger.info(
+      f"read done model={self.model_id} version={self.model_version} bucket={self.bucket} inputs={len(wanted)} matched={len(out)} elapsed={elapsed:.2f}s rate={rate:.1f}/s"
+    )
     return out
 
 
