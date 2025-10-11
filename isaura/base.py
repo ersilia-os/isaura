@@ -16,13 +16,23 @@ from isaura.helpers import (
 )
 
 from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 from collections import defaultdict
 
 from pybloom_live import ScalableBloomFilter
 
 
 class MinioStore:
-  def __init__(self, endpoint=None, access=None, secret=None):
+  def __init__(
+    self,
+    endpoint=None,
+    access=None,
+    secret=None,
+    multipart_threshold=5 * 1024 * 1024,
+    multipart_chunksize=5 * 1024 * 1024,
+    max_concurrency=2,
+    use_threads=True,
+  ):
     self.endpoint = endpoint or MINIO_ENDPOINT
     self.access = access or MINIO_ACCESS_KEY
     self.secret = secret or MINIO_SECRET_KEY
@@ -33,6 +43,12 @@ class MinioStore:
       aws_secret_access_key=self.secret,
       config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
+    self.transfer_config = TransferConfig(
+      multipart_threshold=multipart_threshold,
+      multipart_chunksize=multipart_chunksize,
+      max_concurrency=max_concurrency,
+      use_threads=use_threads,
+    )
 
   def ensure_bucket(self, bucket):
     try:
@@ -41,10 +57,12 @@ class MinioStore:
       self.client.create_bucket(Bucket=bucket)
 
   def download_file(self, bucket, key, local):
-    self.client.download_file(bucket, key, local)
+    self.client.download_file(bucket, key, local, Config=self.transfer_config)
 
-  def upload_file(self, local, bucket, key):
-    self.client.upload_file(local, bucket, key)
+  def upload_file(self, local, bucket, key, extra_args=None):
+    self.client.upload_file(
+      local, bucket, key, ExtraArgs=extra_args or {}, Config=self.transfer_config
+    )
 
   def list_keys(self, bucket, prefix):
     p = self.client.get_paginator("list_objects_v2")
@@ -68,13 +86,15 @@ class MinioStore:
 
 
 class DuckDBMinio:
-  def __init__(self, endpoint=None, access=None, secret=None):
+  def __init__(self, endpoint=None, access=None, secret=None, threads=None):
     endpoint = endpoint or MINIO_ENDPOINT
     access = access or MINIO_ACCESS_KEY
     secret = secret or MINIO_SECRET_KEY
     use_ssl = not endpoint.startswith("http://")
     ep = endpoint.replace("http://", "").replace("https://", "")
     self.con = duckdb.connect(database=":memory:")
+    threads = threads or max(2, (os.cpu_count() or 2))
+    self.con.execute(f"PRAGMA threads={threads};")
     self.con.execute("INSTALL httpfs; LOAD httpfs;")
     self.con.execute("SET s3_access_key_id=?", [access])
     self.con.execute("SET s3_secret_access_key=?", [secret])

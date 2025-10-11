@@ -31,11 +31,6 @@ logger.level("SUCCESS", color="<black><bold><bg green>")
 
 # Constants
 
-API_BASE = "https://hov95ejni7.execute-api.eu-central-1.amazonaws.com/dev/predict"
-GITHUB_ORG = "ersilia-os"
-GITHUB_CONTENT_URL = f"https://raw.githubusercontent.com/{GITHUB_ORG}"
-GITHUB_ERSILIA_REPO = "ersilia"
-PREDEFINED_COLUMN_FILE = "model/framework/columns/run_columns.csv"
 ACCESS_FILE = "access.json"
 TIMEOUT = 3600
 MAX_ROWS = 100_000
@@ -46,9 +41,9 @@ LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
 # Env variables
 
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "https://3.126.120.69")
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
