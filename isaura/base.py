@@ -60,9 +60,7 @@ class MinioStore:
     self.client.download_file(bucket, key, local, Config=self.transfer_config)
 
   def upload_file(self, local, bucket, key, extra_args=None):
-    self.client.upload_file(
-      local, bucket, key, ExtraArgs=extra_args or {}, Config=self.transfer_config
-    )
+    self.client.upload_file(local, bucket, key, ExtraArgs=extra_args or {}, Config=self.transfer_config)
 
   def list_keys(self, bucket, prefix):
     p = self.client.get_paginator("list_objects_v2")
@@ -180,16 +178,17 @@ class BloomIndex:
 
 
 class TrancheState:
-  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows):
+  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows, use_hive=False):
     self.store = store
     self.bucket = bucket
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
     self.state = {}
+    self.use_hive = use_hive
 
   def _prefix(self, r, c):
-    return f"{self.base}/tranche_{r}_{c}"
+    return f"{self.base}/row={r}/col={c}" if self.use_hive else f"{self.base}/tranche_{r}_{c}"
 
   def _list_chunks(self, r, c):
     pref = self._prefix(r, c) + "/"
@@ -247,11 +246,9 @@ class TrancheState:
     prefix = self._prefix(r, c)
     os_key = f"{prefix}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
-
     if mode == "append" and existing_local:
       old = pd.read_parquet(existing_local)
       df = pd.concat([old, df], ignore_index=True)
-
     df.to_parquet(local, index=False)
     self.store.upload_file(local, self.bucket, os_key)
     if not existing_local:
@@ -265,19 +262,15 @@ class TrancheState:
     if not rows:
       return
     self.ensure(r, c)
-
     st = self.state[(r, c)]
     df_all = pd.DataFrame(rows)
-
     for col in schema_cols:
       if col not in df_all.columns:
         df_all[col] = pd.Series([None] * len(df_all))
     df_all = df_all[schema_cols]
-
     remaining = len(df_all)
     start = 0
     logger.info(f"flush: tranche=({r},{c}) rows={remaining}")
-
     if st["open"]:
       tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
       try:
@@ -301,7 +294,6 @@ class TrancheState:
           os.remove(tmp)
         except:
           pass
-
     while remaining > 0:
       take = min(self.max_rows, remaining)
       part = df_all.iloc[start : start + take]
@@ -470,9 +462,7 @@ class _BaseTransfer:
       else None
     )
     w_pub = (
-      _SinkWriter(self.store, "isaura-public", self.model_id, self.model_version, self.tmpdir)
-      if gu
-      else None
+      _SinkWriter(self.store, "isaura-public", self.model_id, self.model_version, self.tmpdir) if gu else None
     )
     tp, tu = 0, 0
     for (r, c), want in gp.items():

@@ -72,47 +72,48 @@ class IsauraWriter:
     input_csv,
     model_id,
     model_version,
-    acess_level=None,
+    acess_level="public",
     bucket=None,
     allowed_inputs=None,
+    metadata_path=None,
     store=None,
+    use_hive=True,
   ):
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
     self.access_level = acess_level
-    self.bucket = bucket or PUB
+    self.bucket = bucket or os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
     self.base_prefix = f"{model_id}/{model_version}/tranches"
+    self.metadata_path = metadata_path
     self.allowed_inputs = set(allowed_inputs) if allowed_inputs else None
+    self.max_rows = int(os.getenv("MAX_ROWS_PER_FILE", str(MAX_ROWS)))
+    self.use_hive = use_hive
     self.store = store or MinioStore()
     self.store.ensure_bucket(self.bucket)
-    self.tmpdir = tempfile.mkdtemp(prefix="isaura_", dir=STORE_DIRECTORY)
-    self.metadata = os.path.join(self.tmpdir, "access.json")
+    self.tmpdir = tempfile.mkdtemp(prefix="isaura_", dir=os.getenv("STORE_DIRECTORY", STORE_DIRECTORY))
     self.bi = BloomIndex(
-      store=self.store,
-      bucket=self.bucket,
-      base_prefix=self.base_prefix,
-      local_dir=self.tmpdir,
-      bloom_filename=BLOOM_FILENAME,
+      self.store,
+      self.bucket,
+      self.base_prefix,
+      self.tmpdir,
+      bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
     )
-    self.tranche = TrancheState(self.store, self.bucket, self.base_prefix, self.tmpdir, MAX_ROWS)
+    self.tranche = TrancheState(
+      self.store, self.bucket, self.base_prefix, self.tmpdir, self.max_rows, use_hive=self.use_hive
+    )
     self.buffers = defaultdict(list)
     self.schema_cols = None
-    logger.info(f"writer init: bucket={self.bucket} base={self.base_prefix} csv={self.input_csv}")
+    logger.info(
+      f"writer init: bucket={self.bucket} base={self.base_prefix} hive={self.use_hive} csv={self.input_csv}"
+    )
 
   def _upload_metadata(self):
-    if self.bucket not in (PUB, PRI):
-      if self.access_level is None:
-        logger.warning(
-          f"You provide a custom project name but access type is not provided! Please provide access type as either of [public, private, both]. System exiting."
-        )
-        sys.exit(0)
-    if self.bucket in (PUB, PRI):
+    if not self.metadata_path:
       return
     try:
-      write_access_file(self.input_csv, self.access_level, self.metadata)
-      self.store.upload_file(self.metadata, self.bucket, f"{self.base_prefix}/access.json")
-      logger.info(f"{self.metadata} -> s3://{self.bucket}/{self.base_prefix}/access.json")
+      self.store.upload_file(self.metadata_path, self.bucket, f"{self.base_prefix}/metadata.json")
+      logger.info(f"metadata.json -> s3://{self.bucket}/{self.base_prefix}/metadata.json")
     except Exception as e:
       logger.warning(f"metadata upload failed: {e}")
 
@@ -123,7 +124,7 @@ class IsauraWriter:
 
   def _flush_if_needed(self, r, c):
     buf = self.buffers[(r, c)]
-    if len(buf) >= MAX_ROWS:
+    if len(buf) >= self.max_rows:
       self.tranche.flush(r, c, buf, self.schema_cols)
       self.buffers[(r, c)].clear()
 
@@ -131,43 +132,33 @@ class IsauraWriter:
     self._upload_metadata()
     total = dupes = 0
     with open(self.input_csv, newline="", encoding="utf-8") as f:
-      total_rows = sum(1 for _ in csv.DictReader(f))
-    desc = f"Writing {self.model_id}/{self.model_version} from {os.path.basename(self.input_csv)}"
-    with progress(desc=desc, total_bytes=total_rows, transient=True) as (pg, tid):
-      with open(self.input_csv, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-          self._set_schema(row)
-          smi = (row.get("input") or "").strip()
-          if not smi:
-            pg.advance(tid, 1)
-            continue
-          if self.allowed_inputs is not None and smi not in self.allowed_inputs:
-            pg.advance(tid, 1)
-            continue
-          if self.bi.seen(smi):
-            dupes += 1
-            pg.advance(tid, 1)
-            continue
-          try:
-            r, c, _, _ = tranche_coordinates(smi)
-          except Exception:
-            logger.warning("invalid SMILES skipped")
-            pg.advance(tid, 1)
-            continue
-          self.buffers[(r, c)].append(dict(row))
-          self.bi.register(smi, rc=(r, c))
-          total += 1
-          self._flush_if_needed(r, c)
-          if self.bi._added >= CHECKPOINT_EVERY:
-            self.bi.persist()
-          pg.advance(tid, 1)
+      reader = csv.DictReader(f)
+      for row in reader:
+        self._set_schema(row)
+        smi = (row.get("input") or "").strip()
+        if not smi:
+          continue
+        if self.allowed_inputs is not None and smi not in self.allowed_inputs:
+          continue
+        if self.bi.seen(smi):
+          dupes += 1
+          continue
+        try:
+          r, c, _, _ = tranche_coordinates(smi)
+        except Exception:
+          logger.warning("invalid SMILES skipped")
+          continue
+        self.buffers[(r, c)].append(dict(row))
+        self.bi.register(smi, rc=(r, c))
+        total += 1
+        self._flush_if_needed(r, c)
+        if self.bi._added >= int(os.getenv("CHECKPOINT_EVERY", str(CHECKPOINT_EVERY))):
+          self.bi.persist()
     for (r, c), buf in list(self.buffers.items()):
       if buf:
         self.tranche.flush(r, c, buf, self.schema_cols)
         self.buffers[(r, c)].clear()
     self.bi.persist()
-    self.close()
     logger.info(f"write done: new={total} dupes={dupes}")
 
   def close(self):
@@ -275,9 +266,7 @@ class IsauraInspect:
     self.base = f"{self.mid}/{self.mv}/tranches"
     self.idx_key = f"{self.base}/index.json"
     self.s = MinioStore()
-    logger.info(
-      f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}"
-    )
+    logger.info(f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}")
 
   def _buckets(self):
     return (
@@ -311,13 +300,9 @@ class IsauraInspect:
   def inspect_inputs(self, input_csv, output_csv=None):
     own = self._union()
     with open(input_csv, newline="", encoding="utf-8") as f:
-      wanted = [
-        (r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()
-      ]
+      wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
     logger.info(f"parsed inputs csv={input_csv} count={len(wanted)}")
-    df = pd.DataFrame([
-      {"input": s, "available": s in own, "bucket": own.get(s, "")} for s in wanted
-    ])
+    df = pd.DataFrame([{"input": s, "available": s in own, "bucket": own.get(s, "")} for s in wanted])
     if output_csv:
       df.to_csv(output_csv, index=False)
       logger.info(f"inspect inputs wrote={len(df)} path={output_csv}")

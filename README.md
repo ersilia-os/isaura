@@ -1,4 +1,8 @@
-# The Isaura data store
+<div id="top"></div>
+<p align="center">
+  <img src="/asset/zairachem_logo.png" height="250" alt="Zairachem logo">
+</p>
+<h2 align="center"> The Isaura data store</h2>
 
 This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub.
 

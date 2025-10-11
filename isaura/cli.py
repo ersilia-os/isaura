@@ -92,9 +92,7 @@ def read(input_file, project_name, access, model, version, output_file):
 @cli.command("copy")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_dump_outdir)
 def cp(model, version, project_name, output_dir):
-  c = IsauraCopy(
-    model_id=model, model_version=version, project_name=project_name, output_dir=output_dir
-  )
+  c = IsauraCopy(model_id=model, model_version=version, project_name=project_name, output_dir=output_dir)
   if output_dir is None:
     priv, pub = c.copy()
     logger.info(f"Copied private_new={priv} public_new={pub} from {project_name}")
@@ -125,9 +123,7 @@ def rm(model, version, project_name, yes):
 @apply_opts(opt_model, opt_version, opt_project, opt_access, opt_input_file, opt_output_file)
 @click.argument("what", type=click.Choice(["inputs"]), required=False, default="inputs")
 def cmd_inspect(what, model, version, project_name, access, input_file, output_file):
-  insp = IsauraInspect(
-    model_id=model, model_version=version, project_name=project_name, access=access
-  )
+  insp = IsauraInspect(model_id=model, model_version=version, project_name=project_name, access=access)
   if input_file:
     df = insp.inspect_inputs(input_file, output_file)
   else:
