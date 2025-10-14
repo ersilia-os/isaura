@@ -14,6 +14,7 @@ from isaura.helpers import (
   tranche_coordinates,
   write_access_file,
   progress,
+  get_apprx,
 )
 
 
@@ -177,9 +178,19 @@ class IsauraWriter:
 
 class IsauraReader:
   def __init__(
-    self, model_id, model_version, input_csv, bucket=None, store=None, endpoint=None, access=None, secret=None
+    self,
+    model_id,
+    model_version,
+    input_csv,
+    approximate,
+    bucket=None,
+    store=None,
+    endpoint=None,
+    access=None,
+    secret=None,
   ):
     self.model_id = model_id
+    self.approximate = approximate
     self.model_version = model_version
     self.input_csv = input_csv
     self.bucket = bucket or PUB
@@ -241,7 +252,12 @@ class IsauraReader:
           wanted.append(v)
         if h not in header:
           header.add(h)
-    print(f"Header:{header} | {list(header)[0]}")
+    if self.approximate:
+      st = time.perf_counter()
+      wanted = get_apprx(wanted)
+      et = time.perf_counter()
+      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
+
     header = list(header)[0]
     if not wanted:
       return pd.DataFrame()
@@ -265,12 +281,21 @@ class IsauraReader:
     if not out.empty and "__o" in out.columns:
       out = out.sort_values("__o").drop(columns="__o").reset_index(drop=True)
     if output_csv:
+      out = (
+        out[out[header].isin(wanted)]
+        .assign(__o=lambda d: d[header].map({s: i for i, s in enumerate(wanted)}))
+        .sort_values("__o")
+        .drop(columns=["__o", "row", "col"], errors="ignore")
+        .reset_index(drop=True)
+      )
       out.to_csv(output_csv, index=False)
       logger.info(f"wrote csv rows={len(out)} path={output_csv}")
     elapsed = time.time() - t0
     rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
     logger.info(
-      f"read done model={self.model_id} version={self.model_version} bucket={self.bucket} inputs={len(wanted)} matched={len(out)} elapsed={elapsed:.2f}s rate={rate:.1f}/s"
+      f"read done model={self.model_id} version={self.model_version} "
+      f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
+      f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
     )
     return out
 

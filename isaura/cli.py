@@ -63,10 +63,15 @@ opt_access = click.option(
   show_default=True,
   help="Which buckets to search when project-name not provided",
 )
-
-
 opt_yes_flag = click.option("--yes", "-y", is_flag=True, help="Confirm deletion")
 opt_dump_outdir = click.option("--output-dir", "-o", required=True, help="Local output directory")
+opt_approx = click.option(
+  "--approximate",
+  "-a",
+  is_flag=True,
+  default=False,
+  help="Specifies whether to use Approximate Nearest Neighbor search for result retrieval or not.",
+)
 
 
 @cli.command("write")
@@ -83,9 +88,11 @@ def write(input_file, project_name, access, model, version):
 
 
 @cli.command("read")
-@apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version, opt_output_file)
-def read(input_file, project_name, access, model, version, output_file):
-  r = IsauraReader(model_id=model, model_version=version, bucket=project_name, input_csv=input_file)
+@apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version, opt_output_file, opt_approx)
+def read(input_file, project_name, access, model, version, output_file, approximate):
+  r = IsauraReader(
+    model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
+  )
   r.read(output_csv=output_file)
 
 

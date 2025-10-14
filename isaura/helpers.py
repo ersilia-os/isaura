@@ -1,4 +1,4 @@
-import csv, json, os
+import csv, json, os, requests
 from contextlib import contextmanager
 from loguru import logger
 from typing import TypeVar, Optional
@@ -32,7 +32,7 @@ logger.level("SUCCESS", color="<black><bold><bg green>")
 # Constants
 
 ACCESS_FILE = "access.json"
-TIMEOUT = 3600
+TIMEOUT = os.getenv("TIMEOUT", 3600)
 MAX_ROWS = 100_000
 # Tranche bins
 
@@ -40,19 +40,31 @@ MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
 LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
 # Env variables
-
+COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+NNS_ENDPOINT = os.getenv("NNS_ENDPOINT", "http://127.0.0.1:8080/search")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
-INPUT_C = ["inputs", "smiles"]
+INPUT_C = ["input", "smiles"]
 DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
 DEFAULT_PRIVATE_BUCKET_NAME = os.getenv("DEFAULT_PRIVATE_BUCKET_NAME", "isaura-private")
 
 # helpers
+
+
+def get_apprx(inputs):
+  try:
+    logger.info(f"Sending {len(inputs)} inputs for ANN search server to get top 1 similar compounds")
+    r = requests.post(NNS_ENDPOINT, json={"collection": COLLECTION, "smiles": inputs}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return [x["input"] for x in r.json().get("results", [])]
+  except Exception as e:
+    logger.error(f"approx NN search failed: {e}")
+    return []
 
 
 def write_access_file(data, access, dir):
