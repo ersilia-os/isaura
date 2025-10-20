@@ -1,20 +1,29 @@
-import csv, json, os, sys, tempfile, time, uuid
+import csv, json, os, shutil, time, uuid
 
 import pandas as pd
 from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio
 from isaura.helpers import (
+  ACCESS_FILE,
+  BLOOM_FILENAME,
+  CHECKPOINT_EVERY,
   DEFAULT_BUCKET_NAME as PUB,
   DEFAULT_PRIVATE_BUCKET_NAME as PRI,
-  STORE_DIRECTORY,
-  CHECKPOINT_EVERY,
-  BLOOM_FILENAME,
-  MAX_ROWS,
   INPUT_C,
+  MAX_ROWS,
   logger,
-  tranche_coordinates,
-  write_access_file,
-  progress,
+  filter_out,
   get_apprx,
+  get_base,
+  get_desc,
+  get_files,
+  get_idx_key,
+  get_pref,
+  group_inputs,
+  make_temp,
+  progress,
+  query,
+  write_access_file,
+  tranche_coordinates,
 )
 
 
@@ -74,26 +83,20 @@ class IsauraWriter:
     input_csv,
     model_id,
     model_version,
-    acess_level="public",
+    access="public",
     bucket=None,
-    allowed_inputs=None,
-    metadata_path=None,
-    store=None,
-    use_hive=True,
   ):
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
-    self.access_level = acess_level
-    self.bucket = bucket or os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
-    self.base_prefix = f"{model_id}/{model_version}/tranches"
-    self.metadata_path = metadata_path
-    self.allowed_inputs = set(allowed_inputs) if allowed_inputs else None
-    self.max_rows = int(os.getenv("MAX_ROWS_PER_FILE", str(MAX_ROWS)))
-    self.use_hive = use_hive
-    self.store = store or MinioStore()
+    self.access = access
+    self.bucket = bucket or PUB
+    self.base_prefix = get_base(self.model_id, model_version)
+    self.max_rows = int(MAX_ROWS)
+    self.store = MinioStore()
     self.store.ensure_bucket(self.bucket)
-    self.tmpdir = tempfile.mkdtemp(prefix="isaura_", dir=os.getenv("STORE_DIRECTORY", STORE_DIRECTORY))
+    self.tmpdir = make_temp("isaura_")
+    self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
     self.bi = BloomIndex(
       self.store,
       self.bucket,
@@ -101,21 +104,18 @@ class IsauraWriter:
       self.tmpdir,
       bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
     )
-    self.tranche = TrancheState(
-      self.store, self.bucket, self.base_prefix, self.tmpdir, self.max_rows, use_hive=self.use_hive
-    )
+    self.tranche = TrancheState(self.store, self.bucket, self.base_prefix, self.tmpdir, self.max_rows)
     self.buffers = defaultdict(list)
     self.schema_cols = None
-    logger.info(
-      f"writer init: bucket={self.bucket} base={self.base_prefix} hive={self.use_hive} csv={self.input_csv}"
-    )
+    logger.info(f"writer init: bucket={self.bucket} base={self.base_prefix} csv={self.input_csv}")
 
   def _upload_metadata(self):
-    if not self.metadata_path:
+    if not self.metadata_path or not self.bucket:
       return
     try:
-      self.store.upload_file(self.metadata_path, self.bucket, f"{self.base_prefix}/metadata.json")
-      logger.info(f"metadata.json -> s3://{self.bucket}/{self.base_prefix}/metadata.json")
+      write_access_file(self.input_csv, self.access, self.metadata_path)
+      self.store.upload_file(self.metadata_path, self.bucket, f"{self.base_prefix}/{ACCESS_FILE}")
+      logger.info(f"{ACCESS_FILE} -> s3://{self.bucket}/{self.base_prefix}/{ACCESS_FILE}")
     except Exception as e:
       logger.warning(f"metadata upload failed: {e}")
 
@@ -140,8 +140,6 @@ class IsauraWriter:
         smi = (row.get("input") or row.get("smiles")).strip()
         if not smi:
           continue
-        if self.allowed_inputs is not None and smi not in self.allowed_inputs:
-          continue
         if self.bi.seen(smi):
           dupes += 1
           continue
@@ -154,7 +152,7 @@ class IsauraWriter:
         self.bi.register(smi, rc=(r, c))
         total += 1
         self._flush_if_needed(r, c)
-        if self.bi._added >= int(os.getenv("CHECKPOINT_EVERY", str(CHECKPOINT_EVERY))):
+        if self.bi._added >= int(CHECKPOINT_EVERY):
           self.bi.persist()
     for (r, c), buf in list(self.buffers.items()):
       if buf:
@@ -165,10 +163,10 @@ class IsauraWriter:
 
   def close(self):
     try:
-      os.rmdir(self.tmpdir)
+      shutil.rmtree(self.tmpdir)
     except:
       pass
-
+  
   def __enter__(self):
     return self
 
@@ -184,25 +182,22 @@ class IsauraReader:
     input_csv,
     approximate,
     bucket=None,
-    store=None,
-    endpoint=None,
-    access=None,
-    secret=None,
   ):
     self.model_id = model_id
-    self.approximate = approximate
     self.model_version = model_version
+    self.approximate = approximate
     self.input_csv = input_csv
     self.bucket = bucket or PUB
-    self.base = f"{model_id}/{model_version}/tranches"
-    self.index_key = f"{self.base}/index.json"
-    self.store = store or MinioStore(endpoint=endpoint, access=access, secret=secret)
-    self.tmpdir = tempfile.mkdtemp(prefix="isaura_reader_", dir=STORE_DIRECTORY)
-    self.duck = DuckDBMinio(endpoint=self.store.endpoint, access=self.store.access, secret=self.store.secret)
+    self.base = get_base(self.model_id, model_version)
+    self.index_key = get_idx_key(self.base)
+    self.pref = get_pref(self.model_id, self.model_version)
+    self.store = MinioStore()
+    self.tmpdir = make_temp("isaura_reader_")
+    self.duck = DuckDBMinio()
     logger.info(f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv}")
 
   def _hive_prefix(self, r, c):
-    return f"{self.base}/row={r}/col={c}"
+    return 
 
   def _load_index(self):
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
@@ -216,21 +211,8 @@ class IsauraReader:
       except:
         pass
 
-  def _group_inputs(self, wanted, index):
-    miss = [s for s in wanted if s not in index]
-    if miss:
-      raise RuntimeError(
-        f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
-      )
-    g = defaultdict(set)
-    for s in wanted:
-      r, c = index[s]
-      g[(int(r), int(c))].add(s)
-    return g
-
   def _sizes_for_groups(self, groups):
-    sizes = {}
-    total = 0
+    sizes, total = {}, 0
     for r, c in groups.keys():
       pref = self._hive_prefix(r, c) + "/"
       s = 0
@@ -242,8 +224,8 @@ class IsauraReader:
       total += s
     return sizes, total
 
-  def read(self, output_csv=None, transient_progress=True):
-    t0, wanted, header = time.time(), [], set()
+  def read(self, output_csv=None):
+    t0, wanted, header, objc, results = time.time(), [], set(), "__o", []
     with open(self.input_csv, newline="", encoding="utf-8") as f:
       for row in csv.DictReader(f):
         h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
@@ -254,7 +236,7 @@ class IsauraReader:
           header.add(h)
     if self.approximate:
       st = time.perf_counter()
-      wanted = get_apprx(wanted)
+      wanted = get_apprx(wanted, self.pref)
       et = time.perf_counter()
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
 
@@ -262,38 +244,27 @@ class IsauraReader:
     if not wanted:
       return pd.DataFrame()
     index = self._load_index()
-    groups = self._group_inputs(wanted, index)
+    groups = group_inputs(wanted, index)
     sizes, total_bytes = self._sizes_for_groups(groups)
     order_map = {s: i for i, s in enumerate(wanted)}
-    results = []
-    desc = f"Fetching hive partitions {self.model_id}/{self.model_version} ({len(wanted)} inputs)"
-    with progress(desc, total_bytes or 0, transient=transient_progress) as (prog, task_id):
+    with progress(get_desc(self.pref, wanted), total_bytes or 0, transient=True) as (prog, task_id):
       for (r, c), _ in groups.items():
-        files = f"s3://{self.bucket}/{self._hive_prefix(r, c)}/chunk_*.parquet"
-        q = f"SELECT * FROM read_parquet('{files}', hive_partitioning=1)"
-        part = self.duck.con.execute(q).fetchdf()
+        part = self.duck.con.execute(query(get_files(self.bucket, r, c, self.base))).fetchdf()
         if not part.empty:
-          part["__o"] = part[header].map(order_map)
+          part[objc] = part[header].map(order_map)
           results.append(part)
         if total_bytes:
           prog.update(task_id, advance=sizes.get((r, c), 0))
     out = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    if not out.empty and "__o" in out.columns:
-      out = out.sort_values("__o").drop(columns="__o").reset_index(drop=True)
+    if not out.empty and objc in out.columns:
+      out = out.sort_values(objc).drop(columns=objc).reset_index(drop=True)
     if output_csv:
-      out = (
-        out[out[header].isin(wanted)]
-        .assign(__o=lambda d: d[header].map({s: i for i, s in enumerate(wanted)}))
-        .sort_values("__o")
-        .drop(columns=["__o", "row", "col"], errors="ignore")
-        .reset_index(drop=True)
-      )
-      out.to_csv(output_csv, index=False)
+      filter_out(out, objc, wanted, header).to_csv(output_csv, index=False)
       logger.info(f"wrote csv rows={len(out)} path={output_csv}")
     elapsed = time.time() - t0
     rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
     logger.info(
-      f"read done model={self.model_id} version={self.model_version} "
+      f"read done model+version={self.pref}"
       f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
       f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
     )
@@ -303,8 +274,8 @@ class IsauraReader:
 class IsauraInspect:
   def __init__(self, model_id, model_version, project_name=None, access="both"):
     self.mid, self.mv, self.proj, self.acc = model_id, model_version, project_name, access
-    self.base = f"{self.mid}/{self.mv}/tranches"
-    self.idx_key = f"{self.base}/index.json"
+    self.base = get_base(self.mid, self.mv)
+    self.idx_key = get_idx_key(self.base)
     self.s = MinioStore()
     logger.info(f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}")
 
@@ -361,7 +332,7 @@ class IsauraInspect:
     def count_chunks(base):
       tr = set()
       ch = 0
-      for page in p.paginate(Bucket=project_name, Prefix=f"{base}/tranches/"):
+      for page in p.paginate(Bucket=project_name, Prefix=base):
         for obj in page.get("Contents", []):
           k = obj["Key"]
           if "/chunk_" in k and k.endswith(".parquet"):
@@ -377,15 +348,14 @@ class IsauraInspect:
         continue
       for v_pref in list_prefixes(m_pref):
         ver = v_pref[len(m_pref) :].strip("/")
-        idx_key = f"{model}/{ver}/tranches/index.json"
         try:
-          obj = c.get_object(Bucket=project_name, Key=idx_key)
+          obj = c.get_object(Bucket=project_name, Key=get_idx_key(self.base))
           idx = json.loads(obj["Body"].read().decode("utf-8"))
           entries = len(idx)
         except Exception:
           entries = 0
-        tr, ch = count_chunks(f"{model}/{ver}")
-        rows.append({"model": f"{model}/{ver}", "entries": entries, "tranches": tr, "chunks": ch})
+        tr, ch = count_chunks(get_pref(model, ver))
+        rows.append({"model": get_pref(model, ver), "entries": entries, "tranches": tr, "chunks": ch})
     return rows
 
 
@@ -403,6 +373,12 @@ class IsauraMover(_BaseTransfer):
 
 
 class IsauraRemover(_BaseTransfer):
+  def remove(self):
+    n = self._delete_tranches_tree()
+    logger.info(f"removed objects={n}")
+
+
+class IsauraPull(_BaseTransfer):
   def remove(self):
     n = self._delete_tranches_tree()
     logger.info(f"removed objects={n}")

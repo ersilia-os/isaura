@@ -1,5 +1,6 @@
-import csv, json, os, requests
+import csv, json, os, requests, tempfile, uuid
 from contextlib import contextmanager
+from collections import defaultdict
 from loguru import logger
 from typing import TypeVar, Optional
 from rich.progress import (
@@ -17,7 +18,7 @@ from rich.progress import Progress
 from rich.console import Console
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
-
+from pathlib import Path
 # logger
 logger.remove()
 console = Console()
@@ -30,22 +31,26 @@ logger.level("SUCCESS", color="<black><bold><bg green>")
 
 
 # Constants
-
 ACCESS_FILE = "access.json"
-TIMEOUT = os.getenv("TIMEOUT", 3600)
+INDEX_FILE = "index.json"
 MAX_ROWS = 100_000
-# Tranche bins
 
+# Tranche bins
 MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
 LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
 # Env variables
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
+TIMEOUT = os.getenv("TIMEOUT", 3600)
+MINIO_ENDPOINT_CLOUD = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 NNS_ENDPOINT = os.getenv("NNS_ENDPOINT", "http://127.0.0.1:8080/search")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
+isaura_temp = os.path.join(Path.home(),"eos", "isaura-temp")
+if not os.path.exists(isaura_temp):
+  os.makedirs(isaura_temp)
+STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
@@ -53,13 +58,42 @@ INPUT_C = ["input", "smiles"]
 DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
 DEFAULT_PRIVATE_BUCKET_NAME = os.getenv("DEFAULT_PRIVATE_BUCKET_NAME", "isaura-private")
 
-# helpers
+def get_base(mdi, ver): return f"{get_pref(mdi, ver)}/tranches"
+def get_desc(pref, wanted): return f"Fetching hive partitions {pref} ({len(wanted)} inputs)"
+def get_files(bucket, r, c, base): return f"s3://{bucket}/{hive_prefix(r, c, base)}/chunk_*.parquet"
+def get_keys(file, base): return f"{base}/{file}"
+def get_idx_key(base): return get_keys(INDEX_FILE, base)
+def get_acc_key(base): return get_keys(ACCESS_FILE,base)
+def get_pref(mdi, ver): return f"{mdi}/{ver}"
+def hive_prefix(r, c, base): return f"{base}/row={r}/col={c}"
+def make_temp(pref): return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
+def query(files): return f"SELECT * FROM read_parquet('{files}', hive_partitioning=1)"
+
+def filter_out(out, objc, wanted, header):
+  return (
+        out[out[header].isin(wanted)]
+        .assign(__o=lambda d: d[header].map({s: i for i, s in enumerate(wanted)}))
+        .sort_values(objc)
+        .drop(columns=[objc, "row", "col"], errors="ignore")
+        .reset_index(drop=True)
+      )
+def group_inputs(wanted, index):
+  miss = [s for s in wanted if s not in index]
+  if miss:
+    raise RuntimeError(
+      f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
+    )
+  g = defaultdict(set)
+  for s in wanted:
+    r, c = index[s]
+    g[(int(r), int(c))].add(s)
+  return g
 
 
-def get_apprx(inputs):
+def get_apprx(inputs, collection):
   try:
     logger.info(f"Sending {len(inputs)} inputs for ANN search server to get top 1 similar compounds")
-    r = requests.post(NNS_ENDPOINT, json={"collection": COLLECTION, "smiles": inputs}, timeout=TIMEOUT)
+    r = requests.post(NNS_ENDPOINT, json={"collection": collection, "smiles": inputs}, timeout=TIMEOUT)
     r.raise_for_status()
     return [x["input"] for x in r.json().get("results", [])]
   except Exception as e:
@@ -70,7 +104,7 @@ def get_apprx(inputs):
 def write_access_file(data, access, dir):
   with open(data, "r") as f:
     data = csv.DictReader(f)
-    input = [d.get("input") for d in data]
+    input = [(d.get("input") or d.get("smiles")).strip() for d in data]
     m = [{"input": i, "access": access} for i in input]
   with open(dir, "w") as f:
     json.dump(m, f, indent=2)
@@ -80,8 +114,7 @@ def tranche_coordinates(smiles):
   mol = Chem.MolFromSmiles(smiles)
   if mol is None:
     raise ValueError("Invalid SMILES")
-  mw = Descriptors.MolWt(mol)
-  logp = Crippen.MolLogP(mol)
+  mw, logp = Descriptors.MolWt(mol), Crippen.MolLogP(mol)
   for i, edge in enumerate(MW_BINS):
     if mw <= edge:
       col = i

@@ -64,7 +64,7 @@ opt_access = click.option(
   help="Which buckets to search when project-name not provided",
 )
 opt_yes_flag = click.option("--yes", "-y", is_flag=True, help="Confirm deletion")
-opt_dump_outdir = click.option("--output-dir", "-o", required=True, help="Local output directory")
+opt_dump_outdir = click.option("--output-dir", "-o", required=False, help="Local output directory")
 opt_approx = click.option(
   "--approximate",
   "-a",
@@ -82,14 +82,14 @@ def write(input_file, project_name, access, model, version):
     model_id=model,
     model_version=version,
     bucket=project_name,
-    acess_level=access,
+    access=access,
   ) as w:
     w.write()
 
 
 @cli.command("read")
-@apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version, opt_output_file, opt_approx)
-def read(input_file, project_name, access, model, version, output_file, approximate):
+@apply_opts(opt_input_file, opt_project, opt_model, opt_version, opt_output_file, opt_approx)
+def read(input_file, project_name, model, version, output_file, approximate):
   r = IsauraReader(
     model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
   )
@@ -99,7 +99,7 @@ def read(input_file, project_name, access, model, version, output_file, approxim
 @cli.command("copy")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_dump_outdir)
 def cp(model, version, project_name, output_dir):
-  c = IsauraCopy(model_id=model, model_version=version, project_name=project_name, output_dir=output_dir)
+  c = IsauraCopy(model_id=model, model_version=version, bucket=project_name, output_dir=output_dir)
   if output_dir is None:
     priv, pub = c.copy()
     logger.info(f"Copied private_new={priv} public_new={pub} from {project_name}")

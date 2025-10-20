@@ -13,6 +13,17 @@ from isaura.helpers import (
   BLOOM_FILENAME,
   ACCESS_FILE,
   logger,
+  filter_out,
+  get_base,
+  get_files,
+  get_pref,
+  get_idx_key,
+  get_acc_key,
+  group_inputs,
+  hive_prefix,
+  make_temp,
+  query,
+
 )
 
 from botocore.config import Config
@@ -83,7 +94,7 @@ class MinioStore:
     return deleted
 
 
-class DuckDBMinio:
+class DuckDBMinio:  # Singleton as we gonna use it for same shared resource
   _instance, _init = None, None
 
   def __new__(cls, *a, **kw):
@@ -95,9 +106,9 @@ class DuckDBMinio:
     if DuckDBMinio._init:
       return
     DuckDBMinio._init = True
-    endpoint = endpoint or os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
-    access = access or os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-    secret = secret or os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    endpoint = endpoint or MINIO_ENDPOINT
+    access = access or MINIO_ACCESS_KEY
+    secret = secret or MINIO_SECRET_KEY
     use_ssl = endpoint.startswith("https://")
     ep = endpoint.replace("http://", "").replace("https://", "")
     self.con = duckdb.connect(database=":memory:")
@@ -194,21 +205,16 @@ class BloomIndex:
 
 
 class TrancheState:
-  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows, use_hive=False):
+  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows):
     self.store = store
     self.bucket = bucket
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
     self.state = {}
-    self.use_hive = use_hive
-
-  def _prefix(self, r, c):
-    return f"{self.base}/row={r}/col={c}" if self.use_hive else f"{self.base}/tranche_{r}_{c}"
 
   def _list_chunks(self, r, c):
-    pref = self._prefix(r, c) + "/"
-    keys = []
+    pref, keys = hive_prefix(self.base, r, c) + "/", []
     for obj in self.store.list_keys(self.bucket, pref):
       k = obj["Key"]
       if k.endswith(".parquet") and "/chunk_" in k:
@@ -259,8 +265,7 @@ class TrancheState:
       logger.info(f"tranche rotate: ({r},{c}) next={idx + 1}")
 
   def _write_chunk(self, df, r, c, idx, mode="new", existing_local=None):
-    prefix = self._prefix(r, c)
-    os_key = f"{prefix}/chunk_{idx}.parquet"
+    os_key = f"{hive_prefix(r, c, self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     if mode == "append" and existing_local:
       old = pd.read_parquet(existing_local)
@@ -333,7 +338,7 @@ class _SinkWriter:
     self.bucket = bucket
     self.model_id = model_id
     self.model_version = model_version
-    self.base = f"{model_id}/{model_version}/tranches"
+    self.base = get_base(model_id, model_version)
     self.tmpdir = tmpdir
     self.max_rows = MAX_ROWS_PER_FILE
     self.store.ensure_bucket(self.bucket)
@@ -373,15 +378,15 @@ class _SinkWriter:
 
 
 class _BaseTransfer:
-  def __init__(self, model_id, model_version, project_name, output_dir=None, store=None):
+  def __init__(self, model_id, model_version, bucket, output_dir=None, store=None):
     self.model_id = model_id
     self.model_version = model_version
-    self.project = project_name
+    self.bucket = bucket
     self.output_dir = output_dir
-    self.base = f"{model_id}/{model_version}"
-    self.tranches = f"{self.base}/tranches"
+    self.base = get_pref(model_id, model_version)
+    self.tranches = get_base(model_id, model_version)
     self.store = store or MinioStore()
-    self.tmpdir = tempfile.mkdtemp(prefix="isaura_xfer_", dir=STORE_DIRECTORY)
+    self.tmpdir = make_temp("isaura_xfer_")
     self.duck = DuckDBMinio(
       endpoint=self.store.endpoint,
       access=self.store.access,
@@ -390,59 +395,39 @@ class _BaseTransfer:
 
   def _download_if_exists(self, key, local):
     try:
-      self.store.download_file(self.project, key, local)
+      self.store.download_file(self.bucket, key, local)
       return True
     except Exception:
       return False
 
   def _load_metadata(self):
-    m1 = f"{self.base}/{ACCESS_FILE}"
-    m2 = f"{self.tranches}/{ACCESS_FILE}"
     local = os.path.join(self.tmpdir, ACCESS_FILE)
-    if self._download_if_exists(m1, local) or self._download_if_exists(m2, local):
+    if self._download_if_exists(get_acc_key(self.tranches), local):
       with open(local, "r", encoding="utf-8") as f:
         return local, json.load(f)
     raise RuntimeError(f"{ACCESS_FILE} not found")
 
   def _load_index(self):
-    key = f"{self.tranches}/index.json"
+    key = get_idx_key(self.tranches)
     local = os.path.join(self.tmpdir, "index_src.json")
     if not self._download_if_exists(key, local):
       raise RuntimeError("index.json not found")
     with open(local, "r", encoding="utf-8") as f:
       return json.load(f), local
 
-  def _group(self, inputs, index_dict):
-    miss = [s for s in inputs if s not in index_dict]
-    if miss:
-      raise RuntimeError(
-        f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
-      )
-    g = defaultdict(set)
-    for s in inputs:
-      r, c = index_dict[s]
-      g[(int(r), int(c))].add(s)
-    return g
-
-  def _select_rows(self, r, c, wanted, input_col="input"):
-    files = f"s3://{self.project}/{self.tranches}/tranche_{r}_{c}/chunk_*.parquet"
-    dfw = pd.DataFrame({input_col: list(wanted)})
-    view = f"w_{r}_{c}_{uuid.uuid4().hex[:6]}"
-    self.duck.con.register(view, dfw)
-    q = f"SELECT t.* FROM read_parquet('{files}') t INNER JOIN {view} w ON t.{input_col}=w.{input_col}"
-    out = self.duck.con.execute(q).fetchdf()
-    self.duck.con.unregister(view)
-    return out
+  def select_rows(self, r, c, wanted, input_col="input"):
+    out = self.duck.con.execute(query(get_files(self.bucket, r, c, self.tranches))).fetchdf()
+    return filter_out(out, "__o", wanted, input_col)
 
   def _delete_tranches_tree(self):
     prefix = f"{self.tranches}/"
-    n = self.store.delete_prefix(self.project, prefix)
+    n = self.store.delete_prefix(self.bucket, prefix)
     return n
 
   def dump(self):
     os.makedirs(self.output_dir, exist_ok=True)
     paginator = self.store.client.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=self.project)
+    pages = paginator.paginate(Bucket=self.bucket)
     found = False
     for page in pages:
       for obj in page.get("Contents", []):
@@ -450,10 +435,10 @@ class _BaseTransfer:
         key = obj["Key"]
         local_path = os.path.join(self.output_dir, key)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        logger.info(f"downloading s3://{self.project}/{key} -> {local_path}")
-        self.store.download_file(self.project, key, local_path)
+        logger.info(f"downloading s3://{self.bucket}/{key} -> {local_path}")
+        self.store.download_file(self.bucket, key, local_path)
     if not found:
-      logger.info(f"bucket empty: {self.project}")
+      logger.info(f"bucket empty: {self.bucket}")
 
   def _copy_to_buckets(self, meta_local, meta_list):
     if self.output_dir is not None:
@@ -469,9 +454,9 @@ class _BaseTransfer:
       for d in meta_list
       if (d.get("access") or "").lower() == "public" and (d.get("input") or "").strip()
     ]
-    index, idx_local = self._load_index()
-    gp = self._group(priv, index) if priv else {}
-    gu = self._group(pub, index) if pub else {}
+    index, _ = self._load_index()
+    gp = group_inputs(priv, index) if priv else {}
+    gu = group_inputs(pub, index) if pub else {}
     w_priv = (
       _SinkWriter(self.store, "isaura-private", self.model_id, self.model_version, self.tmpdir)
       if gp
@@ -482,10 +467,10 @@ class _BaseTransfer:
     )
     tp, tu = 0, 0
     for (r, c), want in gp.items():
-      df = self._select_rows(r, c, want)
+      df = self.select_rows(r, c, want)
       tp += w_priv.add_rows(r, c, df)
     for (r, c), want in gu.items():
-      df = self._select_rows(r, c, want)
+      df = self.select_rows(r, c, want)
       tu += w_pub.add_rows(r, c, df)
     if w_priv:
       w_priv.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
