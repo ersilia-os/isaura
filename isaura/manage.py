@@ -10,6 +10,7 @@ from isaura.helpers import (
   DEFAULT_PRIVATE_BUCKET_NAME as PRI,
   INPUT_C,
   MAX_ROWS,
+  MINIO_ENDPOINT_CLOUD,
   logger,
   filter_out,
   get_apprx,
@@ -18,7 +19,9 @@ from isaura.helpers import (
   get_files,
   get_idx_key,
   get_pref,
+  get_coll,
   group_inputs,
+  hive_prefix,
   make_temp,
   progress,
   query,
@@ -166,7 +169,7 @@ class IsauraWriter:
       shutil.rmtree(self.tmpdir)
     except:
       pass
-  
+
   def __enter__(self):
     return self
 
@@ -175,29 +178,21 @@ class IsauraWriter:
 
 
 class IsauraReader:
-  def __init__(
-    self,
-    model_id,
-    model_version,
-    input_csv,
-    approximate,
-    bucket=None,
-  ):
+  def __init__(self, model_id, model_version, input_csv, approximate, bucket=None, endpoint=None):
     self.model_id = model_id
     self.model_version = model_version
     self.approximate = approximate
     self.input_csv = input_csv
     self.bucket = bucket or PUB
+    self.endpoint = endpoint
     self.base = get_base(self.model_id, model_version)
-    self.index_key = get_idx_key(self.base)
     self.pref = get_pref(self.model_id, self.model_version)
-    self.store = MinioStore()
+    self.collection = get_coll(self.model_id, self.model_version)
+    self.index_key = get_idx_key(self.base)
     self.tmpdir = make_temp("isaura_reader_")
-    self.duck = DuckDBMinio()
+    self.store = MinioStore(endpoint=self.endpoint)
+    self.duck = DuckDBMinio(endpoint=self.endpoint)
     logger.info(f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv}")
-
-  def _hive_prefix(self, r, c):
-    return 
 
   def _load_index(self):
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
@@ -214,7 +209,7 @@ class IsauraReader:
   def _sizes_for_groups(self, groups):
     sizes, total = {}, 0
     for r, c in groups.keys():
-      pref = self._hive_prefix(r, c) + "/"
+      pref = hive_prefix(r, c, self.base) + "/"
       s = 0
       for obj in self.store.list_keys(self.bucket, pref):
         k = obj["Key"]
@@ -225,6 +220,8 @@ class IsauraReader:
     return sizes, total
 
   def read(self, output_csv=None):
+    if self.endpoint is not None:
+      logger.warning("Please have patience as this might take a while to pull from a cloud!")
     t0, wanted, header, objc, results = time.time(), [], set(), "__o", []
     with open(self.input_csv, newline="", encoding="utf-8") as f:
       for row in csv.DictReader(f):
@@ -236,7 +233,7 @@ class IsauraReader:
           header.add(h)
     if self.approximate:
       st = time.perf_counter()
-      wanted = get_apprx(wanted, self.pref)
+      wanted = get_apprx(wanted, self.collection)
       et = time.perf_counter()
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
 
@@ -258,8 +255,9 @@ class IsauraReader:
     out = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     if not out.empty and objc in out.columns:
       out = out.sort_values(objc).drop(columns=objc).reset_index(drop=True)
+    out = filter_out(out, objc, wanted, header)
     if output_csv:
-      filter_out(out, objc, wanted, header).to_csv(output_csv, index=False)
+      out.to_csv(output_csv, index=False)
       logger.info(f"wrote csv rows={len(out)} path={output_csv}")
     elapsed = time.time() - t0
     rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
@@ -362,23 +360,48 @@ class IsauraInspect:
 class IsauraCopy(_BaseTransfer):
   def copy(self):
     meta_local, meta = self._load_metadata()
-    return self._copy_to_buckets(meta_local, meta)
+    return self._copy(meta_local, meta)
 
 
 class IsauraMover(_BaseTransfer):
   def move(self):
-    self.copy()
-    n = self._delete_tranches_tree()
+    self._copy()
+    n = self._delete()
     logger.info(f"move wiped objects={n}")
 
 
 class IsauraRemover(_BaseTransfer):
   def remove(self):
-    n = self._delete_tranches_tree()
+    n = self._delete()
     logger.info(f"removed objects={n}")
 
 
 class IsauraPull(_BaseTransfer):
+  def __init__(self, model_id, model_version, bucket, input_csv, output_dir=None):
+    super().__init__(model_id, model_version, bucket, output_dir)
+    self.model_id = model_id
+    self.model_version = model_version
+    self.bucket = bucket
+    self.input_csv = input_csv
+
+  def pull(self):
+    logger.info(f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}")
+    reader = IsauraReader(
+      model_id=self.model_id,
+      model_version=self.model_version,
+      input_csv=self.input_csv,
+      approximate=False,
+      bucket=self.bucket,
+      endpoint=MINIO_ENDPOINT_CLOUD
+    )
+    df = reader.read()
+    reader.duck.close()
+    print(self.store.endpoint)
+    out = self._pull(df)
+    logger.info(f"pulled objects={out}")
+
+
+class IsauraPush(_BaseTransfer):
   def remove(self):
     n = self._delete_tranches_tree()
     logger.info(f"removed objects={n}")

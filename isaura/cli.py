@@ -10,8 +10,9 @@ from isaura.manage import (
   IsauraWriter,
   IsauraReader,
   IsauraInspect,
+  IsauraPull
 )
-from isaura.helpers import logger, console, make_table, inspect_table
+from isaura.helpers import DEFAULT_BUCKET_NAME, logger, console, inspect_table, make_table
 
 click.rich_click.USE_RICH_MARKUP = True
 click.rich_click.SHOW_ARGUMENTS = True
@@ -45,7 +46,7 @@ def cli():
 opt_model = click.option("--model", "-m", required=True, help="Ersilia model id (eosxxxx)")
 opt_version = click.option("--version", "-v", default="v1", show_default=True, help="Model version")
 opt_project = click.option(
-  "--project-name", "-pn", required=False, default=None, help="Project (bucket) name"
+  "--project-name", "-pn", required=False, default=DEFAULT_BUCKET_NAME, help="Project (bucket) name"
 )
 opt_project_req = click.option("--project-name", "-pn", required=True, help="Project (bucket) name")
 opt_input_file = click.option("--input-file", "-i", required=True, help="Path to input CSV")
@@ -67,7 +68,7 @@ opt_yes_flag = click.option("--yes", "-y", is_flag=True, help="Confirm deletion"
 opt_dump_outdir = click.option("--output-dir", "-o", required=False, help="Local output directory")
 opt_approx = click.option(
   "--approximate",
-  "-a",
+  "-nn",
   is_flag=True,
   default=False,
   help="Specifies whether to use Approximate Nearest Neighbor search for result retrieval or not.",
@@ -95,6 +96,12 @@ def read(input_file, project_name, model, version, output_file, approximate):
   )
   r.read(output_csv=output_file)
 
+@cli.command("pull")
+@apply_opts(opt_input_file, opt_project, opt_model, opt_version, opt_output_file)
+def pull(input_file, project_name, model, version, output_file):
+  pl = IsauraPull(
+    model_id=model, model_version=version, bucket=project_name, input_csv=input_file)
+  pl.pull()
 
 @cli.command("copy")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_dump_outdir)

@@ -1,4 +1,4 @@
-import boto3, duckdb, json, os, pickle, tempfile, uuid
+import boto3, duckdb, json, os, pickle, uuid
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -7,7 +7,6 @@ from isaura.helpers import (
   MINIO_ENDPOINT,
   MINIO_ACCESS_KEY,
   MINIO_SECRET_KEY,
-  STORE_DIRECTORY,
   MAX_ROWS_PER_FILE,
   CHECKPOINT_EVERY,
   BLOOM_FILENAME,
@@ -15,6 +14,7 @@ from isaura.helpers import (
   logger,
   filter_out,
   get_base,
+  get_coll,
   get_files,
   get_pref,
   get_idx_key,
@@ -22,8 +22,8 @@ from isaura.helpers import (
   group_inputs,
   hive_prefix,
   make_temp,
+  post_apprx,
   query,
-
 )
 
 from botocore.config import Config
@@ -117,7 +117,7 @@ class DuckDBMinio:  # Singleton as we gonna use it for same shared resource
     self.con.execute("SET s3_access_key_id=?", [access])
     self.con.execute("SET s3_secret_access_key=?", [secret])
     self.con.execute("SET s3_endpoint=?", [ep])
-    self.con.execute("SET s3_region='us-east-1'")
+    self.con.execute("SET s3_region='';")   
     self.con.execute("SET s3_use_ssl=?", [use_ssl])
     self.con.execute("SET s3_url_style='path'")
 
@@ -378,14 +378,15 @@ class _SinkWriter:
 
 
 class _BaseTransfer:
-  def __init__(self, model_id, model_version, bucket, output_dir=None, store=None):
+  def __init__(self, model_id, model_version, bucket, output_dir=None):
     self.model_id = model_id
     self.model_version = model_version
     self.bucket = bucket
     self.output_dir = output_dir
     self.base = get_pref(model_id, model_version)
     self.tranches = get_base(model_id, model_version)
-    self.store = store or MinioStore()
+    self.collection = get_coll(self.model_id, self.model_version)
+    self.store = MinioStore()
     self.tmpdir = make_temp("isaura_xfer_")
     self.duck = DuckDBMinio(
       endpoint=self.store.endpoint,
@@ -419,12 +420,37 @@ class _BaseTransfer:
     out = self.duck.con.execute(query(get_files(self.bucket, r, c, self.tranches))).fetchdf()
     return filter_out(out, "__o", wanted, input_col)
 
-  def _delete_tranches_tree(self):
+  def _delete(self):
     prefix = f"{self.tranches}/"
     n = self.store.delete_prefix(self.bucket, prefix)
     return n
 
-  def dump(self):
+  def _pull(self, df):
+    # Read from a specific bucket [either isaura-public/isaura-private]
+    # since the read fucntion returns the dataframe we then use that to
+    # use _Sink_Writer to save them locally
+    # But to do that we first load the index of the local model/version/tranches dir
+    # After that we use this to group inputs
+    index, _ = self._load_index()
+    input = df["input"].astype(str).to_list()
+    gp = group_inputs(input, index, force=True)
+    print(f"Groups:{gp}")
+    wt = _SinkWriter(self.store, self.bucket, self.model_id, self.model_version, self.tmpdir)
+    tp, tu, dfs = 0, 0, []
+    for (r, c), want in gp.items():
+      df = self.select_rows(r, c, want)
+      _tp = wt.add_rows(r, c, df)
+      if _tp != 0:
+        dfs.append(df)
+      tp += _tp
+
+    if wt:
+      wt.finalize(schema_cols=list(df.keys()))
+    dfs = pd.concat(dfs, ignore_index=True)
+    post_apprx(dfs, self.collection)
+    return tp, tu
+
+  def _dump(self):
     os.makedirs(self.output_dir, exist_ok=True)
     paginator = self.store.client.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=self.bucket)
@@ -440,9 +466,9 @@ class _BaseTransfer:
     if not found:
       logger.info(f"bucket empty: {self.bucket}")
 
-  def _copy_to_buckets(self, meta_local, meta_list):
+  def _copy(self, meta_local, meta_list):
     if self.output_dir is not None:
-      self.dump()
+      self._dump()
       return
     priv = [
       (d.get("input") or "").strip()
@@ -465,15 +491,24 @@ class _BaseTransfer:
     w_pub = (
       _SinkWriter(self.store, "isaura-public", self.model_id, self.model_version, self.tmpdir) if gu else None
     )
-    tp, tu = 0, 0
+    tp, tu, dfs = 0, 0, []
     for (r, c), want in gp.items():
       df = self.select_rows(r, c, want)
-      tp += w_priv.add_rows(r, c, df)
+      _tp = w_priv.add_rows(r, c, df)
+      if _tp != 0:
+        dfs.append(df)
+      tp += _tp
     for (r, c), want in gu.items():
       df = self.select_rows(r, c, want)
-      tu += w_pub.add_rows(r, c, df)
+      _tu = w_pub.add_rows(r, c, df)
+      if _tu != 0:
+        dfs.append(df)
+      tu += _tu
+
     if w_priv:
       w_priv.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
     if w_pub:
       w_pub.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
+    dfs = pd.concat(dfs, ignore_index=True)
+    post_apprx(dfs, self.collection)
     return tp, tu
