@@ -1,5 +1,5 @@
 import csv, json, os, psutil, requests, tempfile, time
-import pandas as pd
+from time import sleep
 from contextlib import contextmanager
 from collections import defaultdict
 from loguru import logger
@@ -10,9 +10,11 @@ from rich.progress import (
   TextColumn,
   BarColumn,
   TimeRemainingColumn,
-  DownloadColumn,
-  TransferSpeedColumn,
+  TimeElapsedColumn,
+  ProgressColumn,
+  Task,
 )
+from rich.text import Text
 from rich.table import Table
 from rich.logging import RichHandler
 from rich.progress import Progress
@@ -39,12 +41,12 @@ MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
 LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT") or "http://127.0.0.1:9000"
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 TIMEOUT = os.getenv("TIMEOUT", 3600)
 MINIO_ENDPOINT_CLOUD = os.getenv("MINIO_ENDPOINT_CLOUD") or "http://83.48.73.209:8080"
 NNS_ENDPOINT_BASE = os.getenv("NNS_ENDPOINT") or "http://127.0.0.1:8080/"
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin123")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin1234")
 isaura_temp = os.path.join(Path.home(), "eos", "isaura-temp")
 if not os.path.exists(isaura_temp):
   os.makedirs(isaura_temp)
@@ -79,6 +81,17 @@ def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():
 # fmt: on
 
 
+def split_csv(df):
+  paths = []
+  output_dir = make_temp("isaura_push_")
+  for bucket in [DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME]:
+    if bucket in df["bucket"].unique():
+      path = os.path.join(output_dir, f"{bucket.replace('-', '_')}.csv")
+      df[df["bucket"] == bucket].to_csv(path, index=False)
+      paths.append(str(path))
+  return paths
+
+
 def filter_out(out, objc, wanted, header):
   return (
     out[out[header].isin(wanted)]
@@ -92,26 +105,24 @@ def filter_out(out, objc, wanted, header):
 def group_inputs(wanted, index, force=False):
   try:
     miss = [s for s in wanted if s not in index]
-    print(len(miss), len(index))
     g = defaultdict(set)
     if miss and not force:
       raise RuntimeError(
         f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
       )
     if not force:
-      print("Or This happeded")
       for s in wanted:
         r, c = index[s]
         g[(int(r), int(c))].add(s)
       return g
     if miss and force:
-      print("This happeded")
       for s in miss:
         r, c, _, _ = tranche_coordinates(s)
         g[(int(r), int(c))].add(s)
       return g
   except Exception as e:
     print(e)
+    return None
 
 
 def line_gen(df, chunksize=100_000):
@@ -196,30 +207,48 @@ def make_table(title, cols, rows):
 inspect_table = [
   {"key": "model", "name": "model/version", "justify": "left", "style": "bold"},
   {"key": "entries", "name": "entry count", "justify": "right"},
-  {"key": "tranches", "name": "tranches", "justify": "right"},
+  {"key": "rows", "name": "rows", "justify": "right"},
   {"key": "chunks", "name": "chunks", "justify": "right"},
 ]
 
 T = TypeVar("T")
 
 
-def make_download_progress(transient: bool = True) -> Progress:
+class RowCountColumn(ProgressColumn):
+  def render(self, task: Task) -> Text:
+    return Text(f"{int(task.completed):,} rows")
+
+
+class RowSpeedColumn(ProgressColumn):
+  def render(self, task: Task) -> Text:
+    return Text(f"{task.speed:,.0f} rows/s" if task.speed else "– rows/s", style="dim")
+
+
+def make_row_progress(transient: bool = True) -> Progress:
   return Progress(
     SpinnerColumn(),
     TextColumn("[bold cyan]{task.fields[desc]}[/]"),
     BarColumn(),
-    DownloadColumn(binary_units=True),
-    TransferSpeedColumn(),
+    RowCountColumn(),
+    RowSpeedColumn(),
+    TimeElapsedColumn(),
     TimeRemainingColumn(),
     transient=transient,
   )
 
 
 @contextmanager
-def progress(desc: str, total_bytes: Optional[int] = None, transient: bool = True):
-  with make_download_progress(transient=transient) as progress:
-    task_id = progress.add_task("download", total=total_bytes or 0, desc=desc)
-    yield progress, task_id
+def progress(desc: str, total_rows: Optional[int] = None, transient: bool = True):
+  with make_row_progress(transient=transient) as prog:
+    task_id = prog.add_task("rows", total=total_rows, desc=desc)
+    yield prog, task_id
+
+
+def spinner(message, fn, *args, **kwargs):
+  c = Console()
+  with c.status(message, spinner="dots"):
+    result = fn(*args, **kwargs)
+  return result
 
 
 class Logger:

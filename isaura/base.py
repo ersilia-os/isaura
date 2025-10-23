@@ -1,4 +1,4 @@
-import boto3, duckdb, json, os, pickle, uuid
+import boto3, duckdb, json, os, pickle, sys, uuid
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -52,6 +52,7 @@ class MinioStore:
       endpoint_url=self.endpoint,
       aws_access_key_id=self.access,
       aws_secret_access_key=self.secret,
+      region_name="us-east-1",
       config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
     self.transfer_config = TransferConfig(
@@ -64,8 +65,13 @@ class MinioStore:
   def ensure_bucket(self, bucket):
     try:
       self.client.head_bucket(Bucket=bucket)
-    except Exception:
-      self.client.create_bucket(Bucket=bucket)
+    except Exception as e:
+      logger.error(e)
+      try:
+        self.client.create_bucket(Bucket=bucket)
+      except Exception as e:
+        logger.error(e)
+        sys.exit(1)
 
   def download_file(self, bucket, key, local):
     self.client.download_file(bucket, key, local, Config=self.transfer_config)
@@ -94,39 +100,44 @@ class MinioStore:
     return deleted
 
 
-class DuckDBMinio:  # Singleton as we gonna use it for same shared resource
-  _instance, _init = None, None
+class DuckDBMinio:  # Singleton design here
+  _instance = None
 
   def __new__(cls, *a, **kw):
-    if not cls._instance:
+    if cls._instance is None:
       cls._instance = super().__new__(cls)
     return cls._instance
 
   def __init__(self, endpoint=None, access=None, secret=None, threads=None):
-    if DuckDBMinio._init:
-      return
-    DuckDBMinio._init = True
     endpoint = endpoint or MINIO_ENDPOINT
     access = access or MINIO_ACCESS_KEY
     secret = secret or MINIO_SECRET_KEY
-    use_ssl = endpoint.startswith("https://")
-    ep = endpoint.replace("http://", "").replace("https://", "")
-    self.con = duckdb.connect(database=":memory:")
-    self.con.execute(f"PRAGMA threads={threads or max(2, os.cpu_count() or 2)};")
+    threads = threads or max(2, os.cpu_count() or 2)
+    print("main", endpoint, MINIO_ENDPOINT)
+
+    cfg = (endpoint, access, secret, threads)
+    if getattr(self, "_cfg", None) == cfg:
+      return
+
+    if getattr(self, "con", None):
+      self.con.close()
+
+    self.endpoint, self.access, self.secret = endpoint, access, secret
+    self.con = duckdb.connect(":memory:")
+    self.con.execute(f"PRAGMA threads={threads};")
     self.con.execute("INSTALL httpfs; LOAD httpfs;")
     self.con.execute("SET s3_access_key_id=?", [access])
     self.con.execute("SET s3_secret_access_key=?", [secret])
-    self.con.execute("SET s3_endpoint=?", [ep])
-    self.con.execute("SET s3_region='';")   
-    self.con.execute("SET s3_use_ssl=?", [use_ssl])
+    self.con.execute("SET s3_endpoint=?", [endpoint.replace("http://", "").replace("https://", "")])
+    self.con.execute("SET s3_region='us-east-1';")
+    self.con.execute("SET s3_use_ssl=?", [endpoint.startswith("https://")])
     self.con.execute("SET s3_url_style='path'")
+    self._cfg = cfg
 
   def close(self):
     if getattr(self, "con", None):
       self.con.close()
       self.con = None
-      DuckDBMinio._instance = None
-      DuckDBMinio._init = False
 
 
 class BloomIndex:
@@ -352,7 +363,7 @@ class _SinkWriter:
     new_rows = []
     for _, row in df.iterrows():
       smi = row["input"]
-      if smi and not self.bi.seen(smi):
+      if smi:
         new_rows.append(dict(row))
         self.bi.register(smi, rc=(r, c))
     if not new_rows:
@@ -388,6 +399,7 @@ class _BaseTransfer:
     self.collection = get_coll(self.model_id, self.model_version)
     self.store = MinioStore()
     self.tmpdir = make_temp("isaura_xfer_")
+    print(self.store.endpoint)
     self.duck = DuckDBMinio(
       endpoint=self.store.endpoint,
       access=self.store.access,
@@ -403,7 +415,9 @@ class _BaseTransfer:
 
   def _load_metadata(self):
     local = os.path.join(self.tmpdir, ACCESS_FILE)
-    if self._download_if_exists(get_acc_key(self.tranches), local):
+    acc = get_acc_key(self.tranches)
+    print(local, acc)
+    if self._download_if_exists(acc, local):
       with open(local, "r", encoding="utf-8") as f:
         return local, json.load(f)
     raise RuntimeError(f"{ACCESS_FILE} not found")
@@ -421,33 +435,28 @@ class _BaseTransfer:
     return filter_out(out, "__o", wanted, input_col)
 
   def _delete(self):
-    prefix = f"{self.tranches}/"
-    n = self.store.delete_prefix(self.bucket, prefix)
-    return n
+    return self.store.delete_prefix(self.bucket, self.tranches)
 
-  def _pull(self, df):
-    # Read from a specific bucket [either isaura-public/isaura-private]
-    # since the read fucntion returns the dataframe we then use that to
-    # use _Sink_Writer to save them locally
-    # But to do that we first load the index of the local model/version/tranches dir
-    # After that we use this to group inputs
-    index, _ = self._load_index()
+  def _pull(self, df, index):
     input = df["input"].astype(str).to_list()
+    print("here 1")
     gp = group_inputs(input, index, force=True)
-    print(f"Groups:{gp}")
+    print("here 2")
     wt = _SinkWriter(self.store, self.bucket, self.model_id, self.model_version, self.tmpdir)
     tp, tu, dfs = 0, 0, []
     for (r, c), want in gp.items():
-      df = self.select_rows(r, c, want)
+      df_ = df[df["input"].isin(list(want))]
       _tp = wt.add_rows(r, c, df)
       if _tp != 0:
-        dfs.append(df)
+        dfs.append(df_)
       tp += _tp
-
     if wt:
       wt.finalize(schema_cols=list(df.keys()))
-    dfs = pd.concat(dfs, ignore_index=True)
-    post_apprx(dfs, self.collection)
+    print("here 3")
+    if dfs:
+      dfs = pd.concat(dfs, ignore_index=True)
+      post_apprx(dfs, self.collection)
+    print("here 4")
     return tp, tu
 
   def _dump(self):
@@ -504,11 +513,11 @@ class _BaseTransfer:
       if _tu != 0:
         dfs.append(df)
       tu += _tu
-
     if w_priv:
       w_priv.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
     if w_pub:
       w_pub.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
-    dfs = pd.concat(dfs, ignore_index=True)
-    post_apprx(dfs, self.collection)
+    if dfs:
+      dfs = pd.concat(dfs, ignore_index=True)
+      post_apprx(dfs, self.collection)
     return tp, tu

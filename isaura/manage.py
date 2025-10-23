@@ -1,4 +1,4 @@
-import csv, json, os, shutil, time, uuid
+import csv, json, os, shutil, sys, time, uuid
 
 import pandas as pd
 from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio
@@ -25,6 +25,7 @@ from isaura.helpers import (
   make_temp,
   progress,
   query,
+  spinner,
   write_access_file,
   tranche_coordinates,
 )
@@ -81,14 +82,7 @@ class IsauraChecker(AbstractContextManager):
 
 
 class IsauraWriter:
-  def __init__(
-    self,
-    input_csv,
-    model_id,
-    model_version,
-    access="public",
-    bucket=None,
-  ):
+  def __init__(self, input_csv, model_id, model_version, access="public", bucket=None, endpoint=None):
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
@@ -96,7 +90,7 @@ class IsauraWriter:
     self.bucket = bucket or PUB
     self.base_prefix = get_base(self.model_id, model_version)
     self.max_rows = int(MAX_ROWS)
-    self.store = MinioStore()
+    self.store = MinioStore(endpoint=endpoint)
     self.store.ensure_bucket(self.bucket)
     self.tmpdir = make_temp("isaura_")
     self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
@@ -206,22 +200,7 @@ class IsauraReader:
       except:
         pass
 
-  def _sizes_for_groups(self, groups):
-    sizes, total = {}, 0
-    for r, c in groups.keys():
-      pref = hive_prefix(r, c, self.base) + "/"
-      s = 0
-      for obj in self.store.list_keys(self.bucket, pref):
-        k = obj["Key"]
-        if k.endswith(".parquet") and "/chunk_" in k:
-          s += int(obj.get("Size", 0))
-      sizes[(r, c)] = s
-      total += s
-    return sizes, total
-
   def read(self, output_csv=None):
-    if self.endpoint is not None:
-      logger.warning("Please have patience as this might take a while to pull from a cloud!")
     t0, wanted, header, objc, results = time.time(), [], set(), "__o", []
     with open(self.input_csv, newline="", encoding="utf-8") as f:
       for row in csv.DictReader(f):
@@ -236,22 +215,20 @@ class IsauraReader:
       wanted = get_apprx(wanted, self.collection)
       et = time.perf_counter()
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
-
     header = list(header)[0]
     if not wanted:
       return pd.DataFrame()
-    index = self._load_index()
+    index = spinner("Fetching index. Please have patience as this might take a while!", self._load_index)
     groups = group_inputs(wanted, index)
-    sizes, total_bytes = self._sizes_for_groups(groups)
     order_map = {s: i for i, s in enumerate(wanted)}
-    with progress(get_desc(self.pref, wanted), total_bytes or 0, transient=True) as (prog, task_id):
+    with progress(get_desc(self.pref, wanted), total_rows=len(wanted), transient=True) as (prog, task_id):
       for (r, c), _ in groups.items():
-        part = self.duck.con.execute(query(get_files(self.bucket, r, c, self.base))).fetchdf()
+        files = get_files(self.bucket, r, c, self.base)
+        part = self.duck.con.execute(query(files)).fetchdf()
         if not part.empty:
           part[objc] = part[header].map(order_map)
           results.append(part)
-        if total_bytes:
-          prog.update(task_id, advance=sizes.get((r, c), 0))
+        prog.update(task_id, advance=len(part))
     out = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     if not out.empty and objc in out.columns:
       out = out.sort_values(objc).drop(columns=objc).reset_index(drop=True)
@@ -270,11 +247,12 @@ class IsauraReader:
 
 
 class IsauraInspect:
-  def __init__(self, model_id, model_version, project_name=None, access="both"):
+  def __init__(self, model_id, model_version, cloud, project_name=None, access="both"):
     self.mid, self.mv, self.proj, self.acc = model_id, model_version, project_name, access
     self.base = get_base(self.mid, self.mv)
     self.idx_key = get_idx_key(self.base)
-    self.s = MinioStore()
+    endpoint = MINIO_ENDPOINT_CLOUD if cloud else None
+    self.s = MinioStore(endpoint=endpoint)
     logger.info(f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}")
 
   def _buckets(self):
@@ -285,10 +263,14 @@ class IsauraInspect:
     )
 
   def _idx(self, b):
-    o = self.s.client.get_object(Bucket=b, Key=self.idx_key)
-    d = json.loads(o["Body"].read().decode("utf-8"))
-    logger.info(f"loaded index: bucket={b} entries={len(d)}")
-    return d
+    try:
+      o = self.s.client.get_object(Bucket=b, Key=self.idx_key)
+      d = json.loads(o["Body"].read().decode("utf-8"))
+      logger.info(f"loaded index: bucket={b} entries={len(d)}")
+      return d
+    except Exception as e:
+      logger.warning(e)
+      return None
 
   def _union(self):
     if self.proj:
@@ -305,6 +287,37 @@ class IsauraInspect:
       except Exception as e:
         logger.info(f"no index in {b}: {e}")
     return own
+
+  def _candidate_buckets(self):
+    if self.proj:
+      return [self.proj]
+    if self.acc == "public":
+      return [PUB]
+    if self.acc == "private":
+      return [PRI]
+    return [PUB, PRI]
+
+  def _load_indices_union(self):
+    buckets = self._candidate_buckets()
+    union = {}
+    owners = {}
+    for b in buckets:
+      idx = self._idx(b)
+      if idx:
+        for smi in idx.keys():
+          if smi not in union:
+            union[smi] = True
+            owners[smi] = b
+    return union, owners
+
+  def list_available(self, output_csv=None):
+    _, owner = self._load_indices_union()
+    rows = [{"input": smi, "bucket": b} for smi, b in owner.items()]
+    df = pd.DataFrame(rows)
+    if output_csv:
+      df.to_csv(output_csv, index=False)
+      logger.info(f"inspect list wrote={len(df)} path={output_csv}")
+    return df
 
   def inspect_inputs(self, input_csv, output_csv=None):
     own = self._union()
@@ -335,7 +348,7 @@ class IsauraInspect:
           k = obj["Key"]
           if "/chunk_" in k and k.endswith(".parquet"):
             ch += 1
-            i = k.find("tranche_")
+            i = k.find("row=")
             if i != -1:
               tr.add(k[i:].split("/")[0])
       return len(tr), ch
@@ -347,13 +360,14 @@ class IsauraInspect:
       for v_pref in list_prefixes(m_pref):
         ver = v_pref[len(m_pref) :].strip("/")
         try:
-          obj = c.get_object(Bucket=project_name, Key=get_idx_key(self.base))
+          obj = c.get_object(Bucket=project_name, Key=get_idx_key(get_base(model, ver)))
           idx = json.loads(obj["Body"].read().decode("utf-8"))
           entries = len(idx)
-        except Exception:
+        except Exception as e:
+          logger.error(e)
           entries = 0
         tr, ch = count_chunks(get_pref(model, ver))
-        rows.append({"model": get_pref(model, ver), "entries": entries, "tranches": tr, "chunks": ch})
+        rows.append({"model": get_pref(model, ver), "entries": entries, "rows": tr, "chunks": ch})
     return rows
 
 
@@ -385,23 +399,21 @@ class IsauraPull(_BaseTransfer):
     self.input_csv = input_csv
 
   def pull(self):
-    logger.info(f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}")
-    reader = IsauraReader(
+    logger.info(
+      f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}"
+    )
+    r = IsauraReader(
       model_id=self.model_id,
       model_version=self.model_version,
       input_csv=self.input_csv,
       approximate=False,
       bucket=self.bucket,
-      endpoint=MINIO_ENDPOINT_CLOUD
+      endpoint=MINIO_ENDPOINT_CLOUD,
     )
-    df = reader.read()
-    reader.duck.close()
-    print(self.store.endpoint)
-    out = self._pull(df)
+    out = self._pull(r.read(), self._load_index())
     logger.info(f"pulled objects={out}")
 
 
 class IsauraPush(_BaseTransfer):
-  def remove(self):
-    n = self._delete_tranches_tree()
-    logger.info(f"removed objects={n}")
+  # we first use inspect command
+  pass
