@@ -1,5 +1,5 @@
-import csv, json, os, psutil, requests, subprocess, tempfile, time
-from time import sleep
+import json, os, psutil, requests, subprocess, tempfile, time
+import pandas as pd
 from contextlib import contextmanager
 from collections import defaultdict
 from loguru import logger
@@ -86,38 +86,40 @@ def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():
 
 
 def run_docker_compose(up=True):
-    try:
-        path = Path(__file__).parent / "configs" / "docker-compose.yml"
-        cmd = ["docker", "compose", "-f", path, "up", "-d"] if up else ["docker", "compose", "-f", path, "down"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info(f"Docker Compose {'started' if up else 'stopped'} successfully.")
-        logger.debug(result.stdout.strip())
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Docker Compose failed: {e.stderr.strip()}")
-    except FileNotFoundError:
-        logger.error("Docker is not installed or not in PATH.")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-    return False
+  try:
+    path = Path(__file__).parent / "configs" / "docker-compose.yml"
+    cmd = ["docker", "compose", "-f", path, "up", "-d"] if up else ["docker", "compose", "-f", path, "down"]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    logger.info(f"Docker Compose {'started' if up else 'stopped'} successfully.")
+    logger.debug(result.stdout.strip())
+    return True
+  except subprocess.CalledProcessError as e:
+    logger.error(f"Docker Compose failed: {e.stderr.strip()}")
+  except FileNotFoundError:
+    logger.error("Docker is not installed or not in PATH.")
+  except Exception as e:
+    logger.error(f"Unexpected error: {e}")
+  return False
+
 
 def show_figlet():
-    path = Path(__file__).parent.parent / "assets" / "figlet.txt"
-    text = Path(path).read_text(encoding="utf-8")
-    start_color = (0, 255, 255)   
-    end_color = (255, 0, 255)    
-    content = "".join(text)
-    gradient = Text()
-    for i, ch in enumerate(content):
-        ratio = i / max(1, len(content) - 1)
-        r = int(start_color[0] + (end_color[0] - start_color[0]) * ratio)
-        g = int(start_color[1] + (end_color[1] - start_color[1]) * ratio)
-        b = int(start_color[2] + (end_color[2] - start_color[2]) * ratio)
-        gradient.append(ch, style=f"rgb({r},{g},{b})")
-    print()
-    console.print(gradient, justify="center")
-    console.print(Text(f"Version 2.0.1", style="bold bright_black"), justify="center")
-    print()
+  path = Path(__file__).parent.parent / "assets" / "figlet.txt"
+  text = Path(path).read_text(encoding="utf-8")
+  start_color = (0, 255, 255)
+  end_color = (255, 0, 255)
+  content = "".join(text)
+  gradient = Text()
+  for i, ch in enumerate(content):
+    ratio = i / max(1, len(content) - 1)
+    r = int(start_color[0] + (end_color[0] - start_color[0]) * ratio)
+    g = int(start_color[1] + (end_color[1] - start_color[1]) * ratio)
+    b = int(start_color[2] + (end_color[2] - start_color[2]) * ratio)
+    gradient.append(ch, style=f"rgb({r},{g},{b})")
+  print()
+  console.print(gradient, justify="center")
+  console.print(Text(f"Version 2.0.1", style="bold bright_black"), justify="center")
+  print()
+
 
 def split_csv(df):
   paths = []
@@ -130,14 +132,29 @@ def split_csv(df):
   return paths
 
 
-def filter_out(out, objc, wanted, header):
-  return (
-    out[out[header].isin(wanted)]
-    .assign(__o=lambda d: d[header].map({s: i for i, s in enumerate(wanted)}))
-    .sort_values(objc)
-    .drop(columns=[objc, "row", "col"], errors="ignore")
+def filter_out(out, objc, wanted, header, chunk=100_000):
+  if out is None or out.empty or not wanted:
+    return pd.DataFrame()
+
+  parts = []
+  n = len(wanted)
+  for i in range(0, n, chunk):
+    w = wanted[i : i + chunk]
+    wdf = pd.DataFrame({header: w, "_order": range(i, i + len(w))})
+    m = wdf.merge(out, on=header, how="left", sort=False, indicator=True)
+    m = m[m["_merge"] == "both"].drop(columns=["_merge"])
+    parts.append(m)
+
+  if not parts:
+    return pd.DataFrame()
+
+  res = (
+    pd.concat(parts, ignore_index=True)
+    .sort_values("_order")
+    .drop(columns=["_order", objc, "row", "col"], errors="ignore")
     .reset_index(drop=True)
   )
+  return res
 
 
 def group_inputs(wanted, index, force=False):
@@ -215,6 +232,7 @@ def write_access_file(existed, data, access, dir):
   except Exception as e:
     logger.error(e)
 
+
 def tranche_coordinates(smiles):
   mol = Chem.MolFromSmiles(smiles)
   if mol is None:
@@ -291,6 +309,7 @@ def spinner(message, fn, *args, **kwargs):
   return result
 
 
+# fmt: off
 class Logger:
   def __init__(self):
     self.logger = logger
@@ -323,23 +342,12 @@ class Logger:
     else:
       self._unlog_from_console()
 
-  def debug(self, text):
-    self.logger.debug(text)
-
-  def info(self, text):
-    self.logger.info(text)
-
-  def warning(self, text):
-    self.logger.warning(text)
-
-  def error(self, text):
-    self.logger.error(text)
-
-  def critical(self, text):
-    self.logger.critical(text)
-
-  def success(self, text):
-    self.logger.success(text)
+  def debug(self, text): self.logger.debug(text)
+  def info(self, text): self.logger.info(text)
+  def warning(self, text): self.logger.warning(text)
+  def error(self, text): self.logger.error(text)
+  def critical(self, text): self.logger.critical(text)
+  def success(self, text): self.logger.success(text)
 
 
 logger = Logger()

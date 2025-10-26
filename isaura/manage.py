@@ -87,7 +87,17 @@ class IsauraChecker(AbstractContextManager):
 
 
 class IsauraWriter:
-  def __init__(self, input_csv, model_id, model_version, access="public", bucket=None, endpoint=None, access_key=None, secrete=None):
+  def __init__(
+    self,
+    input_csv,
+    model_id,
+    model_version,
+    access="public",
+    bucket=None,
+    endpoint=None,
+    access_key=None,
+    secrete=None,
+  ):
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
@@ -198,7 +208,17 @@ class IsauraWriter:
 
 
 class IsauraReader:
-  def __init__(self, model_id, model_version, input_csv, approximate, bucket=None, endpoint=None, access_key=None, secrete=None):
+  def __init__(
+    self,
+    model_id,
+    model_version,
+    input_csv,
+    approximate,
+    bucket=None,
+    endpoint=None,
+    access_key=None,
+    secrete=None,
+  ):
     self.model_id = model_id
     self.model_version = model_version
     self.approximate = approximate
@@ -226,16 +246,19 @@ class IsauraReader:
       except:
         pass
 
-  def read(self, output_csv=None):
+  def read(self, output_csv=None, df=None):
     t0, wanted, header, objc, results = time.time(), [], set(), "__o", []
-    with open(self.input_csv, newline="", encoding="utf-8") as f:
-      for row in csv.DictReader(f):
-        h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-        v = (row.get(h)).strip()
-        if v:
-          wanted.append(v)
-        if h not in header:
-          header.add(h)
+    rows = df.to_dict("records") if df is not None else None
+    if rows is None:
+      with open(self.input_csv, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for row in rows:
+      h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+      v = (row.get(h)).strip()
+      if v:
+        wanted.append(v)
+      if h not in header:
+        header.add(h)
     if self.approximate:
       st = time.perf_counter()
       wanted = get_apprx(wanted, self.collection)
@@ -258,6 +281,7 @@ class IsauraReader:
     out = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     if not out.empty and objc in out.columns:
       out = out.sort_values(objc).drop(columns=objc).reset_index(drop=True)
+    logger.info(f"Preprocessing the data for final write up!")
     out = filter_out(out, objc, wanted, header)
     if output_csv:
       out.to_csv(output_csv, index=False)
@@ -368,6 +392,7 @@ class IsauraInspect:
             yield cp["Prefix"]
       except Exception as e:
         logger.error(e)
+
     def count_chunks(base):
       tr = set()
       ch = 0
@@ -439,7 +464,7 @@ class IsauraPull(_BaseTransfer):
       bucket=self.bucket,
       endpoint=MINIO_ENDPOINT_CLOUD,
       access_key=mcak,
-      secrete=mcsk
+      secrete=mcsk,
     )
     out = self._pull(r.read(), self._load_index())
     logger.info(f"pulled objects={out}")
@@ -490,6 +515,6 @@ class IsauraPush:
         access=None if access == "public" else "private",
         endpoint=MINIO_ENDPOINT_CLOUD,
         access_key=mck,
-        secrete=mcs
+        secrete=mcs,
       ) as w:
         w.write(df=df)
