@@ -1,5 +1,7 @@
-import csv, json, os, requests
+import csv, json, os, psutil, requests, subprocess, tempfile, time
+from time import sleep
 from contextlib import contextmanager
+from collections import defaultdict
 from loguru import logger
 from typing import TypeVar, Optional
 from rich.progress import (
@@ -8,17 +10,19 @@ from rich.progress import (
   TextColumn,
   BarColumn,
   TimeRemainingColumn,
-  DownloadColumn,
-  TransferSpeedColumn,
+  TimeElapsedColumn,
+  ProgressColumn,
+  Task,
 )
+from rich.text import Text
 from rich.table import Table
 from rich.logging import RichHandler
 from rich.progress import Progress
 from rich.console import Console
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
+from pathlib import Path
 
-# logger
 logger.remove()
 console = Console()
 logger.level("DEBUG", color="<cyan><bold>")
@@ -29,59 +33,193 @@ logger.level("CRITICAL", color="<white><bold><bg red>")
 logger.level("SUCCESS", color="<black><bold><bg green>")
 
 
-# Constants
-
 ACCESS_FILE = "access.json"
-TIMEOUT = os.getenv("TIMEOUT", 3600)
+INDEX_FILE = "index.json"
 MAX_ROWS = 100_000
-# Tranche bins
 
 MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
 LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
 
-# Env variables
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
-NNS_ENDPOINT = os.getenv("NNS_ENDPOINT", "http://127.0.0.1:8080/search")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", ".")
+TIMEOUT = os.getenv("TIMEOUT", 3600)
+MINIO_ENDPOINT_CLOUD = os.getenv("MINIO_ENDPOINT_CLOUD") or "http://83.48.73.209:8080"
+NNS_ENDPOINT_BASE = os.getenv("NNS_ENDPOINT") or "http://127.0.0.1:8080/"
+MINIO_LOCAL_AK = os.getenv("MINIO_LOCAL_AK", "minioadmin123")
+MINIO_LOCAL_SK = os.getenv("MINIO_LOCAL_SK", "minioadmin1234")
+MINIO_CLOUD_AK = os.getenv("MINIO_CLOUD_AK", None)
+MINIO_CLOUD_SK = os.getenv("MINIO_CLOUD_SK", None)
+MINIO_PRIV_CLOUD_AK = os.getenv("MINIO_PRIV_CLOUD_AK", None)
+MINIO_PRIV_CLOUD_SK = os.getenv("MINIO_PRIV_CLOUD_SK", None)
+isaura_temp = os.path.join(Path.home(), "isaura", "isaura-temp")
+if not os.path.exists(isaura_temp):
+  os.makedirs(isaura_temp)
+STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
 INPUT_C = ["input", "smiles"]
 DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
 DEFAULT_PRIVATE_BUCKET_NAME = os.getenv("DEFAULT_PRIVATE_BUCKET_NAME", "isaura-private")
+BATCH = int(os.getenv("BATCH", 10_000))
+FLUSH_EVERY = os.getenv("FLUSH_EVERY", 10_000)
+proc = psutil.Process(os.getpid())
 
-# helpers
+
+# fmt: off
+def get_base(mdi, ver): return f"{get_pref(mdi, ver)}/tranches"
+def get_desc(pref, wanted): return f"Fetching hive partitions {pref} ({len(wanted)} inputs)"
+def get_files(bucket, r, c, base): return f"s3://{bucket}/{hive_prefix(r, c, base)}/chunk_*.parquet"
+def get_keys(file, base): return f"{base}/{file}"
+def get_idx_key(base): return get_keys(INDEX_FILE, base)
+def get_acc_key(base): return get_keys(ACCESS_FILE,base)
+def get_pref(mdi, ver): return f"{mdi}/{ver}"
+def get_coll(mdi, ver): return f"{mdi}_{ver}"
+def get_params(collection): return {"collection": collection, "batch": str(BATCH), "flush_every": str(FLUSH_EVERY)}
+def get_header(): return {"Content-Type": "text/plain"}
+def hive_prefix(r, c, base): return f"{base}/row={r}/col={c}"
+def make_temp(pref): return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
+def query(files): return f"SELECT * FROM read_parquet('{files}', hive_partitioning=1)"
+def rss_mb(): return proc.memory_info().rss / (1024*1024)
+def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():.1f} MB")
+# fmt: on
 
 
-def get_apprx(inputs):
+def run_docker_compose(up=True):
+    try:
+        path = Path(__file__).parent / "configs" / "docker-compose.yml"
+        cmd = ["docker", "compose", "-f", path, "up", "-d"] if up else ["docker", "compose", "-f", path, "down"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info(f"Docker Compose {'started' if up else 'stopped'} successfully.")
+        logger.debug(result.stdout.strip())
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Docker Compose failed: {e.stderr.strip()}")
+    except FileNotFoundError:
+        logger.error("Docker is not installed or not in PATH.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    return False
+
+def show_figlet():
+    path = Path(__file__).parent.parent / "assets" / "figlet.txt"
+    text = Path(path).read_text(encoding="utf-8")
+    start_color = (0, 255, 255)   
+    end_color = (255, 0, 255)    
+    content = "".join(text)
+    gradient = Text()
+    for i, ch in enumerate(content):
+        ratio = i / max(1, len(content) - 1)
+        r = int(start_color[0] + (end_color[0] - start_color[0]) * ratio)
+        g = int(start_color[1] + (end_color[1] - start_color[1]) * ratio)
+        b = int(start_color[2] + (end_color[2] - start_color[2]) * ratio)
+        gradient.append(ch, style=f"rgb({r},{g},{b})")
+    print()
+    console.print(gradient, justify="center")
+    console.print(Text(f"Version 2.0.1", style="bold bright_black"), justify="center")
+    print()
+
+def split_csv(df):
+  paths = []
+  output_dir = make_temp("isaura_push_")
+  for bucket in [DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME]:
+    if bucket in df["bucket"].unique():
+      path = os.path.join(output_dir, f"{bucket.replace('-', '_')}.csv")
+      df[df["bucket"] == bucket].to_csv(path, index=False)
+      paths.append(str(path))
+  return paths
+
+
+def filter_out(out, objc, wanted, header):
+  return (
+    out[out[header].isin(wanted)]
+    .assign(__o=lambda d: d[header].map({s: i for i, s in enumerate(wanted)}))
+    .sort_values(objc)
+    .drop(columns=[objc, "row", "col"], errors="ignore")
+    .reset_index(drop=True)
+  )
+
+
+def group_inputs(wanted, index, force=False):
   try:
-    logger.info(f"Sending {len(inputs)} inputs for ANN search server to get top 1 similar compounds")
-    r = requests.post(NNS_ENDPOINT, json={"collection": COLLECTION, "smiles": inputs}, timeout=TIMEOUT)
-    r.raise_for_status()
-    return [x["input"] for x in r.json().get("results", [])]
+    miss = [s for s in wanted if s not in index]
+    g = defaultdict(set)
+    if miss and not force:
+      raise RuntimeError(
+        f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
+      )
+    if not force:
+      for s in wanted:
+        r, c = index[s]
+        g[(int(r), int(c))].add(s)
+      return g
+    if miss and force:
+      for s in miss:
+        r, c, _, _ = tranche_coordinates(s)
+        g[(int(r), int(c))].add(s)
+      return g
   except Exception as e:
-    logger.error(f"approx NN search failed: {e}")
+    print(e)
+    return None
+
+
+def line_gen(df, chunksize=100_000):
+  for start in range(0, len(df), chunksize):
+    chunk = df.iloc[start : start + chunksize]
+    for s in chunk["input"].astype(str):
+      yield (s + "\n").encode("utf-8")
+    log(f"sent chunk rows={len(chunk):,}")
+  log("finished streaming")
+
+
+def post_apprx(df, colelction):
+  t0 = time.time()
+  try:
+    with requests.Session() as s:
+      log("start streaming to nns api. This process sometimes appears to be slow. Please have some patience!")
+      resp = s.post(
+        f"{NNS_ENDPOINT_BASE}/insert",
+        params=get_params(colelction),
+        data=line_gen(df),
+        headers=get_header(),
+        timeout=None,
+      )
+    dt = (time.time() - t0) * 1000
+    log(f"done total_ms={dt:.0f}. Body: {resp.text[:1000]}")
+  except requests.RequestException as e:
+    logger.error(f"approx NN search failed. The NNS server container may not be sarted!: {e}")
     return []
 
 
-def write_access_file(data, access, dir):
-  with open(data, "r") as f:
-    data = csv.DictReader(f)
-    input = [d.get("input") for d in data]
-    m = [{"input": i, "access": access} for i in input]
-  with open(dir, "w") as f:
-    json.dump(m, f, indent=2)
+def get_apprx(inputs, collection):
+  try:
+    logger.info(f"Sending {len(inputs)} inputs for ANN search server to get top 1 similar compounds")
+    r = requests.post(
+      f"{NNS_ENDPOINT_BASE}/search", json={"collection": collection, "smiles": inputs}, timeout=TIMEOUT
+    )
+    r.raise_for_status()
+    return [x["input"] for x in r.json().get("results", [])]
+  except requests.RequestException as e:
+    logger.error(f"approx NN search failed. The NNS server container may not be sarted!: {e}")
+    return []
 
+
+def write_access_file(existed, data, access, dir):
+  try:
+    if data:
+      m = [{"input": i, "access": access} for i in data]
+      if existed:
+        m = m + existed
+      with open(dir, "w") as f:
+        json.dump(m, f, indent=2)
+  except Exception as e:
+    logger.error(e)
 
 def tranche_coordinates(smiles):
   mol = Chem.MolFromSmiles(smiles)
   if mol is None:
     raise ValueError("Invalid SMILES")
-  mw = Descriptors.MolWt(mol)
-  logp = Crippen.MolLogP(mol)
+  mw, logp = Descriptors.MolWt(mol), Crippen.MolLogP(mol)
   for i, edge in enumerate(MW_BINS):
     if mw <= edge:
       col = i
@@ -109,30 +247,48 @@ def make_table(title, cols, rows):
 inspect_table = [
   {"key": "model", "name": "model/version", "justify": "left", "style": "bold"},
   {"key": "entries", "name": "entry count", "justify": "right"},
-  {"key": "tranches", "name": "tranches", "justify": "right"},
+  {"key": "rows", "name": "rows", "justify": "right"},
   {"key": "chunks", "name": "chunks", "justify": "right"},
 ]
 
 T = TypeVar("T")
 
 
-def make_download_progress(transient: bool = True) -> Progress:
+class RowCountColumn(ProgressColumn):
+  def render(self, task: Task) -> Text:
+    return Text(f"{int(task.completed):,} rows")
+
+
+class RowSpeedColumn(ProgressColumn):
+  def render(self, task: Task) -> Text:
+    return Text(f"{task.speed:,.0f} rows/s" if task.speed else "– rows/s", style="dim")
+
+
+def make_row_progress(transient: bool = True) -> Progress:
   return Progress(
     SpinnerColumn(),
     TextColumn("[bold cyan]{task.fields[desc]}[/]"),
     BarColumn(),
-    DownloadColumn(binary_units=True),
-    TransferSpeedColumn(),
+    RowCountColumn(),
+    RowSpeedColumn(),
+    TimeElapsedColumn(),
     TimeRemainingColumn(),
     transient=transient,
   )
 
 
 @contextmanager
-def progress(desc: str, total_bytes: Optional[int] = None, transient: bool = True):
-  with make_download_progress(transient=transient) as progress:
-    task_id = progress.add_task("download", total=total_bytes or 0, desc=desc)
-    yield progress, task_id
+def progress(desc: str, total_rows: Optional[int] = None, transient: bool = True):
+  with make_row_progress(transient=transient) as prog:
+    task_id = prog.add_task("rows", total=total_rows, desc=desc)
+    yield prog, task_id
+
+
+def spinner(message, fn, *args, **kwargs):
+  c = Console()
+  with c.status(message, spinner="dots"):
+    result = fn(*args, **kwargs)
+  return result
 
 
 class Logger:

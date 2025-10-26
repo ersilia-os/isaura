@@ -15,6 +15,7 @@ dependencies = [
     "mypy>=1.17.1",
     "nox>=2025.5.1",
     "pandas>=2.3.2",
+    "psutil>=7.1.1",
     "pyarrow>=21.0.0",
     "pybloom-live>=4.0.0",
     "pymilvus>=2.6.0",

@@ -1,23 +1,35 @@
-import boto3, duckdb, json, os, pickle, tempfile, uuid
+import boto3, duckdb, json, os, pickle, requests, sys, uuid
 
 import pandas as pd
 import pyarrow.parquet as pq
 
 from isaura.helpers import (
   MINIO_ENDPOINT,
-  MINIO_ACCESS_KEY,
-  MINIO_SECRET_KEY,
-  STORE_DIRECTORY,
+  MINIO_LOCAL_AK,
+  MINIO_LOCAL_SK,
   MAX_ROWS_PER_FILE,
   CHECKPOINT_EVERY,
   BLOOM_FILENAME,
   ACCESS_FILE,
   logger,
+  filter_out,
+  get_base,
+  get_coll,
+  get_files,
+  get_pref,
+  get_idx_key,
+  get_acc_key,
+  group_inputs,
+  hive_prefix,
+  make_temp,
+  post_apprx,
+  query,
 )
 
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from collections import defaultdict
+
 
 from pybloom_live import ScalableBloomFilter
 
@@ -34,13 +46,14 @@ class MinioStore:
     use_threads=True,
   ):
     self.endpoint = endpoint or MINIO_ENDPOINT
-    self.access = access or MINIO_ACCESS_KEY
-    self.secret = secret or MINIO_SECRET_KEY
+    self.access = access or MINIO_LOCAL_AK
+    self.secret = secret or MINIO_LOCAL_SK
     self.client = boto3.client(
       "s3",
       endpoint_url=self.endpoint,
       aws_access_key_id=self.access,
       aws_secret_access_key=self.secret,
+      region_name="us-east-1",
       config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
     self.transfer_config = TransferConfig(
@@ -49,12 +62,36 @@ class MinioStore:
       max_concurrency=max_concurrency,
       use_threads=use_threads,
     )
+    # if not self.ping(self.client):
+    #   sys.exit(1)
+
+  def ping(self, store):
+    try:
+      url = f"{self.endpoint.rstrip('/')}/minio/health/ready"
+      resp = requests.get(url, timeout=3)
+
+      if resp.status_code == 200:
+        logger.info(f"MinIO server healthy at {url}")
+        return True
+      logger.error(
+        f"MinIO health check failed. Maybe the minio containers not running[{resp.status_code}]: {resp.text.strip()}"
+      )
+    except requests.exceptions.RequestException as e:
+      logger.error(f"MinIO health request error. Maybe the minio containers not running: {e}")
+    except Exception as e:
+      logger.error(f"Unexpected error during MinIO health check: {e}")
+    return False
 
   def ensure_bucket(self, bucket):
     try:
       self.client.head_bucket(Bucket=bucket)
-    except Exception:
-      self.client.create_bucket(Bucket=bucket)
+    except Exception as e:
+      logger.error(e)
+      try:
+        self.client.create_bucket(Bucket=bucket)
+      except Exception as e:
+        logger.error(e)
+        sys.exit(1)
 
   def download_file(self, bucket, key, local):
     self.client.download_file(bucket, key, local, Config=self.transfer_config)
@@ -83,39 +120,43 @@ class MinioStore:
     return deleted
 
 
-class DuckDBMinio:
-  _instance, _init = None, None
+class DuckDBMinio:  # Singleton design here
+  _instance = None
 
   def __new__(cls, *a, **kw):
-    if not cls._instance:
+    if cls._instance is None:
       cls._instance = super().__new__(cls)
     return cls._instance
 
   def __init__(self, endpoint=None, access=None, secret=None, threads=None):
-    if DuckDBMinio._init:
+    endpoint = endpoint or MINIO_ENDPOINT
+    access = access or MINIO_LOCAL_AK
+    secret = secret or MINIO_LOCAL_SK
+    threads = threads or max(2, os.cpu_count() or 2)
+
+    cfg = (endpoint, access, secret, threads)
+    if getattr(self, "_cfg", None) == cfg:
       return
-    DuckDBMinio._init = True
-    endpoint = endpoint or os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
-    access = access or os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-    secret = secret or os.getenv("MINIO_SECRET_KEY", "minioadmin")
-    use_ssl = endpoint.startswith("https://")
-    ep = endpoint.replace("http://", "").replace("https://", "")
-    self.con = duckdb.connect(database=":memory:")
-    self.con.execute(f"PRAGMA threads={threads or max(2, os.cpu_count() or 2)};")
+
+    if getattr(self, "con", None):
+      self.con.close()
+
+    self.endpoint, self.access, self.secret = endpoint, access, secret
+    self.con = duckdb.connect(":memory:")
+    self.con.execute(f"PRAGMA threads={threads};")
     self.con.execute("INSTALL httpfs; LOAD httpfs;")
     self.con.execute("SET s3_access_key_id=?", [access])
     self.con.execute("SET s3_secret_access_key=?", [secret])
-    self.con.execute("SET s3_endpoint=?", [ep])
-    self.con.execute("SET s3_region='us-east-1'")
-    self.con.execute("SET s3_use_ssl=?", [use_ssl])
+    self.con.execute("SET s3_endpoint=?", [endpoint.replace("http://", "").replace("https://", "")])
+    self.con.execute("SET s3_region='us-east-1';")
+    self.con.execute("SET s3_use_ssl=?", [endpoint.startswith("https://")])
     self.con.execute("SET s3_url_style='path'")
+    self._cfg = cfg
 
   def close(self):
     if getattr(self, "con", None):
       self.con.close()
       self.con = None
-      DuckDBMinio._instance = None
-      DuckDBMinio._init = False
 
 
 class BloomIndex:
@@ -194,21 +235,16 @@ class BloomIndex:
 
 
 class TrancheState:
-  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows, use_hive=False):
+  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows):
     self.store = store
     self.bucket = bucket
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
     self.state = {}
-    self.use_hive = use_hive
-
-  def _prefix(self, r, c):
-    return f"{self.base}/row={r}/col={c}" if self.use_hive else f"{self.base}/tranche_{r}_{c}"
 
   def _list_chunks(self, r, c):
-    pref = self._prefix(r, c) + "/"
-    keys = []
+    pref, keys = hive_prefix(self.base, r, c) + "/", []
     for obj in self.store.list_keys(self.bucket, pref):
       k = obj["Key"]
       if k.endswith(".parquet") and "/chunk_" in k:
@@ -259,8 +295,7 @@ class TrancheState:
       logger.info(f"tranche rotate: ({r},{c}) next={idx + 1}")
 
   def _write_chunk(self, df, r, c, idx, mode="new", existing_local=None):
-    prefix = self._prefix(r, c)
-    os_key = f"{prefix}/chunk_{idx}.parquet"
+    os_key = f"{hive_prefix(r, c, self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     if mode == "append" and existing_local:
       old = pd.read_parquet(existing_local)
@@ -333,7 +368,7 @@ class _SinkWriter:
     self.bucket = bucket
     self.model_id = model_id
     self.model_version = model_version
-    self.base = f"{model_id}/{model_version}/tranches"
+    self.base = get_base(model_id, model_version)
     self.tmpdir = tmpdir
     self.max_rows = MAX_ROWS_PER_FILE
     self.store.ensure_bucket(self.bucket)
@@ -373,15 +408,16 @@ class _SinkWriter:
 
 
 class _BaseTransfer:
-  def __init__(self, model_id, model_version, project_name, output_dir=None, store=None):
+  def __init__(self, model_id, model_version, bucket, output_dir=None):
     self.model_id = model_id
     self.model_version = model_version
-    self.project = project_name
+    self.bucket = bucket
     self.output_dir = output_dir
-    self.base = f"{model_id}/{model_version}"
-    self.tranches = f"{self.base}/tranches"
-    self.store = store or MinioStore()
-    self.tmpdir = tempfile.mkdtemp(prefix="isaura_xfer_", dir=STORE_DIRECTORY)
+    self.base = get_pref(model_id, model_version)
+    self.tranches = get_base(model_id, model_version)
+    self.collection = get_coll(self.model_id, self.model_version)
+    self.store = MinioStore()
+    self.tmpdir = make_temp("isaura_xfer_")
     self.duck = DuckDBMinio(
       endpoint=self.store.endpoint,
       access=self.store.access,
@@ -390,59 +426,60 @@ class _BaseTransfer:
 
   def _download_if_exists(self, key, local):
     try:
-      self.store.download_file(self.project, key, local)
+      self.store.download_file(self.bucket, key, local)
       return True
-    except Exception:
+    except Exception as e:
+      logger.error(f"Either model id or version or project name are maybe specified wrongly. Results -> {e}")
+      sys.exit(1)
       return False
 
   def _load_metadata(self):
-    m1 = f"{self.base}/{ACCESS_FILE}"
-    m2 = f"{self.tranches}/{ACCESS_FILE}"
     local = os.path.join(self.tmpdir, ACCESS_FILE)
-    if self._download_if_exists(m1, local) or self._download_if_exists(m2, local):
+    acc = get_acc_key(self.tranches)
+    if self._download_if_exists(acc, local):
       with open(local, "r", encoding="utf-8") as f:
         return local, json.load(f)
     raise RuntimeError(f"{ACCESS_FILE} not found")
 
   def _load_index(self):
-    key = f"{self.tranches}/index.json"
+    key = get_idx_key(self.tranches)
     local = os.path.join(self.tmpdir, "index_src.json")
     if not self._download_if_exists(key, local):
       raise RuntimeError("index.json not found")
     with open(local, "r", encoding="utf-8") as f:
       return json.load(f), local
 
-  def _group(self, inputs, index_dict):
-    miss = [s for s in inputs if s not in index_dict]
-    if miss:
-      raise RuntimeError(
-        f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
-      )
-    g = defaultdict(set)
-    for s in inputs:
-      r, c = index_dict[s]
-      g[(int(r), int(c))].add(s)
-    return g
+  def select_rows(self, r, c, wanted, input_col="input"):
+    out = self.duck.con.execute(query(get_files(self.bucket, r, c, self.tranches))).fetchdf()
+    return filter_out(out, "__o", wanted, input_col)
 
-  def _select_rows(self, r, c, wanted, input_col="input"):
-    files = f"s3://{self.project}/{self.tranches}/tranche_{r}_{c}/chunk_*.parquet"
-    dfw = pd.DataFrame({input_col: list(wanted)})
-    view = f"w_{r}_{c}_{uuid.uuid4().hex[:6]}"
-    self.duck.con.register(view, dfw)
-    q = f"SELECT t.* FROM read_parquet('{files}') t INNER JOIN {view} w ON t.{input_col}=w.{input_col}"
-    out = self.duck.con.execute(q).fetchdf()
-    self.duck.con.unregister(view)
-    return out
+  def _delete(self):
+    return self.store.delete_prefix(self.bucket, self.tranches)
 
-  def _delete_tranches_tree(self):
-    prefix = f"{self.tranches}/"
-    n = self.store.delete_prefix(self.project, prefix)
-    return n
+  def _pull(self, df, index):
+    input = df["input"].astype(str).to_list()
+    gp = group_inputs(input, index, force=True)
+    wt = _SinkWriter(self.store, self.bucket, self.model_id, self.model_version, self.tmpdir)
+    tp, tu, dfs = 0, 0, []
+    if gp is None:
+      return 0, 0
+    for (r, c), want in gp.items():
+      df_ = df[df["input"].isin(list(want))]
+      _tp = wt.add_rows(r, c, df)
+      if _tp != 0:
+        dfs.append(df_)
+      tp += _tp
+    if wt:
+      wt.finalize(schema_cols=list(df.keys()))
+    if dfs:
+      dfs = pd.concat(dfs, ignore_index=True)
+      post_apprx(dfs, self.collection)
+    return tp, tu
 
-  def dump(self):
+  def _dump(self):
     os.makedirs(self.output_dir, exist_ok=True)
     paginator = self.store.client.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=self.project)
+    pages = paginator.paginate(Bucket=self.bucket)
     found = False
     for page in pages:
       for obj in page.get("Contents", []):
@@ -450,14 +487,14 @@ class _BaseTransfer:
         key = obj["Key"]
         local_path = os.path.join(self.output_dir, key)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        logger.info(f"downloading s3://{self.project}/{key} -> {local_path}")
-        self.store.download_file(self.project, key, local_path)
+        logger.info(f"downloading s3://{self.bucket}/{key} -> {local_path}")
+        self.store.download_file(self.bucket, key, local_path)
     if not found:
-      logger.info(f"bucket empty: {self.project}")
+      logger.info(f"bucket empty: {self.bucket}")
 
-  def _copy_to_buckets(self, meta_local, meta_list):
+  def _copy(self, meta_local, meta_list):
     if self.output_dir is not None:
-      self.dump()
+      self._dump()
       return
     priv = [
       (d.get("input") or "").strip()
@@ -469,9 +506,9 @@ class _BaseTransfer:
       for d in meta_list
       if (d.get("access") or "").lower() == "public" and (d.get("input") or "").strip()
     ]
-    index, idx_local = self._load_index()
-    gp = self._group(priv, index) if priv else {}
-    gu = self._group(pub, index) if pub else {}
+    index, _ = self._load_index()
+    gp = group_inputs(priv, index) if priv else {}
+    gu = group_inputs(pub, index) if pub else {}
     w_priv = (
       _SinkWriter(self.store, "isaura-private", self.model_id, self.model_version, self.tmpdir)
       if gp
@@ -480,15 +517,24 @@ class _BaseTransfer:
     w_pub = (
       _SinkWriter(self.store, "isaura-public", self.model_id, self.model_version, self.tmpdir) if gu else None
     )
-    tp, tu = 0, 0
+    tp, tu, dfs = 0, 0, []
     for (r, c), want in gp.items():
-      df = self._select_rows(r, c, want)
-      tp += w_priv.add_rows(r, c, df)
+      df = self.select_rows(r, c, want)
+      _tp = w_priv.add_rows(r, c, df)
+      if _tp != 0:
+        dfs.append(df)
+      tp += _tp
     for (r, c), want in gu.items():
-      df = self._select_rows(r, c, want)
-      tu += w_pub.add_rows(r, c, df)
+      df = self.select_rows(r, c, want)
+      _tu = w_pub.add_rows(r, c, df)
+      if _tu != 0:
+        dfs.append(df)
+      tu += _tu
     if w_priv:
       w_priv.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
     if w_pub:
       w_pub.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
+    if dfs:
+      dfs = pd.concat(dfs, ignore_index=True)
+      post_apprx(dfs, self.collection)
     return tp, tu
