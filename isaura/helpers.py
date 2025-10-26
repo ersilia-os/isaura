@@ -133,28 +133,29 @@ def split_csv(df):
 
 
 def filter_out(out, objc, wanted, header, chunk=100_000):
-    if out is None or out.empty or not wanted:
-        return pd.DataFrame()
+  if out is None or out.empty or not wanted:
+    return pd.DataFrame()
 
-    parts = []
-    n = len(wanted)
-    for i in range(0, n, chunk):
-        w = wanted[i:i + chunk]
-        wdf = pd.DataFrame({header: w, "_order": range(i, i + len(w))})
-        m = wdf.merge(out, on=header, how="left", sort=False, indicator=True)
-        m = m[m["_merge"] == "both"].drop(columns=["_merge"])
-        parts.append(m)
+  parts = []
+  n = len(wanted)
+  for i in range(0, n, chunk):
+    w = wanted[i : i + chunk]
+    wdf = pd.DataFrame({header: w, "_order": range(i, i + len(w))})
+    m = wdf.merge(out, on=header, how="left", sort=False, indicator=True)
+    m = m[m["_merge"] == "both"].drop(columns=["_merge"])
+    parts.append(m)
 
-    if not parts:
-        return pd.DataFrame()
+  if not parts:
+    return pd.DataFrame()
 
-    res = (
-        pd.concat(parts, ignore_index=True)
-          .sort_values("_order")
-          .drop(columns=["_order", objc, "row", "col"], errors="ignore")
-          .reset_index(drop=True)
-    )
-    return res
+  res = (
+    pd.concat(parts, ignore_index=True)
+    .sort_values("_order")
+    .drop(columns=["_order", objc, "row", "col"], errors="ignore")
+    .reset_index(drop=True)
+  )
+  return res
+
 
 def group_inputs(wanted, index, force=False):
   try:
@@ -308,6 +309,7 @@ def spinner(message, fn, *args, **kwargs):
   return result
 
 
+# fmt: off
 class Logger:
   def __init__(self):
     self.logger = logger
@@ -340,23 +342,12 @@ class Logger:
     else:
       self._unlog_from_console()
 
-  def debug(self, text):
-    self.logger.debug(text)
-
-  def info(self, text):
-    self.logger.info(text)
-
-  def warning(self, text):
-    self.logger.warning(text)
-
-  def error(self, text):
-    self.logger.error(text)
-
-  def critical(self, text):
-    self.logger.critical(text)
-
-  def success(self, text):
-    self.logger.success(text)
+  def debug(self, text): self.logger.debug(text)
+  def info(self, text): self.logger.info(text)
+  def warning(self, text): self.logger.warning(text)
+  def error(self, text): self.logger.error(text)
+  def critical(self, text): self.logger.critical(text)
+  def success(self, text): self.logger.success(text)
 
 
 logger = Logger()
