@@ -11,6 +11,7 @@ from isaura.manage import (
   IsauraReader,
   IsauraInspect,
   IsauraPull,
+  IsauraPush,
 )
 from isaura.helpers import (
   DEFAULT_BUCKET_NAME,
@@ -19,7 +20,9 @@ from isaura.helpers import (
   console,
   inspect_table,
   make_table,
-  split_csv,
+  show_figlet,
+  run_docker_compose,
+  spinner
 )
 
 click.rich_click.USE_RICH_MARKUP = True
@@ -50,6 +53,7 @@ def apply_opts(*opts):
 def cli():
   pass
 
+show_figlet()
 
 opt_model = click.option("--model", "-m", required=True, help="Ersilia model id (eosxxxx)")
 opt_version = click.option("--version", "-v", default="v1", show_default=True, help="Model version")
@@ -90,7 +94,13 @@ opt_cloud = click.option(
   default=False,
   help="Specifies to use isaura in cloud mode or not.",
 )
-
+opt_start = click.option(
+  "--start",
+  "-s",
+  is_flag=True,
+  default=False,
+  help="Specifies to start isuara main engines such as minio, milvus, nns server.",
+)
 
 @cli.command("write")
 @apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version)
@@ -131,34 +141,9 @@ def pull(input_file, project_name, model, version):
 
 @cli.command("push")
 @apply_opts(opt_project, opt_model, opt_version)
-def pull(project_name, model, version):
-  insp = IsauraInspect(
-    model_id=model, model_version=version, project_name=project_name, access="both", cloud=False
-  )
-  df = insp.list_available()
-  files = split_csv(df)
-
-  if not files:
-    logger.error("No data found in any default bucket! Aborting pull.")
-    sys.exit(1)
-
-  file1 = files[0]
-  file2 = files[1] if len(files) > 1 else None
-
-  if not file2:
-    logger.warning("Private bucket has no data! Skipping pull for it.")
-
-  for access, file in [("public", file1), ("private", file2)]:
-    if not file:
-      continue
-    with IsauraWriter(
-      input_csv=file,
-      model_id=model,
-      model_version=version,
-      bucket=project_name,
-      access=None if access == "public" else "private",
-    ) as w:
-      w.write()
+def push(project_name, model, version):
+  p = IsauraPush(model, version, project_name)
+  p.push()
 
 
 @cli.command("copy")
@@ -175,10 +160,14 @@ def cp(model, version, project_name, output_dir):
 @cli.command("move")
 @apply_opts(opt_model, opt_version, opt_project_req)
 def mv(model, version, project_name):
-  m = IsauraMover(model_id=model, model_version=version, project_name=project_name)
+  m = IsauraMover(model_id=model, model_version=version, bucket=project_name)
   m.move()
   logger.info(f"Move done for {model}/{version} from {project_name}")
 
+@cli.command("engine")
+@apply_opts(opt_start)
+def engine(start):
+  s = spinner("Starting the engines. Please wait!", run_docker_compose, start)
 
 @cli.command("remove")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_yes_flag)
@@ -186,7 +175,7 @@ def rm(model, version, project_name, yes):
   if not yes:
     logger.info("Add --yes to confirm deletion")
     sys.exit(1)
-  r = IsauraRemover(model_id=model, model_version=version, project_name=project_name)
+  r = IsauraRemover(model_id=model, model_version=version, bucket=project_name)
   r.remove()
   logger.info(f"Remove done for {model}/{version} in {project_name}")
 

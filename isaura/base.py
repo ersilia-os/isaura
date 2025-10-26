@@ -1,12 +1,12 @@
-import boto3, duckdb, json, os, pickle, sys, uuid
+import boto3, duckdb, json, os, pickle, requests, sys, uuid
 
 import pandas as pd
 import pyarrow.parquet as pq
 
 from isaura.helpers import (
   MINIO_ENDPOINT,
-  MINIO_ACCESS_KEY,
-  MINIO_SECRET_KEY,
+  MINIO_LOCAL_AK,
+  MINIO_LOCAL_SK,
   MAX_ROWS_PER_FILE,
   CHECKPOINT_EVERY,
   BLOOM_FILENAME,
@@ -30,6 +30,7 @@ from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from collections import defaultdict
 
+
 from pybloom_live import ScalableBloomFilter
 
 
@@ -45,8 +46,8 @@ class MinioStore:
     use_threads=True,
   ):
     self.endpoint = endpoint or MINIO_ENDPOINT
-    self.access = access or MINIO_ACCESS_KEY
-    self.secret = secret or MINIO_SECRET_KEY
+    self.access = access or MINIO_LOCAL_AK
+    self.secret = secret or MINIO_LOCAL_SK
     self.client = boto3.client(
       "s3",
       endpoint_url=self.endpoint,
@@ -61,6 +62,25 @@ class MinioStore:
       max_concurrency=max_concurrency,
       use_threads=use_threads,
     )
+    # if not self.ping(self.client):
+    #   sys.exit(1)
+
+  def ping(self, store):
+    try:
+      url = f"{self.endpoint.rstrip('/')}/minio/health/ready"
+      resp = requests.get(url, timeout=3)
+
+      if resp.status_code == 200:
+        logger.info(f"MinIO server healthy at {url}")
+        return True
+      logger.error(
+        f"MinIO health check failed. Maybe the minio containers not running[{resp.status_code}]: {resp.text.strip()}"
+      )
+    except requests.exceptions.RequestException as e:
+      logger.error(f"MinIO health request error. Maybe the minio containers not running: {e}")
+    except Exception as e:
+      logger.error(f"Unexpected error during MinIO health check: {e}")
+    return False
 
   def ensure_bucket(self, bucket):
     try:
@@ -110,10 +130,9 @@ class DuckDBMinio:  # Singleton design here
 
   def __init__(self, endpoint=None, access=None, secret=None, threads=None):
     endpoint = endpoint or MINIO_ENDPOINT
-    access = access or MINIO_ACCESS_KEY
-    secret = secret or MINIO_SECRET_KEY
+    access = access or MINIO_LOCAL_AK
+    secret = secret or MINIO_LOCAL_SK
     threads = threads or max(2, os.cpu_count() or 2)
-    print("main", endpoint, MINIO_ENDPOINT)
 
     cfg = (endpoint, access, secret, threads)
     if getattr(self, "_cfg", None) == cfg:
@@ -363,7 +382,7 @@ class _SinkWriter:
     new_rows = []
     for _, row in df.iterrows():
       smi = row["input"]
-      if smi:
+      if smi and not self.bi.seen(smi):
         new_rows.append(dict(row))
         self.bi.register(smi, rc=(r, c))
     if not new_rows:
@@ -399,7 +418,6 @@ class _BaseTransfer:
     self.collection = get_coll(self.model_id, self.model_version)
     self.store = MinioStore()
     self.tmpdir = make_temp("isaura_xfer_")
-    print(self.store.endpoint)
     self.duck = DuckDBMinio(
       endpoint=self.store.endpoint,
       access=self.store.access,
@@ -410,13 +428,14 @@ class _BaseTransfer:
     try:
       self.store.download_file(self.bucket, key, local)
       return True
-    except Exception:
+    except Exception as e:
+      logger.error(f"Either model id or version or project name are maybe specified wrongly. Results -> {e}")
+      sys.exit(1)
       return False
 
   def _load_metadata(self):
     local = os.path.join(self.tmpdir, ACCESS_FILE)
     acc = get_acc_key(self.tranches)
-    print(local, acc)
     if self._download_if_exists(acc, local):
       with open(local, "r", encoding="utf-8") as f:
         return local, json.load(f)
@@ -439,11 +458,11 @@ class _BaseTransfer:
 
   def _pull(self, df, index):
     input = df["input"].astype(str).to_list()
-    print("here 1")
     gp = group_inputs(input, index, force=True)
-    print("here 2")
     wt = _SinkWriter(self.store, self.bucket, self.model_id, self.model_version, self.tmpdir)
     tp, tu, dfs = 0, 0, []
+    if gp is None:
+      return 0, 0
     for (r, c), want in gp.items():
       df_ = df[df["input"].isin(list(want))]
       _tp = wt.add_rows(r, c, df)
@@ -452,11 +471,9 @@ class _BaseTransfer:
       tp += _tp
     if wt:
       wt.finalize(schema_cols=list(df.keys()))
-    print("here 3")
     if dfs:
       dfs = pd.concat(dfs, ignore_index=True)
       post_apprx(dfs, self.collection)
-    print("here 4")
     return tp, tu
 
   def _dump(self):

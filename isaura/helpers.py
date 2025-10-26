@@ -1,4 +1,4 @@
-import csv, json, os, psutil, requests, tempfile, time
+import csv, json, os, psutil, requests, subprocess, tempfile, time
 from time import sleep
 from contextlib import contextmanager
 from collections import defaultdict
@@ -45,9 +45,13 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 TIMEOUT = os.getenv("TIMEOUT", 3600)
 MINIO_ENDPOINT_CLOUD = os.getenv("MINIO_ENDPOINT_CLOUD") or "http://83.48.73.209:8080"
 NNS_ENDPOINT_BASE = os.getenv("NNS_ENDPOINT") or "http://127.0.0.1:8080/"
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin123")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin1234")
-isaura_temp = os.path.join(Path.home(), "eos", "isaura-temp")
+MINIO_LOCAL_AK = os.getenv("MINIO_LOCAL_AK", "minioadmin123")
+MINIO_LOCAL_SK = os.getenv("MINIO_LOCAL_SK", "minioadmin1234")
+MINIO_CLOUD_AK = os.getenv("MINIO_CLOUD_AK", None)
+MINIO_CLOUD_SK = os.getenv("MINIO_CLOUD_SK", None)
+MINIO_PRIV_CLOUD_AK = os.getenv("MINIO_PRIV_CLOUD_AK", None)
+MINIO_PRIV_CLOUD_SK = os.getenv("MINIO_PRIV_CLOUD_SK", None)
+isaura_temp = os.path.join(Path.home(), "isaura", "isaura-temp")
 if not os.path.exists(isaura_temp):
   os.makedirs(isaura_temp)
 STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
@@ -80,6 +84,40 @@ def rss_mb(): return proc.memory_info().rss / (1024*1024)
 def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():.1f} MB")
 # fmt: on
 
+
+def run_docker_compose(up=True):
+    try:
+        path = Path(__file__).parent / "configs" / "docker-compose.yml"
+        cmd = ["docker", "compose", "-f", path, "up", "-d"] if up else ["docker", "compose", "-f", path, "down"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger.info(f"Docker Compose {'started' if up else 'stopped'} successfully.")
+        logger.debug(result.stdout.strip())
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Docker Compose failed: {e.stderr.strip()}")
+    except FileNotFoundError:
+        logger.error("Docker is not installed or not in PATH.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    return False
+
+def show_figlet():
+    path = Path(__file__).parent.parent / "assets" / "figlet.txt"
+    text = Path(path).read_text(encoding="utf-8")
+    start_color = (0, 255, 255)   
+    end_color = (255, 0, 255)    
+    content = "".join(text)
+    gradient = Text()
+    for i, ch in enumerate(content):
+        ratio = i / max(1, len(content) - 1)
+        r = int(start_color[0] + (end_color[0] - start_color[0]) * ratio)
+        g = int(start_color[1] + (end_color[1] - start_color[1]) * ratio)
+        b = int(start_color[2] + (end_color[2] - start_color[2]) * ratio)
+        gradient.append(ch, style=f"rgb({r},{g},{b})")
+    print()
+    console.print(gradient, justify="center")
+    console.print(Text(f"Version 2.0.1", style="bold bright_black"), justify="center")
+    print()
 
 def split_csv(df):
   paths = []
@@ -149,7 +187,7 @@ def post_apprx(df, colelction):
     dt = (time.time() - t0) * 1000
     log(f"done total_ms={dt:.0f}. Body: {resp.text[:1000]}")
   except requests.RequestException as e:
-    logger.error(f"approx NN search failed: {e}")
+    logger.error(f"approx NN search failed. The NNS server container may not be sarted!: {e}")
     return []
 
 
@@ -162,18 +200,20 @@ def get_apprx(inputs, collection):
     r.raise_for_status()
     return [x["input"] for x in r.json().get("results", [])]
   except requests.RequestException as e:
-    logger.error(f"approx NN search failed: {e}")
+    logger.error(f"approx NN search failed. The NNS server container may not be sarted!: {e}")
     return []
 
 
-def write_access_file(data, access, dir):
-  with open(data, "r") as f:
-    data = csv.DictReader(f)
-    input = [(d.get("input") or d.get("smiles")).strip() for d in data]
-    m = [{"input": i, "access": access} for i in input]
-  with open(dir, "w") as f:
-    json.dump(m, f, indent=2)
-
+def write_access_file(existed, data, access, dir):
+  try:
+    if data:
+      m = [{"input": i, "access": access} for i in data]
+      if existed:
+        m = m + existed
+      with open(dir, "w") as f:
+        json.dump(m, f, indent=2)
+  except Exception as e:
+    logger.error(e)
 
 def tranche_coordinates(smiles):
   mol = Chem.MolFromSmiles(smiles)

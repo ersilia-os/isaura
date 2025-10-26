@@ -11,6 +11,10 @@ from isaura.helpers import (
   INPUT_C,
   MAX_ROWS,
   MINIO_ENDPOINT_CLOUD,
+  MINIO_CLOUD_AK as mcak,
+  MINIO_CLOUD_SK as mcsk,
+  MINIO_PRIV_CLOUD_AK as mcpak,
+  MINIO_PRIV_CLOUD_SK as mcpsk,
   logger,
   filter_out,
   get_apprx,
@@ -18,16 +22,17 @@ from isaura.helpers import (
   get_desc,
   get_files,
   get_idx_key,
+  get_acc_key,
   get_pref,
   get_coll,
   group_inputs,
-  hive_prefix,
   make_temp,
   progress,
   query,
   spinner,
   write_access_file,
   tranche_coordinates,
+  split_csv,
 )
 
 
@@ -82,15 +87,16 @@ class IsauraChecker(AbstractContextManager):
 
 
 class IsauraWriter:
-  def __init__(self, input_csv, model_id, model_version, access="public", bucket=None, endpoint=None):
+  def __init__(self, input_csv, model_id, model_version, access="public", bucket=None, endpoint=None, access_key=None, secrete=None):
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
     self.access = access
     self.bucket = bucket or PUB
     self.base_prefix = get_base(self.model_id, model_version)
+    self.access_key = get_acc_key(self.base_prefix)
     self.max_rows = int(MAX_ROWS)
-    self.store = MinioStore(endpoint=endpoint)
+    self.store = MinioStore(endpoint=endpoint, access=access_key, secret=secrete)
     self.store.ensure_bucket(self.bucket)
     self.tmpdir = make_temp("isaura_")
     self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
@@ -106,11 +112,26 @@ class IsauraWriter:
     self.schema_cols = None
     logger.info(f"writer init: bucket={self.bucket} base={self.base_prefix} csv={self.input_csv}")
 
-  def _upload_metadata(self):
+  def _load_metadata(self):
+    local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
+    try:
+      self.store.download_file(self.bucket, self.access_key, local)
+      with open(local, "r", encoding="utf-8") as f:
+        return json.load(f)
+    except Exception as e:
+      return None
+    finally:
+      try:
+        os.remove(local)
+      except:
+        pass
+
+  def _upload_metadata(self, inputs):
     if not self.metadata_path or not self.bucket:
       return
     try:
-      write_access_file(self.input_csv, self.access, self.metadata_path)
+      existed = self._load_metadata()
+      write_access_file(existed, inputs, self.access, self.metadata_path)
       self.store.upload_file(self.metadata_path, self.bucket, f"{self.base_prefix}/{ACCESS_FILE}")
       logger.info(f"{ACCESS_FILE} -> s3://{self.bucket}/{self.base_prefix}/{ACCESS_FILE}")
     except Exception as e:
@@ -127,35 +148,40 @@ class IsauraWriter:
       self.tranche.flush(r, c, buf, self.schema_cols)
       self.buffers[(r, c)].clear()
 
-  def write(self):
-    self._upload_metadata()
+  def write(self, df=None):
     total = dupes = 0
-    with open(self.input_csv, newline="", encoding="utf-8") as f:
-      reader = csv.DictReader(f)
-      for row in reader:
-        self._set_schema(row)
-        smi = (row.get("input") or row.get("smiles")).strip()
-        if not smi:
-          continue
-        if self.bi.seen(smi):
-          dupes += 1
-          continue
-        try:
-          r, c, _, _ = tranche_coordinates(smi)
-        except Exception:
-          logger.warning("invalid SMILES skipped")
-          continue
-        self.buffers[(r, c)].append(dict(row))
-        self.bi.register(smi, rc=(r, c))
-        total += 1
-        self._flush_if_needed(r, c)
-        if self.bi._added >= int(CHECKPOINT_EVERY):
-          self.bi.persist()
+    new = []
+    rows = df.to_dict("records") if df is not None else None
+    if rows is None:
+      with open(self.input_csv, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for row in rows:
+      self._set_schema(row)
+      smi = (row.get("input") or row.get("smiles") or "").strip()
+      if not smi:
+        continue
+      if self.bi.seen(smi):
+        dupes += 1
+        continue
+      try:
+        r, c, _, _ = tranche_coordinates(smi)
+      except Exception:
+        logger.warning("invalid SMILES skipped")
+        continue
+      new.append(smi)
+      self.buffers[(r, c)].append(dict(row))
+      self.bi.register(smi, rc=(r, c))
+      total += 1
+      self._flush_if_needed(r, c)
+      if self.bi._added >= int(CHECKPOINT_EVERY):
+        self.bi.persist()
     for (r, c), buf in list(self.buffers.items()):
       if buf:
         self.tranche.flush(r, c, buf, self.schema_cols)
         self.buffers[(r, c)].clear()
     self.bi.persist()
+    if new:
+      self._upload_metadata(new)
     logger.info(f"write done: new={total} dupes={dupes}")
 
   def close(self):
@@ -172,7 +198,7 @@ class IsauraWriter:
 
 
 class IsauraReader:
-  def __init__(self, model_id, model_version, input_csv, approximate, bucket=None, endpoint=None):
+  def __init__(self, model_id, model_version, input_csv, approximate, bucket=None, endpoint=None, access_key=None, secrete=None):
     self.model_id = model_id
     self.model_version = model_version
     self.approximate = approximate
@@ -184,8 +210,8 @@ class IsauraReader:
     self.collection = get_coll(self.model_id, self.model_version)
     self.index_key = get_idx_key(self.base)
     self.tmpdir = make_temp("isaura_reader_")
-    self.store = MinioStore(endpoint=self.endpoint)
-    self.duck = DuckDBMinio(endpoint=self.endpoint)
+    self.store = MinioStore(endpoint=self.endpoint, access=access_key, secret=secrete)
+    self.duck = DuckDBMinio(endpoint=self.endpoint, access=access_key, secret=secrete)
     logger.info(f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv}")
 
   def _load_index(self):
@@ -336,10 +362,12 @@ class IsauraInspect:
     p = c.get_paginator("list_objects_v2")
 
     def list_prefixes(pref):
-      for page in p.paginate(Bucket=project_name, Prefix=pref, Delimiter="/"):
-        for cp in page.get("CommonPrefixes", []):
-          yield cp["Prefix"]
-
+      try:
+        for page in p.paginate(Bucket=project_name, Prefix=pref, Delimiter="/"):
+          for cp in page.get("CommonPrefixes", []):
+            yield cp["Prefix"]
+      except Exception as e:
+        logger.error(e)
     def count_chunks(base):
       tr = set()
       ch = 0
@@ -379,7 +407,8 @@ class IsauraCopy(_BaseTransfer):
 
 class IsauraMover(_BaseTransfer):
   def move(self):
-    self._copy()
+    meta_local, meta = self._load_metadata()
+    self._copy(meta_local, meta)
     n = self._delete()
     logger.info(f"move wiped objects={n}")
 
@@ -409,11 +438,58 @@ class IsauraPull(_BaseTransfer):
       approximate=False,
       bucket=self.bucket,
       endpoint=MINIO_ENDPOINT_CLOUD,
+      access_key=mcak,
+      secrete=mcsk
     )
     out = self._pull(r.read(), self._load_index())
     logger.info(f"pulled objects={out}")
 
 
-class IsauraPush(_BaseTransfer):
-  # we first use inspect command
-  pass
+class IsauraPush:
+  def __init__(self, model_id, model_version, bucket):
+    self.model_id = model_id
+    self.model_version = model_version
+    self.bucket = bucket
+
+  def push(self):
+    insp = IsauraInspect(
+      model_id=self.model_id,
+      model_version=self.model_version,
+      access="both",
+      cloud=False,
+    )
+    df = insp.list_available()
+    files = split_csv(df)
+
+    if not files:
+      logger.error("No data found in any default bucket! Aborting pull.")
+      sys.exit(1)
+
+    file1 = files[0]
+    file2 = files[1] if len(files) > 1 else None
+
+    if not file2:
+      logger.warning("Private bucket has no data! Skipping pull for it.")
+
+    for access, file, mck, mcs in [("public", file1, mcak, mcsk), ("private", file2, mcpak, mcpsk)]:
+      if not file:
+        continue
+      r = IsauraReader(
+        model_id=self.model_id,
+        model_version=self.model_version,
+        input_csv=file,
+        approximate=False,
+        bucket=f"isaura-{access}",
+      )
+      df = r.read()
+      with IsauraWriter(
+        input_csv=file,
+        model_id=self.model_id,
+        model_version=self.model_version,
+        bucket=f"isaura-{access}",
+        access=None if access == "public" else "private",
+        endpoint=MINIO_ENDPOINT_CLOUD,
+        access_key=mck,
+        secrete=mcs
+      ) as w:
+        w.write(df=df)
