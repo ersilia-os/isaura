@@ -19,7 +19,7 @@ dependencies = [
     "pyarrow>=21.0.0",
     "pybloom-live>=4.0.0",
     "pymilvus>=2.6.0",
-    "rdkit>=2025.3.6",
+    "rdkit==2024.3.6",
     "redis>=6.4.0",
     "requests>=2.32.5",
     "rich>=14.1.0",
