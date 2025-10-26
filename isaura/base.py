@@ -12,13 +12,12 @@ from isaura.helpers import (
   BLOOM_FILENAME,
   ACCESS_FILE,
   logger,
-  filter_out,
+  get_acc_key,
   get_base,
   get_coll,
-  get_files,
-  get_pref,
   get_idx_key,
-  get_acc_key,
+  get_files_glob,
+  get_pref,
   group_inputs,
   hive_prefix,
   make_temp,
@@ -246,22 +245,6 @@ class TrancheState:
     self.max_rows = max_rows
     self.state = {}
 
-  def _list_chunks(self, r, c):
-    pref, keys = hive_prefix(self.base, r, c) + "/", []
-    for obj in self.store.list_keys(self.bucket, pref):
-      k = obj["Key"]
-      if k.endswith(".parquet") and "/chunk_" in k:
-        keys.append(k)
-    return sorted(keys)
-
-  def _chunk_idx(self, key):
-    base = os.path.basename(key)
-    name, _ = os.path.splitext(base)
-    try:
-      return int(name.split("_")[1])
-    except:
-      return 1
-
   def _rows_in_remote(self, key):
     local = os.path.join(self.tmpdir, f"inspect_{uuid.uuid4().hex}.parquet")
     try:
@@ -297,14 +280,38 @@ class TrancheState:
       self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
       logger.info(f"tranche rotate: ({r},{c}) next={idx + 1}")
 
+  def _list_chunks(self, r, c):
+    # Consistent call order: base, r, c
+    pref = hive_prefix(r, c, self.base) + "/"
+    keys = []
+    for obj in self.store.list_keys(self.bucket, pref):
+      k = obj["Key"]
+      if k.endswith(".parquet") and "/chunk_" in k:
+        keys.append(k)
+    # Sort by numeric chunk index, not lexicographically
+    return sorted(keys, key=self._chunk_idx)
+
+  def _chunk_idx(self, key):
+    base = os.path.basename(key)
+    name, _ = os.path.splitext(base)
+    try:
+      return int(name.split("_")[1])
+    except:
+      return 1
+
   def _write_chunk(self, df, r, c, idx, mode="new", existing_local=None):
+    # 🔧 FIX: correct hive_prefix argument order
     os_key = f"{hive_prefix(r, c, self.base)}/chunk_{idx}.parquet"
+
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     if mode == "append" and existing_local:
       old = pd.read_parquet(existing_local)
+      # Keep columns aligned; pandas handles union but we normalize before calling
       df = pd.concat([old, df], ignore_index=True)
+
     df.to_parquet(local, index=False)
     self.store.upload_file(local, self.bucket, os_key)
+
     if not existing_local:
       try:
         os.remove(local)
@@ -453,8 +460,7 @@ class _BaseTransfer:
       return json.load(f), local
 
   def select_rows(self, r, c, wanted, input_col="input"):
-    out = self.duck.con.execute(query(get_files(self.bucket, r, c, self.tranches))).fetchdf()
-    return filter_out(out, "__o", wanted, input_col)
+    return query(self.duck.con, input_col, wanted, get_files_glob(self.bucket, self.tranches))
 
   def _delete(self):
     return self.store.delete_prefix(self.bucket, self.tranches)

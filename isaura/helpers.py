@@ -1,4 +1,4 @@
-import json, os, psutil, requests, subprocess, tempfile, time
+import json, os, psutil, requests, subprocess, sys, tempfile, time
 import pandas as pd
 from contextlib import contextmanager
 from collections import defaultdict
@@ -69,7 +69,7 @@ proc = psutil.Process(os.getpid())
 # fmt: off
 def get_base(mdi, ver): return f"{get_pref(mdi, ver)}/tranches"
 def get_desc(pref, wanted): return f"Fetching hive partitions {pref} ({len(wanted)} inputs)"
-def get_files(bucket, r, c, base): return f"s3://{bucket}/{hive_prefix(r, c, base)}/chunk_*.parquet"
+def get_files_glob(bucket, base): return f"s3://{bucket}/{base}/*/*/chunk_*.parquet"
 def get_keys(file, base): return f"{base}/{file}"
 def get_idx_key(base): return get_keys(INDEX_FILE, base)
 def get_acc_key(base): return get_keys(ACCESS_FILE,base)
@@ -79,7 +79,6 @@ def get_params(collection): return {"collection": collection, "batch": str(BATCH
 def get_header(): return {"Content-Type": "text/plain"}
 def hive_prefix(r, c, base): return f"{base}/row={r}/col={c}"
 def make_temp(pref): return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
-def query(files): return f"SELECT * FROM read_parquet('{files}', hive_partitioning=1)"
 def rss_mb(): return proc.memory_info().rss / (1024*1024)
 def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():.1f} MB")
 # fmt: on
@@ -132,39 +131,44 @@ def split_csv(df):
   return paths
 
 
-def filter_out(out, objc, wanted, header, chunk=100_000):
-  if out is None or out.empty or not wanted:
+def query(conn, header, wanted, file_glob):
+  import pandas as pd, os
+
+  if not wanted:
     return pd.DataFrame()
-
-  parts = []
-  n = len(wanted)
-  for i in range(0, n, chunk):
-    w = wanted[i : i + chunk]
-    wdf = pd.DataFrame({header: w, "_order": range(i, i + len(w))})
-    m = wdf.merge(out, on=header, how="left", sort=False, indicator=True)
-    m = m[m["_merge"] == "both"].drop(columns=["_merge"])
-    parts.append(m)
-
-  if not parts:
-    return pd.DataFrame()
-
-  res = (
-    pd.concat(parts, ignore_index=True)
-    .sort_values("_order")
-    .drop(columns=["_order", objc, "row", "col"], errors="ignore")
-    .reset_index(drop=True)
+  try:
+    conn.execute("PRAGMA enable_object_cache")
+    conn.execute(f"SET threads TO {os.cpu_count() or 4}")
+  except Exception:
+    pass
+  wanted_df = pd.DataFrame({header: wanted, "__o": list(range(len(wanted)))})
+  conn.register("wanted_df", wanted_df)
+  conn.execute("CREATE TEMP TABLE wanted_inputs AS SELECT * FROM wanted_df")
+  conn.unregister("wanted_df")
+  conn.execute(
+    f"CREATE TEMP VIEW p AS SELECT * FROM read_parquet('{file_glob}', hive_partitioning=1, filename=false)"
   )
-  return res
-
+  try:
+    df = conn.execute(
+      f"SELECT p.*, w.__o FROM p INNER JOIN wanted_inputs w ON p.{header} = w.{header}"
+    ).fetchdf()
+  finally:
+    conn.execute("DROP VIEW p")
+    conn.execute("DROP TABLE wanted_inputs")
+  if df.empty:
+    return df
+  df = df.sort_values("__o").drop(columns="__o").reset_index(drop=True)
+  return df
 
 def group_inputs(wanted, index, force=False):
   try:
     miss = [s for s in wanted if s not in index]
     g = defaultdict(set)
     if miss and not force:
-      raise RuntimeError(
+      logger.error(
         f"inputs not indexed: {miss[:5]}{'...' if len(miss) > 5 else ''} total_missing={len(miss)}"
       )
+      sys.exit(1)
     if not force:
       for s in wanted:
         r, c = index[s]
@@ -176,7 +180,7 @@ def group_inputs(wanted, index, force=False):
         g[(int(r), int(c))].add(s)
       return g
   except Exception as e:
-    print(e)
+    logger.error(e)
     return None
 
 
@@ -238,18 +242,23 @@ def tranche_coordinates(smiles):
   if mol is None:
     raise ValueError("Invalid SMILES")
   mw, logp = Descriptors.MolWt(mol), Crippen.MolLogP(mol)
+
+  # 1-based col by MW
   for i, edge in enumerate(MW_BINS):
     if mw <= edge:
-      col = i
+      col = i + 1
       break
   else:
-    col = len(MW_BINS)
+    col = len(MW_BINS) + 1
+
+  # 1-based row by logP
   for j, edge in enumerate(LOGP_BINS):
     if logp <= edge:
-      row = j
+      row = j + 1
       break
   else:
-    row = len(LOGP_BINS)
+    row = len(LOGP_BINS) + 1
+
   return row, col, mw, logp
 
 

@@ -16,23 +16,18 @@ from isaura.helpers import (
   MINIO_PRIV_CLOUD_AK as mcpak,
   MINIO_PRIV_CLOUD_SK as mcpsk,
   logger,
-  filter_out,
+  get_acc_key,
   get_apprx,
   get_base,
-  get_desc,
-  get_files,
-  get_idx_key,
-  get_acc_key,
-  get_pref,
   get_coll,
-  group_inputs,
+  get_files_glob,
+  get_idx_key,
+  get_pref,
   make_temp,
-  progress,
   query,
-  spinner,
-  write_access_file,
-  tranche_coordinates,
   split_csv,
+  tranche_coordinates,
+  write_access_file,
 )
 
 
@@ -108,7 +103,7 @@ class IsauraWriter:
     self.max_rows = int(MAX_ROWS)
     self.store = MinioStore(endpoint=endpoint, access=access_key, secret=secrete)
     self.store.ensure_bucket(self.bucket)
-    self.tmpdir = make_temp("isaura_")
+    self.tmpdir = make_temp("isaura_writter_")
     self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
     self.bi = BloomIndex(
       self.store,
@@ -175,8 +170,10 @@ class IsauraWriter:
         continue
       try:
         r, c, _, _ = tranche_coordinates(smi)
+        if r < 1 or c < 1:
+          raise ValueError("Tranche coordinates must be >= 1")
       except Exception:
-        logger.warning("invalid SMILES skipped")
+        logger.warning("invalid SMILES or tranche mapping; skipped")
         continue
       new.append(smi)
       self.buffers[(r, c)].append(dict(row))
@@ -247,53 +244,40 @@ class IsauraReader:
         pass
 
   def read(self, output_csv=None, df=None):
-    t0, wanted, header, objc, results = time.time(), [], set(), "__o", []
-    rows = df.to_dict("records") if df is not None else None
-    if rows is None:
-      with open(self.input_csv, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    for row in rows:
-      h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-      v = (row.get(h)).strip()
-      if v:
-        wanted.append(v)
-      if h not in header:
-        header.add(h)
-    if self.approximate:
-      st = time.perf_counter()
-      wanted = get_apprx(wanted, self.collection)
-      et = time.perf_counter()
-      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
-    header = list(header)[0]
-    if not wanted:
-      return pd.DataFrame()
-    index = spinner("Fetching index. Please have patience as this might take a while!", self._load_index)
-    groups = group_inputs(wanted, index)
-    order_map = {s: i for i, s in enumerate(wanted)}
-    with progress(get_desc(self.pref, wanted), total_rows=len(wanted), transient=True) as (prog, task_id):
-      for (r, c), _ in groups.items():
-        files = get_files(self.bucket, r, c, self.base)
-        part = self.duck.con.execute(query(files)).fetchdf()
-        if not part.empty:
-          part[objc] = part[header].map(order_map)
-          results.append(part)
-        prog.update(task_id, advance=len(part))
-    out = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    if not out.empty and objc in out.columns:
-      out = out.sort_values(objc).drop(columns=objc).reset_index(drop=True)
-    logger.info(f"Preprocessing the data for final write up!")
-    out = filter_out(out, objc, wanted, header)
-    if output_csv:
-      out.to_csv(output_csv, index=False)
-      logger.info(f"wrote csv rows={len(out)} path={output_csv}")
-    elapsed = time.time() - t0
-    rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
-    logger.info(
-      f"read done model+version={self.pref}"
-      f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
-      f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
-    )
-    return out
+      import time, csv, pandas as pd
+      t0, wanted, header_set = time.time(), [], set()
+      rows = df.to_dict("records") if df is not None else None
+      if rows is None:
+          with open(self.input_csv, newline="", encoding="utf-8") as f:
+              rows = list(csv.DictReader(f))
+      for row in rows:
+          h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+          v = (row.get(h) or "").strip()
+          if v:
+              wanted.append(v)
+          if h:
+              header_set.add(h)
+      if self.approximate:
+          st = time.perf_counter()
+          wanted = get_apprx(wanted, self.collection)
+          et = time.perf_counter()
+          logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
+      header = list(header_set)[0] if header_set else "smiles"
+      if not wanted:
+          return pd.DataFrame()
+      out = query(self.duck.con, header, wanted, get_files_glob(self.bucket, self.base))
+      if output_csv:
+          out.to_csv(output_csv, index=False)
+          logger.info(f"wrote csv rows={len(out)} path={output_csv}")
+      elapsed = time.time() - t0
+      rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
+      logger.info(
+          f"read done model+version={self.pref}"
+          f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
+          f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
+      )
+      return out
+
 
 
 class IsauraInspect:
