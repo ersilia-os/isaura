@@ -94,7 +94,11 @@ class MinioStore:
         sys.exit(1)
 
   def download_file(self, bucket, key, local):
-    self.client.download_file(bucket, key, local, Config=self.transfer_config)
+    try:
+      self.client.download_file(bucket, key, local, Config=self.transfer_config)
+    except Exception as e:
+      logger.warning(f"The file {key} is not found in bucket {bucket}. Operation Abort!. Details -> {e}")
+      
 
   def upload_file(self, local, bucket, key, extra_args=None):
     self.client.upload_file(local, bucket, key, ExtraArgs=extra_args or {}, Config=self.transfer_config)

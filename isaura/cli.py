@@ -22,7 +22,7 @@ from isaura.helpers import (
   make_table,
   show_figlet,
   run_docker_compose,
-  spinner
+  spinner,
 )
 
 click.rich_click.USE_RICH_MARKUP = True
@@ -52,6 +52,7 @@ def apply_opts(*opts):
 @click.group()
 def cli():
   pass
+
 
 show_figlet()
 
@@ -101,6 +102,7 @@ opt_start = click.option(
   default=False,
   help="Specifies to start isuara main engines such as minio, milvus, nns server.",
 )
+
 
 @cli.command("write")
 @apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version)
@@ -164,10 +166,12 @@ def mv(model, version, project_name):
   m.move()
   logger.info(f"Move done for {model}/{version} from {project_name}")
 
+
 @cli.command("engine")
 @apply_opts(opt_start)
 def engine(start):
   s = spinner("Starting the engines. Please wait!", run_docker_compose, start)
+
 
 @cli.command("remove")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_yes_flag)
