@@ -23,6 +23,7 @@ from isaura.helpers import (
   make_temp,
   post_apprx,
   query,
+  spinner,
 )
 
 from botocore.config import Config
@@ -281,14 +282,12 @@ class TrancheState:
       logger.info(f"tranche rotate: ({r},{c}) next={idx + 1}")
 
   def _list_chunks(self, r, c):
-    # Consistent call order: base, r, c
     pref = hive_prefix(r, c, self.base) + "/"
     keys = []
     for obj in self.store.list_keys(self.bucket, pref):
       k = obj["Key"]
       if k.endswith(".parquet") and "/chunk_" in k:
         keys.append(k)
-    # Sort by numeric chunk index, not lexicographically
     return sorted(keys, key=self._chunk_idx)
 
   def _chunk_idx(self, key):
@@ -300,13 +299,11 @@ class TrancheState:
       return 1
 
   def _write_chunk(self, df, r, c, idx, mode="new", existing_local=None):
-    # 🔧 FIX: correct hive_prefix argument order
     os_key = f"{hive_prefix(r, c, self.base)}/chunk_{idx}.parquet"
 
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     if mode == "append" and existing_local:
       old = pd.read_parquet(existing_local)
-      # Keep columns aligned; pandas handles union but we normalize before calling
       df = pd.concat([old, df], ignore_index=True)
 
     df.to_parquet(local, index=False)
@@ -370,7 +367,6 @@ class TrancheState:
         logger.info(f"flush: full tranche=({r},{c}) idx={st['next'] - 1} rows={take}")
       remaining -= take
       start += take
-
 
 class _SinkWriter:
   def __init__(self, store, bucket, model_id, model_version, tmpdir):

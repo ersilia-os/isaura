@@ -1,5 +1,4 @@
-import json, os, psutil, requests, subprocess, sys, tempfile, time
-import pandas as pd
+import os, pandas as pd, numpy as np, json, os, psutil, requests, subprocess, sys, tempfile, time
 from contextlib import contextmanager
 from collections import defaultdict
 from loguru import logger
@@ -35,10 +34,10 @@ logger.level("SUCCESS", color="<black><bold><bg green>")
 
 ACCESS_FILE = "access.json"
 INDEX_FILE = "index.json"
-MAX_ROWS = 100_000
+MAX_ROWS = 2_000_000
 
-MW_BINS = [200, 250, 300, 325, 350, 375, 400, 425, 450, 500]
-LOGP_BINS = [-1, 0, 1, 2, 2.5, 3, 3.5, 4, 4.5, 5]
+MW_BINS = [200, 500]
+LOGP_BINS = [-1, 5]
 
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
@@ -69,7 +68,7 @@ proc = psutil.Process(os.getpid())
 # fmt: off
 def get_base(mdi, ver): return f"{get_pref(mdi, ver)}/tranches"
 def get_desc(pref, wanted): return f"Fetching hive partitions {pref} ({len(wanted)} inputs)"
-def get_files_glob(bucket, base): return f"s3://{bucket}/{base}/*/*/chunk_*.parquet"
+def get_files_glob(bucket, base): return f"s3://{bucket}/{base}/*/chunk_*.parquet"
 def get_keys(file, base): return f"{base}/{file}"
 def get_idx_key(base): return get_keys(INDEX_FILE, base)
 def get_acc_key(base): return get_keys(ACCESS_FILE,base)
@@ -77,7 +76,7 @@ def get_pref(mdi, ver): return f"{mdi}/{ver}"
 def get_coll(mdi, ver): return f"{mdi}_{ver}"
 def get_params(collection): return {"collection": collection, "batch": str(BATCH), "flush_every": str(FLUSH_EVERY)}
 def get_header(): return {"Content-Type": "text/plain"}
-def hive_prefix(r, c, base): return f"{base}/row={r}/col={c}"
+def hive_prefix(r, c, base): return f"{base}/tranche_{r}_{c}"
 def make_temp(pref): return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
 def rss_mb(): return proc.memory_info().rss / (1024*1024)
 def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():.1f} MB")
@@ -131,34 +130,38 @@ def split_csv(df):
   return paths
 
 
-def query(conn, header, wanted, file_glob):
-  import pandas as pd, os
-
+def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp"):
   if not wanted:
     return pd.DataFrame()
   try:
+    conn.execute(f"SET memory_limit='{int(mem_gb)}GB'")
+    conn.execute(f"SET temp_directory='{tmpdir}'")
     conn.execute("PRAGMA enable_object_cache")
-    conn.execute(f"SET threads TO {os.cpu_count() or 4}")
+    conn.execute(f"SET threads TO {max(1, (os.cpu_count() or 1) // 2)}")
   except Exception:
     pass
-  wanted_df = pd.DataFrame({header: wanted, "__o": list(range(len(wanted)))})
-  conn.register("wanted_df", wanted_df)
-  conn.execute("CREATE TEMP TABLE wanted_inputs AS SELECT * FROM wanted_df")
-  conn.unregister("wanted_df")
-  conn.execute(
-    f"CREATE TEMP VIEW p AS SELECT * FROM read_parquet('{file_glob}', hive_partitioning=1, filename=false)"
-  )
+  wanted_list = list(wanted)
+  order = np.arange(len(wanted_list), dtype=np.int64)
+  wdf = pd.DataFrame({header: wanted_list, "__o": order})
+  conn.register("wanted_inputs", wdf)
+  sql = f"""
+        WITH p AS (
+          SELECT {columns}
+          FROM read_parquet('{file_glob}', hive_partitioning=1)
+          WHERE {header} IN (SELECT {header} FROM wanted_inputs)
+        )
+        SELECT p.*
+        FROM p
+        JOIN wanted_inputs w
+          ON p.{header} = w.{header}
+        ORDER BY w.__o
+    """
   try:
-    df = conn.execute(
-      f"SELECT p.*, w.__o FROM p INNER JOIN wanted_inputs w ON p.{header} = w.{header}"
-    ).fetchdf()
+    out = conn.execute(sql).fetchdf()
   finally:
-    conn.execute("DROP VIEW p")
-    conn.execute("DROP TABLE wanted_inputs")
-  if df.empty:
-    return df
-  df = df.sort_values("__o").drop(columns="__o").reset_index(drop=True)
-  return df
+    conn.unregister("wanted_inputs")
+  return out
+
 
 def group_inputs(wanted, index, force=False):
   try:
@@ -243,7 +246,6 @@ def tranche_coordinates(smiles):
     raise ValueError("Invalid SMILES")
   mw, logp = Descriptors.MolWt(mol), Crippen.MolLogP(mol)
 
-  # 1-based col by MW
   for i, edge in enumerate(MW_BINS):
     if mw <= edge:
       col = i + 1
@@ -251,7 +253,6 @@ def tranche_coordinates(smiles):
   else:
     col = len(MW_BINS) + 1
 
-  # 1-based row by logP
   for j, edge in enumerate(LOGP_BINS):
     if logp <= edge:
       row = j + 1

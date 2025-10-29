@@ -26,6 +26,7 @@ from isaura.helpers import (
   make_temp,
   query,
   split_csv,
+  spinner,
   tranche_coordinates,
   write_access_file,
 )
@@ -244,45 +245,50 @@ class IsauraReader:
         pass
 
   def read(self, output_csv=None, df=None):
-      import time, csv, pandas as pd
-      t0, wanted, header_set = time.time(), [], set()
-      rows = df.to_dict("records") if df is not None else None
-      if rows is None:
-          with open(self.input_csv, newline="", encoding="utf-8") as f:
-              rows = list(csv.DictReader(f))
-      for row in rows:
-          h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-          v = (row.get(h) or "").strip()
-          if v:
-              wanted.append(v)
-          if h:
-              header_set.add(h)
-      if self.approximate:
-          st = time.perf_counter()
-          wanted = get_apprx(wanted, self.collection)
-          et = time.perf_counter()
-          logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
-      header = list(header_set)[0] if header_set else "smiles"
-      if not wanted:
-          return pd.DataFrame()
-      out = query(self.duck.con, header, wanted, get_files_glob(self.bucket, self.base))
-      if output_csv:
-          out.to_csv(output_csv, index=False)
-          logger.info(f"wrote csv rows={len(out)} path={output_csv}")
-      elapsed = time.time() - t0
-      rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
-      logger.info(
-          f"read done model+version={self.pref}"
-          f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
-          f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
-      )
-      return out
+    import time, csv, pandas as pd
 
+    t0, wanted, header_set = time.time(), [], set()
+    rows = df.to_dict("records") if df is not None else None
+    if rows is None:
+      with open(self.input_csv, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for row in rows:
+      h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+      v = (row.get(h) or "").strip()
+      if v:
+        wanted.append(v)
+      if h:
+        header_set.add(h)
+    if self.approximate:
+      st = time.perf_counter()
+      wanted = get_apprx(wanted, self.collection)
+      et = time.perf_counter()
+      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
+    header = list(header_set)[0] if header_set else "smiles"
+    if not wanted:
+      return pd.DataFrame()
+    try:
+      files = get_files_glob(self.bucket, self.base)
+      out = spinner("Fetching queries. Please wait!", query, self.duck.con, header, wanted, files)
+    except Exception as e:
+      logger.error(e)
+      sys.exit(1)
+    if output_csv:
+      out.to_csv(output_csv, index=False)
+      logger.info(f"wrote csv rows={len(out)} path={output_csv}")
+    elapsed = time.time() - t0
+    rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
+    logger.info(
+      f"read done model+version={self.pref}"
+      f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
+      f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
+    )
+    return out
 
 
 class IsauraInspect:
   def __init__(self, model_id, model_version, cloud, project_name=None, access="both"):
-    self.mid, self.mv, self.proj, self.acc = model_id, model_version, project_name, access
+    self.mid, self.mv, self.proj, self.acc, self.cloud = model_id, model_version, project_name, access, cloud
     self.base = get_base(self.mid, self.mv)
     self.idx_key = get_idx_key(self.base)
     endpoint = MINIO_ENDPOINT_CLOUD if cloud else None
@@ -290,6 +296,7 @@ class IsauraInspect:
     logger.info(f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}")
 
   def _buckets(self):
+
     return (
       [self.proj]
       if self.proj
@@ -298,6 +305,10 @@ class IsauraInspect:
 
   def _idx(self, b):
     try:
+      if self.cloud and b == PUB:
+          self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
+      if self.cloud and b == PRI:
+          self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
       o = self.s.client.get_object(Bucket=b, Key=self.idx_key)
       d = json.loads(o["Body"].read().decode("utf-8"))
       logger.info(f"loaded index: bucket={b} entries={len(d)}")
@@ -365,6 +376,10 @@ class IsauraInspect:
     return df
 
   def inspect_models(self, project_name, prefix_filter=""):
+    if self.cloud and project_name == PUB:
+        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
+    if self.cloud and project_name == PRI:
+        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
     c = self.s.client
     rows = []
     p = c.get_paginator("list_objects_v2")
