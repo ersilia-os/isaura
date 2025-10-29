@@ -130,14 +130,26 @@ def split_csv(df):
   return paths
 
 
-def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp"):
+def _available_mem_bytes():
+  return int(psutil.virtual_memory().available)
+
+def _memory_limit_gb_from_available(ratio=0.8, floor_gb=1):
+  return max(floor_gb, int(_available_mem_bytes() * ratio / (1024**3)))
+
+def _thread_count_from_cpus(ratio=0.9):
+  import os, math
+  c = os.cpu_count() or 1
+  return max(1, int(math.floor(c * ratio)))
+
+
+def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   if not wanted:
     return pd.DataFrame()
   try:
-    conn.execute(f"SET memory_limit='{int(mem_gb)}GB'")
+    conn.execute(f"SET memory_limit='{_memory_limit_gb_from_available()}GB'")
     conn.execute(f"SET temp_directory='{tmpdir}'")
     conn.execute("PRAGMA enable_object_cache")
-    conn.execute(f"SET threads TO {max(1, (os.cpu_count() or 1) // 2)}")
+    conn.execute(f"SET threads TO {_thread_count_from_cpus()}")
   except Exception:
     pass
   wanted_list = list(wanted)
@@ -161,6 +173,7 @@ def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp")
   finally:
     conn.unregister("wanted_inputs")
   return out
+
 
 
 def group_inputs(wanted, index, force=False):
