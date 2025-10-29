@@ -141,15 +141,17 @@ def _thread_count_from_cpus(ratio=0.9):
   c = os.cpu_count() or 1
   return max(1, int(math.floor(c * ratio)))
 
-
-def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
+def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp"):
   if not wanted:
     return pd.DataFrame()
   try:
-    conn.execute(f"SET memory_limit='{_memory_limit_gb_from_available()}GB'")
+    conn.execute(f"SET memory_limit='{int(mem_gb)}GB'")
     conn.execute(f"SET temp_directory='{tmpdir}'")
     conn.execute("PRAGMA enable_object_cache")
-    conn.execute(f"SET threads TO {_thread_count_from_cpus()}")
+    import os, math
+    tc = max(1, int(math.floor((os.cpu_count() or 1) * 0.9)))
+    conn.execute(f"SET threads TO {tc}")
+    conn.execute("SET preserve_insertion_order=false")
   except Exception:
     pass
   wanted_list = list(wanted)
@@ -173,6 +175,42 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   finally:
     conn.unregister("wanted_inputs")
   return out
+
+
+# def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
+#   if not wanted:
+#     return pd.DataFrame()
+#   try:
+#     t = _thread_count_from_cpus()
+#     m = _memory_limit_gb_from_available()
+#     print(t, m)
+#     conn.execute(f"SET memory_limit='{m}GB'")
+#     conn.execute(f"SET temp_directory='{tmpdir}'")
+#     # conn.execute("PRAGMA enable_object_cache")
+#     conn.execute(f"SET threads TO {t}")
+#   except Exception:
+#     pass
+#   wanted_list = list(wanted)
+#   order = np.arange(len(wanted_list), dtype=np.int64)
+#   wdf = pd.DataFrame({header: wanted_list, "__o": order})
+#   conn.register("wanted_inputs", wdf)
+#   sql = f"""
+#         WITH p AS (
+#           SELECT {columns}
+#           FROM read_parquet('{file_glob}')
+#           WHERE {header} IN (SELECT {header} FROM wanted_inputs)
+#         )
+#         SELECT p.*
+#         FROM p
+#         JOIN wanted_inputs w
+#           ON p.{header} = w.{header}
+#         ORDER BY w.__o
+#     """
+#   try:
+#     out = conn.execute(sql).fetchdf()
+#   finally:
+#     conn.unregister("wanted_inputs")
+#   return out
 
 
 
