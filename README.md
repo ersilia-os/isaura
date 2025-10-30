@@ -16,7 +16,7 @@ cd isaura
 uv sync
 source .venv/bin/activate
 ```
-### 2. Install Minio (high performance object store) as below
+### 2. Install all isaura services
 #### Prerequisites
 
 - [Docker](https://www.docker.com/get-started) installed and running
@@ -28,49 +28,9 @@ source .venv/bin/activate
 isaura engine --start
 ```
 
-#### Step 1: Pull the MinIO Docker Image
 
-```bash
-docker pull minio/minio
-````
 
----
-
-### Step 2: Create a Data Directory
-
-Create a local folder to persist data (optional but recommended):
-
-```bash
-mkdir -p ~/minio-data
-```
-
----
-
-#### Step 3: Run MinIO Server with Environment Variables
-
-Replace the example keys with your own secure values.
-
-```bash
-docker run -d \
-  -p 9000:9000 \
-  -p 9001:9001 \
-  --name minio \
-  -v ~/minio-data:/data \
-  -e "MINIO_ROOT_USER=minioadmin" \
-  -e "MINIO_ROOT_PASSWORD=minioadmin" \
-  minio/minio server /data --console-address ":9001"
-```
-
-**Explanation:**
-
-* `-v ~/minio-data:/data`: mounts your local folder
-* `--console-address ":9001"`: enables the web console at port 9001
-* Access UI: [http://localhost:9001](http://localhost:9001)
-* S3 endpoint: [http://localhost:9000](http://localhost:9000)
-
----
-
-#### Step 4: Access the Web Console
+#### Access the Web Console
 
 Open your browser and go to:
 👉 [http://localhost:9001](http://localhost:9001)
@@ -78,8 +38,8 @@ Open your browser and go to:
 Login using:
 
 ```
-Username: minioadmin
-Password: minioadmin
+Username: minioadmin123
+Password: minioadmin1234
 ```
 
 ---
