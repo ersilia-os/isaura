@@ -1,4 +1,4 @@
-import os, pandas as pd, numpy as np, json, math,  os, psutil, requests, subprocess, sys, tempfile, time
+import os, pandas as pd, numpy as np, json, math, os, psutil, requests, subprocess, sys, tempfile, time
 from contextlib import contextmanager
 from collections import defaultdict
 from loguru import logger
@@ -133,8 +133,6 @@ def split_csv(df):
   return paths
 
 
-
-
 def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   if not wanted:
     return pd.DataFrame()
@@ -166,7 +164,6 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   finally:
     conn.unregister("wanted_inputs")
   return out
-
 
 
 def group_inputs(wanted, index, force=False):

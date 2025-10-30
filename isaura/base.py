@@ -294,7 +294,7 @@ class TrancheState:
     except:
       return 1
 
-  def _write_chunk(self, df,idx, mode="new", existing_local=None):
+  def _write_chunk(self, df, idx, mode="new", existing_local=None):
     os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
 
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
@@ -363,6 +363,7 @@ class TrancheState:
         logger.info(f"flush: full tranche idx={st['next'] - 1} rows={take}")
       remaining -= take
       start += take
+
 
 class _SinkWriter:
   def __init__(self, store, bucket, model_id, model_version, tmpdir):

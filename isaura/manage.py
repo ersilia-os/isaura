@@ -297,7 +297,6 @@ class IsauraInspect:
     logger.info(f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}")
 
   def _buckets(self):
-
     return (
       [self.proj]
       if self.proj
@@ -307,9 +306,9 @@ class IsauraInspect:
   def _idx(self, b):
     try:
       if self.cloud and b == PUB:
-          self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
+        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
       if self.cloud and b == PRI:
-          self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
+        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
       o = self.s.client.get_object(Bucket=b, Key=self.idx_key)
       d = json.loads(o["Body"].read().decode("utf-8"))
       logger.info(f"loaded index: bucket={b} entries={len(d)}")
@@ -378,9 +377,9 @@ class IsauraInspect:
 
   def inspect_models(self, project_name, prefix_filter=""):
     if self.cloud and project_name == PUB:
-        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
+      self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
     if self.cloud and project_name == PRI:
-        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
+      self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
     c = self.s.client
     rows = []
     p = c.get_paginator("list_objects_v2")

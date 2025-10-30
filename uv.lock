@@ -364,7 +364,7 @@ wheels = [
 
 [[package]]
 name = "isaura"
-version = "0.1.0"
+version = "2.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
