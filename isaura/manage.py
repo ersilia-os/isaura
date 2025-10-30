@@ -246,8 +246,6 @@ class IsauraReader:
         pass
 
   def read(self, output_csv=None, df=None):
-    import time, csv, pandas as pd
-
     t0, wanted, header_set = time.time(), [], set()
     rows = df.to_dict("records") if df is not None else None
     if rows is None:
