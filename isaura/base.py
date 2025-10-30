@@ -11,6 +11,7 @@ from isaura.helpers import (
   CHECKPOINT_EVERY,
   BLOOM_FILENAME,
   ACCESS_FILE,
+  INDEX_FILE,
   logger,
   get_acc_key,
   get_base,
@@ -175,8 +176,8 @@ class BloomIndex:
     self.store = store
     self.bucket = bucket
     self.base = base_prefix.strip("/")
-    self.bloom_key = f"{self.base}/bloom.pkl"
-    self.index_key = f"{self.base}/index.json"
+    self.bloom_key = f"{self.base}/{BLOOM_FILENAME}"
+    self.index_key = f"{self.base}/{INDEX_FILE}"
     self.local_bloom = os.path.join(local_dir, bloom_filename)
     self.local_index = os.path.join(local_dir, "index.json")
     os.makedirs(local_dir, exist_ok=True)
@@ -489,7 +490,7 @@ class _BaseTransfer:
         key = obj["Key"]
         local_path = os.path.join(self.output_dir, key)
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        logger.info(f"downloading s3://{self.bucket}/{key} -> {local_path}")
+        logger.info(f"dumping from minio://{self.bucket}/{key} -> {local_path}")
         self.store.download_file(self.bucket, key, local_path)
     if not found:
       logger.info(f"bucket empty: {self.bucket}")
