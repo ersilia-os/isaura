@@ -23,6 +23,10 @@ source .venv/bin/activate
 - A terminal (Linux, macOS, or WSL on Windows)
 
 ---
+#### Fastest way to start all the services
+```bash
+isaura engine --start
+```
 
 #### Step 1: Pull the MinIO Docker Image
 
