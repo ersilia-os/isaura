@@ -183,6 +183,7 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
 
 
 def group_inputs(wanted, index, force=False):
+  logger.debug(f"Checking {len(wanted)} inputs in the index!")
   try:
     miss = [s for s in wanted if s not in index]
     g = defaultdict(set)
