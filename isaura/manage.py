@@ -140,7 +140,7 @@ class IsauraWriter:
       existed = self._load_metadata()
       write_access_file(existed, inputs, self.access, self.metadata_path)
       self.store.upload_file(self.metadata_path, self.bucket, f"{self.base_prefix}/{ACCESS_FILE}")
-      logger.info(f"{ACCESS_FILE} -> s3://{self.bucket}/{self.base_prefix}/{ACCESS_FILE}")
+      logger.info(f"{ACCESS_FILE} -> minio://{self.bucket}/{self.base_prefix}/{ACCESS_FILE}")
     except Exception as e:
       logger.warning(f"metadata upload failed: {e}")
 
@@ -400,7 +400,7 @@ class IsauraInspect:
           k = obj["Key"]
           if "/chunk_" in k and k.endswith(".parquet"):
             ch += 1
-            i = k.find("row=")
+            i = k.find("data")
             if i != -1:
               tr.add(k[i:].split("/")[0])
       return len(tr), ch
@@ -419,7 +419,7 @@ class IsauraInspect:
           logger.error(e)
           entries = 0
         tr, ch = count_chunks(get_pref(model, ver))
-        rows.append({"model": get_pref(model, ver), "entries": entries, "rows": tr, "chunks": ch})
+        rows.append({"model": get_pref(model, ver), "entries": entries, "chunks": ch})
     return rows
 
 
