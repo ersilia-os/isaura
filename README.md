@@ -43,6 +43,18 @@ Password: minioadmin1234
 ```
 
 ---
+### Cloud functionality usage
+You can export the following env varibles:
+- For accessing the could public data
+```bash
+export MINIO_CLOUD_AK = <Keys here> # access key
+export MINIO_CLOUD_SK = <Keys here> # secrete key
+```
+- For accessing the could private data
+```bash
+export MINIO_PRIV_CLOUD_AK = <Keys here> # access key
+export MINIO_PRIV_CLOUD_SK = <Keys here> # secrete key
+```
 
 #### Step 5: Install MinIO Client (mc) for fine grained control and management over the object store
 
