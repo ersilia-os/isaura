@@ -1,4 +1,4 @@
-import os, pandas as pd, numpy as np, hashlib, json, os, psutil, requests, subprocess, sys, tempfile, time
+import os, pandas as pd, numpy as np, json, math,  os, psutil, requests, subprocess, sys, tempfile, time
 from contextlib import contextmanager
 from collections import defaultdict
 from loguru import logger
@@ -80,6 +80,9 @@ def hive_prefix(base): return f"{base}/data"
 def make_temp(pref): return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
 def rss_mb(): return proc.memory_info().rss / (1024*1024)
 def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():.1f} MB")
+def avail_mem(): return int(psutil.virtual_memory().available)
+def mem_gb_lim(ratio=0.8, floor_gb=1): return max(floor_gb, int(avail_mem() * ratio / (1024**3)))
+def cpu_cnt(ratio=0.6): return max(1, int(math.floor((os.cpu_count() or 1) * ratio)))
 # fmt: on
 
 
@@ -130,34 +133,18 @@ def split_csv(df):
   return paths
 
 
-def _available_mem_bytes():
-  return int(psutil.virtual_memory().available)
 
-def _memory_limit_gb_from_available(ratio=0.8, floor_gb=1):
-  return max(floor_gb, int(_available_mem_bytes() * ratio / (1024**3)))
-
-def _thread_count_from_cpus(ratio=0.6):
-  import os, math
-  c = os.cpu_count() or 1
-  return max(1, int(math.floor(c * ratio)))
-
-def keys(input): return hashlib.md5(input.encode()).hexdigest()
 
 def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   if not wanted:
     return pd.DataFrame()
   try:
-    t = _thread_count_from_cpus()
-    m = _memory_limit_gb_from_available()
-    conn.execute(f"SET memory_limit='{m}GB'")
+    conn.execute(f"SET memory_limit='{mem_gb_lim()}GB'")
     conn.execute(f"SET temp_directory='{tmpdir}'")
     conn.execute("PRAGMA enable_object_cache")
-    conn.execute(f"SET threads TO {t}")
-    conn.execute("SET preserve_insertion_order=false")
+    conn.execute(f"SET threads TO {cpu_cnt()}")
   except Exception:
     pass
-  header = "key"
-  wanted = [keys(w) for w in wanted]
   wanted_list = list(wanted)
   order = np.arange(len(wanted_list), dtype=np.int64)
   wdf = pd.DataFrame({header: wanted_list, "__o": order})
