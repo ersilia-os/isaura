@@ -23,6 +23,7 @@ from isaura.helpers import (
   get_files_glob,
   get_idx_key,
   get_pref,
+  group_inputs,
   make_temp,
   query,
   split_csv,
@@ -151,7 +152,7 @@ class IsauraWriter:
   def _flush_if_needed(self, r, c):
     buf = self.buffers[(r, c)]
     if len(buf) >= self.max_rows:
-      self.tranche.flush(r, c, buf, self.schema_cols)
+      self.tranche.flush(buf, self.schema_cols)
       self.buffers[(r, c)].clear()
 
   def write(self, df=None):
@@ -185,7 +186,7 @@ class IsauraWriter:
         self.bi.persist()
     for (r, c), buf in list(self.buffers.items()):
       if buf:
-        self.tranche.flush(r, c, buf, self.schema_cols)
+        self.tranche.flush(buf, self.schema_cols)
         self.buffers[(r, c)].clear()
     self.bi.persist()
     if new:
@@ -265,6 +266,8 @@ class IsauraReader:
       et = time.perf_counter()
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
     header = list(header_set)[0] if header_set else "smiles"
+    index = self._load_index()
+    group_inputs(wanted, index)
     if not wanted:
       return pd.DataFrame()
     try:

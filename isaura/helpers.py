@@ -1,4 +1,4 @@
-import os, pandas as pd, numpy as np, json, os, psutil, requests, subprocess, sys, tempfile, time
+import os, pandas as pd, numpy as np, hashlib, json, os, psutil, requests, subprocess, sys, tempfile, time
 from contextlib import contextmanager
 from collections import defaultdict
 from loguru import logger
@@ -76,7 +76,7 @@ def get_pref(mdi, ver): return f"{mdi}/{ver}"
 def get_coll(mdi, ver): return f"{mdi}_{ver}"
 def get_params(collection): return {"collection": collection, "batch": str(BATCH), "flush_every": str(FLUSH_EVERY)}
 def get_header(): return {"Content-Type": "text/plain"}
-def hive_prefix(r, c, base): return f"{base}/tranche_{r}_{c}"
+def hive_prefix(base): return f"{base}/data"
 def make_temp(pref): return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
 def rss_mb(): return proc.memory_info().rss / (1024*1024)
 def log(msg): logger.info(f"[{time.strftime('%H:%M:%S')}] {msg} | RSS={rss_mb():.1f} MB")
@@ -136,24 +136,28 @@ def _available_mem_bytes():
 def _memory_limit_gb_from_available(ratio=0.8, floor_gb=1):
   return max(floor_gb, int(_available_mem_bytes() * ratio / (1024**3)))
 
-def _thread_count_from_cpus(ratio=0.9):
+def _thread_count_from_cpus(ratio=0.6):
   import os, math
   c = os.cpu_count() or 1
   return max(1, int(math.floor(c * ratio)))
 
-def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp"):
+def keys(input): return hashlib.md5(input.encode()).hexdigest()
+
+def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   if not wanted:
     return pd.DataFrame()
   try:
-    conn.execute(f"SET memory_limit='{int(mem_gb)}GB'")
+    t = _thread_count_from_cpus()
+    m = _memory_limit_gb_from_available()
+    conn.execute(f"SET memory_limit='{m}GB'")
     conn.execute(f"SET temp_directory='{tmpdir}'")
     conn.execute("PRAGMA enable_object_cache")
-    import os, math
-    tc = max(1, int(math.floor((os.cpu_count() or 1) * 0.9)))
-    conn.execute(f"SET threads TO {tc}")
+    conn.execute(f"SET threads TO {t}")
     conn.execute("SET preserve_insertion_order=false")
   except Exception:
     pass
+  header = "key"
+  wanted = [keys(w) for w in wanted]
   wanted_list = list(wanted)
   order = np.arange(len(wanted_list), dtype=np.int64)
   wdf = pd.DataFrame({header: wanted_list, "__o": order})
@@ -161,7 +165,7 @@ def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp")
   sql = f"""
         WITH p AS (
           SELECT {columns}
-          FROM read_parquet('{file_glob}', hive_partitioning=1)
+          FROM read_parquet('{file_glob}')
           WHERE {header} IN (SELECT {header} FROM wanted_inputs)
         )
         SELECT p.*
@@ -175,42 +179,6 @@ def query(conn, header, wanted, file_glob, columns="*", mem_gb=4, tmpdir="/tmp")
   finally:
     conn.unregister("wanted_inputs")
   return out
-
-
-# def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
-#   if not wanted:
-#     return pd.DataFrame()
-#   try:
-#     t = _thread_count_from_cpus()
-#     m = _memory_limit_gb_from_available()
-#     print(t, m)
-#     conn.execute(f"SET memory_limit='{m}GB'")
-#     conn.execute(f"SET temp_directory='{tmpdir}'")
-#     # conn.execute("PRAGMA enable_object_cache")
-#     conn.execute(f"SET threads TO {t}")
-#   except Exception:
-#     pass
-#   wanted_list = list(wanted)
-#   order = np.arange(len(wanted_list), dtype=np.int64)
-#   wdf = pd.DataFrame({header: wanted_list, "__o": order})
-#   conn.register("wanted_inputs", wdf)
-#   sql = f"""
-#         WITH p AS (
-#           SELECT {columns}
-#           FROM read_parquet('{file_glob}')
-#           WHERE {header} IN (SELECT {header} FROM wanted_inputs)
-#         )
-#         SELECT p.*
-#         FROM p
-#         JOIN wanted_inputs w
-#           ON p.{header} = w.{header}
-#         ORDER BY w.__o
-#     """
-#   try:
-#     out = conn.execute(sql).fetchdf()
-#   finally:
-#     conn.unregister("wanted_inputs")
-#   return out
 
 
 

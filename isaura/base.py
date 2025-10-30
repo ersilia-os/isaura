@@ -23,7 +23,6 @@ from isaura.helpers import (
   make_temp,
   post_apprx,
   query,
-  spinner,
 )
 
 from botocore.config import Config
@@ -62,8 +61,8 @@ class MinioStore:
       max_concurrency=max_concurrency,
       use_threads=use_threads,
     )
-    # if not self.ping(self.client):
-    #   sys.exit(1)
+    if not self.ping(self.client):
+      sys.exit(1)
 
   def ping(self, store):
     try:
@@ -262,27 +261,24 @@ class TrancheState:
       except:
         pass
 
-  def ensure(self, r, c):
-    t = (r, c)
-    if t in self.state:
-      return
-    keys = self._list_chunks(r, c)
+  def ensure(self):
+    keys, t = self._list_chunks(), "data"
     if not keys:
       self.state[t] = {"next": 1, "open": None, "rows": 0}
-      logger.info(f"tranche new: ({r},{c}) next=1")
+      logger.info(f"tranche new: next=1")
       return
     last = keys[-1]
     n = self._rows_in_remote(last)
     idx = self._chunk_idx(last)
     if n < self.max_rows:
       self.state[t] = {"next": idx, "open": last, "rows": n}
-      logger.info(f"tranche open: ({r},{c}) idx={idx} rows={n}")
+      logger.info(f"tranche open: idx={idx} rows={n}")
     else:
       self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
-      logger.info(f"tranche rotate: ({r},{c}) next={idx + 1}")
+      logger.info(f"tranche rotate: next={idx + 1}")
 
-  def _list_chunks(self, r, c):
-    pref = hive_prefix(r, c, self.base) + "/"
+  def _list_chunks(self):
+    pref = hive_prefix(self.base) + "/"
     keys = []
     for obj in self.store.list_keys(self.bucket, pref):
       k = obj["Key"]
@@ -298,8 +294,8 @@ class TrancheState:
     except:
       return 1
 
-  def _write_chunk(self, df, r, c, idx, mode="new", existing_local=None):
-    os_key = f"{hive_prefix(r, c, self.base)}/chunk_{idx}.parquet"
+  def _write_chunk(self, df,idx, mode="new", existing_local=None):
+    os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
 
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     if mode == "append" and existing_local:
@@ -316,11 +312,11 @@ class TrancheState:
         pass
     return os_key
 
-  def flush(self, r, c, rows, schema_cols):
+  def flush(self, rows, schema_cols):
     if not rows:
       return
-    self.ensure(r, c)
-    st = self.state[(r, c)]
+    self.ensure()
+    st = self.state["data"]
     df_all = pd.DataFrame(rows)
     for col in schema_cols:
       if col not in df_all.columns:
@@ -328,7 +324,7 @@ class TrancheState:
     df_all = df_all[schema_cols]
     remaining = len(df_all)
     start = 0
-    logger.info(f"flush: tranche=({r},{c}) rows={remaining}")
+    logger.info(f"flush: tranche rows={remaining}")
     if st["open"]:
       tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
       try:
@@ -337,16 +333,16 @@ class TrancheState:
         take = min(space, remaining)
         if take > 0:
           part = df_all.iloc[start : start + take]
-          self._write_chunk(part, r, c, st["next"], mode="append", existing_local=tmp)
+          self._write_chunk(part, st["next"], mode="append", existing_local=tmp)
           st["rows"] += take
           remaining -= take
           start += take
-          logger.info(f"flush: appended tranche=({r},{c}) idx={st['next']} +{take} -> {st['rows']}")
+          logger.info(f"flush: appended tranche idx={st['next']} +{take} -> {st['rows']}")
         if st["rows"] >= self.max_rows:
           st["next"] += 1
           st["open"] = None
           st["rows"] = 0
-          logger.info(f"flush: closed tranche=({r},{c}) next={st['next']}")
+          logger.info(f"flush: closed tranche next={st['next']}")
       finally:
         try:
           os.remove(tmp)
@@ -355,16 +351,16 @@ class TrancheState:
     while remaining > 0:
       take = min(self.max_rows, remaining)
       part = df_all.iloc[start : start + take]
-      os_key = self._write_chunk(part, r, c, st["next"], mode="new")
+      os_key = self._write_chunk(part, st["next"], mode="new")
       if take < self.max_rows:
         st["open"] = os_key
         st["rows"] = take
-        logger.info(f"flush: new open tranche=({r},{c}) idx={st['next']} rows={take}")
+        logger.info(f"flush: new open tranche idx={st['next']} rows={take}")
       else:
         st["next"] += 1
         st["open"] = None
         st["rows"] = 0
-        logger.info(f"flush: full tranche=({r},{c}) idx={st['next'] - 1} rows={take}")
+        logger.info(f"flush: full tranche idx={st['next'] - 1} rows={take}")
       remaining -= take
       start += take
 
