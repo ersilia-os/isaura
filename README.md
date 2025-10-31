@@ -115,3 +115,4 @@ export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
 | 📋 **List available model results**      | `isaura inspect -m eos8a4x -v v1  -o reports/available.csv`                                      | List all available inputs or files related to a model/version.                                            |
 | 📚 **Catalog project models**    | `isaura catalog -pn myproject`                                                                 | Display all models within a project                                    |
 
+### API usage examples
