@@ -116,3 +116,95 @@ export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
 | 📚 **Catalog project models**    | `isaura catalog -pn myproject`                                                                 | Display all models within a project                                    |
 
 ### API usage examples
+```python
+from isaura.manage import (
+    IsauraWriter,
+    IsauraReader,
+    IsauraMover,
+    IsauraCopy,
+    IsauraRemover,
+    IsauraInspect,
+    IsauraPull,
+    IsauraPush,
+)
+
+
+writer = IsauraWriter(
+    input_csv="data/input.csv",
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+    access="public",  # can be 'public', 'private', or 'both'
+)
+writer.write()
+
+
+reader = IsauraReader(
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+    input_csv="data/query.csv",
+    approximate=False,  # use ANN if True
+)
+reader.read(output_csv="results.csv")
+
+
+puller = IsauraPull(
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+    input_csv="data/ids.csv",
+)
+puller.pull()
+
+
+pusher = IsauraPush(
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+)
+pusher.push()
+
+
+copier = IsauraCopy(
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+    output_dir="backups/",
+)
+copier.copy()
+
+
+mover = IsauraMover(
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+)
+mover.move()
+
+
+remover = IsauraRemover(
+    model_id="eos8a4x",
+    model_version="v1",
+    bucket="my-project",
+)
+remover.remove()
+
+
+inspector = IsauraInspect(
+    model_id="eos8a4x",
+    model_version="v1",
+    project_name="my-project",
+    access="public",
+    cloud=False,
+)
+
+# List available inputs
+df_inputs = inspector.list_available(output_file="inputs.csv")
+
+# Inspect specific input CSV
+df_inspected = inspector.inspect_inputs("data/input.csv", "inspected_results.csv")
+
+# Inspect all models in a project
+df_models = inspector.inspect_models("my-project")
+```
