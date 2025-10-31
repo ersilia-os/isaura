@@ -20,7 +20,8 @@ source .venv/bin/activate
 #### Prerequisites
 
 - [Docker](https://www.docker.com/get-started) installed and running
-- A terminal (Linux, macOS, or WSL on Windows)
+- `docker-compose` ubuntu we need to have them installed. Use this instruction for more detail [here](https://docs.docker.com/engine/install/ubuntu/).
+- `docker-compose` macOS as `brew install docker-compose`
 
 ---
 #### Fastest way to start all the services
