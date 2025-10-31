@@ -28,35 +28,7 @@ source .venv/bin/activate
 isaura engine --start
 ```
 
-
-
-#### Access the Web Console
-
-Open your browser and go to:
-👉 [http://localhost:9001](http://localhost:9001)
-
-Login using:
-
-```
-Username: minioadmin123
-Password: minioadmin1234
-```
-
----
-### Cloud functionality usage
-You can export the following env varibles:
-- For read/write the could public data
-```bash
-export MINIO_CLOUD_AK = <Key here> # access key
-export MINIO_CLOUD_SK = <Key here> # secrete key
-```
-- For read/write the could private data
-```bash
-export MINIO_PRIV_CLOUD_AK = <Key here> # access key
-export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
-```
-
-#### Step 5: Install MinIO Client (mc) for fine grained control and management over the object store
+#### 3. Install MinIO Client (mc) for fine grained control and management over the object store
 
 The MinIO Client (`mc`) is a command-line tool to interact with MinIO or any S3-compatible storage.
 
@@ -89,6 +61,33 @@ mc ls local
 
 You can find more detailed docs [here](https://github.com/minio/mc?tab=readme-ov-file) on how to use `mc`.
 
+#### Access the Web Console
+
+Open your browser and go to:
+👉 [http://localhost:9001](http://localhost:9001)
+
+Login using:
+
+```
+Username: minioadmin123
+Password: minioadmin1234
+```
+
+---
+### Cloud functionality usage
+You can export the following env varibles:
+- For read/write the could public data
+```bash
+export MINIO_CLOUD_AK = <Key here> # access key
+export MINIO_CLOUD_SK = <Key here> # secrete key
+```
+- For read/write the could private data
+```bash
+export MINIO_PRIV_CLOUD_AK = <Key here> # access key
+export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
+```
+
+
 ### Command at a Glance
 
 | Command   | Alias | Required Options                                                      | Optional Options                                                                                                                                     | What it does                                                                                                                                       |                        |                                                                           |
@@ -98,8 +97,8 @@ You can find more detailed docs [here](https://github.com/minio/mc?tab=readme-ov
 | `copy`    | `cp`  | `-m/--model`, `-v/--version`, `-pn/--project-name`, `-o/--output-dir` | —                                                                                                                                                    | Copy all artifacts for a model/version from a project to a local directory. If `-o` is omitted in code, it logs counts; with `-o` it writes files. |                        |                                                                           |
 | `move`    | `mv`  | `-m/--model`, `-v/--version`, `-pn/--project-name`                    | —                                                                                                                                                    | Move/relocate server-side artifacts for a model/version within the project space.                                                                  |                        |                                                                           |
 | `remove`  | `rm`  | `-m/--model`, `-v/--version`, `-pn/--project-name`, `-y/--yes`        | —                                                                                                                                                    | Permanently delete artifacts for a model/version from a project. Safety-guarded by `--yes`.                                                        |                        |                                                                           |
-| `inspect` | —     | (none strictly; behavior changes with flags)                          | `what` argument (`inputs`, default: `inputs`), `-m/--model`, `-v/--version`, `-pn/--project-name`, `--access`, `-i/--input-file`, `-o/--output-file` | Inspect available items or validate inputs. With `-i`, validates inputs and writes a report; without `-i`, lists available entries.                |                        |                                                                           |
-| `catalog` | —     | —                                                                     | `-pn/--project-name`                                                                                                                | List models present in a project (bucket), optionally filtered by an id prefix.                                                                    |                        |                                                                           |
+| `inspect` | —     | (none strictly; behavior changes with flags)                          | `-m/--model`, `-v/--version`, `-pn/--project-name`, `--access`, `-i/--input-file`, `-o/--output-file`, `--cloud` (optional) | Inspect available items or validate inputs. With `-i`, validates inputs and writes a report; without `-i`, lists available entries.                |                        |                                                                           |
+| `catalog` | —     | —                                                                     | `-pn/--project-name`, , `--cloud` (optional)                                                                                                                | List models present in a project (bucket), optionally filtered by an id prefix.                                                                    |                        |                                                                           |
 
 ### Brief CLI usage examples
 > Buckets: are just a storage directory for model calcultaion (just a term used by the minio). 
