@@ -440,11 +440,14 @@ class _BaseTransfer:
   def _load_metadata(self):
     local = os.path.join(self.tmpdir, ACCESS_FILE)
     acc = get_acc_key(self.tranches)
-    if self._download_if_exists(acc, local):
-      with open(local, "r", encoding="utf-8") as f:
-        return local, json.load(f)
-    raise RuntimeError(f"{ACCESS_FILE} not found")
-
+    try:
+      if self._download_if_exists(acc, local):
+        with open(local, "r", encoding="utf-8") as f:
+          return local, json.load(f)
+    except Exception as e:
+      logger.error(f"{e}. Possible causes -> 1. No project 2. Incorrect model id or version")
+      sys.exit(1)
+    
   def _load_index(self):
     key = get_idx_key(self.tranches)
     local = os.path.join(self.tmpdir, "index_src.json")
