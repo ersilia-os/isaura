@@ -446,7 +446,6 @@ class _BaseTransfer:
           return local, json.load(f)
     except Exception as e:
       logger.error(f"{e}. Possible causes -> 1. No project 2. Incorrect model id or version")
-      sys.exit(1)
     
   def _load_index(self):
     key = get_idx_key(self.tranches)
