@@ -239,6 +239,8 @@ class IsauraReader:
     try:
       with open(local, "r", encoding="utf-8") as f:
         return json.load(f)
+    except Exception as e:
+      logger.error(e)
     finally:
       try:
         os.remove(local)
