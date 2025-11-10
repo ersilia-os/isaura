@@ -1,7 +1,7 @@
 <div id="top"></div>
 
 <p align="center">
-  <img src="/assets/isaura.png" height="180" alt="Isaura logo"><br>
+  <img src="/assets/isaura.png" height="200" alt="Isaura logo"><br>
   <img src="https://img.shields.io/badge/python-%3E%3D3.8-blue.svg?style=flat-square&logo=python&logoColor=white" alt="Python >=3.8">
   <img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square&logo=python&logoColor=white" alt="Code style: Black">
 </p>
@@ -10,6 +10,8 @@
 
 
 This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub. Initial benchmark is made and can be found [here](BENCHMARK.md).
+
+---
 
 ## Quick start guide
 First install a high-performance python project manager called `uv` based on this [manual](https://docs.astral.sh/uv/getting-started/installation/)
