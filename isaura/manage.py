@@ -157,7 +157,7 @@ class IsauraWriter:
 
   def write(self, df=None):
     total = dupes = 0
-    new = []
+    new, buffs = [], []
     rows = df.to_dict("records") if df is not None else None
     if rows is None:
       with open(self.input_csv, newline="", encoding="utf-8") as f:
@@ -186,8 +186,10 @@ class IsauraWriter:
         self.bi.persist()
     for (r, c), buf in list(self.buffers.items()):
       if buf:
-        self.tranche.flush(buf, self.schema_cols)
+        buffs.extend(buf)
         self.buffers[(r, c)].clear()
+
+    self.tranche.flush(buffs, self.schema_cols)
     self.bi.persist()
     if new:
       self._upload_metadata(new)
