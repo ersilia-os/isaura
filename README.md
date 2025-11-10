@@ -1,7 +1,7 @@
 <div id="top"></div>
 
 <p align="center">
-  <img src="/assets/isaura.png" height="120" alt="Isaura logo"><br><br>
+  <img src="/assets/isaura.png" height="110" alt="Isaura logo"><br><br>
   <img src="https://img.shields.io/badge/python-%3E%3D3.8-blue.svg?style=flat-square&logo=python&logoColor=white" alt="Python >=3.8">
   <img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square&logo=python&logoColor=white" alt="Code style: Black">
 </p>
