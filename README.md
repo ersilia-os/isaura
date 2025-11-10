@@ -1,11 +1,8 @@
 <div id="top"></div>
-
 <p align="center">
-  <img src="/assets/isaura.png" height="220" alt="Isaura logo">
+  <img src="/assets/isaura.png" height="280" alt="Isaura logo">
 </p>
-
 <h2 align="center">The Isaura Data Store</h2>
-
 <p align="center">
   <img src="https://img.shields.io/badge/python-%3E%3D3.8-blue.svg?style=flat-square&logo=python&logoColor=white" alt="Python >=3.8">
   <img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square&logo=python&logoColor=white" alt="Code style: Black">
