@@ -11,6 +11,7 @@ from isaura.helpers import (
   INPUT_C,
   MAX_ROWS,
   MINIO_ENDPOINT_CLOUD,
+  MIN_NNS_RESULT_SIZE,
   MINIO_CLOUD_AK as mcak,
   MINIO_CLOUD_SK as mcsk,
   MINIO_PRIV_CLOUD_AK as mcpak,
@@ -250,6 +251,7 @@ class IsauraReader:
         pass
 
   def read(self, output_csv=None, df=None):
+    index = self._load_index()
     t0, wanted, header_set = time.time(), [], set()
     rows = df.to_dict("records") if df is not None else None
     if rows is None:
@@ -262,31 +264,38 @@ class IsauraReader:
         wanted.append(v)
       if h:
         header_set.add(h)
+    if len(index) < MIN_NNS_RESULT_SIZE and self.approximate:
+      logger.error(
+        f"Minimum precalculation size for enabling nearest neighbor search is {MIN_NNS_RESULT_SIZE}, found {len(index)}. Aborting the Ops!"
+      )
+      sys.exit(1)
     if self.approximate:
       st = time.perf_counter()
       wanted = get_apprx(wanted, self.collection)
       et = time.perf_counter()
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
     header = list(header_set)[0] if header_set else "smiles"
-    index = self._load_index()
     group_inputs(wanted, index)
     if not wanted:
       return pd.DataFrame()
     try:
       files = get_files_glob(self.bucket, self.base)
       out = spinner("Fetching queries. Please wait!", query, self.duck.con, header, wanted, files)
+      elapsed = time.time() - t0
+      logger.success(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
     except Exception as e:
       logger.error(e)
       sys.exit(1)
+    rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
     if output_csv:
+      logger.debug(f"writting csv rows={len(out)} path={output_csv}. Please wait!")
       out.to_csv(output_csv, index=False)
       logger.info(f"wrote csv rows={len(out)} path={output_csv}")
-    elapsed = time.time() - t0
-    rate = (len(out) / elapsed) if elapsed > 0 and len(out) else 0.0
+    te = time.time() - t0
     logger.info(
-      f"read done model+version={self.pref}"
+      f"read done model+version={self.pref} "
       f"bucket={self.bucket} inputs={len(wanted)} matched={len(out)} "
-      f"elapsed={elapsed:.2f}s rate={rate:.1f}/s"
+      f"(query elapsed)={elapsed:.2f}s rate={rate:.1f}/s (total time elapsed)={te:.2f}s"
     )
     return out
 
