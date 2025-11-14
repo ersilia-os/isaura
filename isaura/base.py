@@ -1,4 +1,4 @@
-import boto3, duckdb, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys
+import boto3, duckdb, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys, uuid
 
 from isaura.helpers import (
   MINIO_ENDPOINT,
@@ -21,7 +21,7 @@ from isaura.helpers import (
   make_temp,
   post_apprx,
   query,
-  cpu_cnt
+  cpu_cnt,
 )
 
 from botocore.config import Config
@@ -243,98 +243,139 @@ class TrancheState:
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
-    self.st = {"next": 1, "open": None, "rows": 0}
-    self._w = None
-    self._schema = None
+    self.state = {}
 
-  def _pref(self):
-    return hive_prefix(self.base) + "/"
-
-  def _ok(self, i):
-    return f"{self._pref()}chunk_{i}.parquet"
-
-  def _lp(self, i):
-    return os.path.join(self.tmpdir, f"open_{i}.parquet")
-
-  def _ls(self):
-    ks = []
-    for o in self.store.list_keys(self.bucket, self._pref()):
-      k = o["Key"]
-      if k.endswith(".parquet") and "/chunk_" in k:
-        ks.append(k)
-    ks.sort(key=self._idx)
-    return ks
-
-  def _idx(self, k):
-    b = os.path.basename(k)
-    n, _ = os.path.splitext(b)
-    try: return int(n.split("_")[1])
-    except: return 1
-
-  def _esc(self, cols):
-    if cols is None: return []
-    return list(cols)
-
-  def _ens(self, cols):
-    if self._schema is None:
-      self._schema = pa.schema([pa.field(c, pa.string()) for c in cols])
-
-  def _wopen(self, i, cols):
-    if self._w is None:
-      self._ens(cols)
-      self._w = pq.ParquetWriter(self._lp(i), self._schema, compression="zstd", use_dictionary=True)
-
-  def _append(self, df, cols):
-    cols = self._esc(cols)
-    for c in cols:
-      if c not in df.columns:
-        df[c] = None
-    df = df[cols]
-    t = pa.Table.from_pandas(df, schema=self._schema, preserve_index=False)
-    self._w.write_table(t)
-    self.st["rows"] += t.num_rows
-
-  def _closeup(self, i):
-    if self._w:
-      self._w.close()
-      self._w = None
-      local = self._lp(i)
-      self.store.upload_file(local, self.bucket, self._ok(i))
-      try: os.remove(local)
-      except: pass
+  def _rows_in_remote(self, key):
+    local = os.path.join(self.tmpdir, f"inspect_{uuid.uuid4().hex}.parquet")
+    try:
+      self.store.download_file(self.bucket, key, local)
+      try:
+        return pq.ParquetFile(local).metadata.num_rows
+      except:
+        return len(pd.read_parquet(local))
+    except:
+      return 0
+    finally:
+      try:
+        os.remove(local)
+      except:
+        pass
 
   def ensure(self):
-    ks = self._ls()
-    if not ks:
-      self.st = {"next": 1, "open": self._lp(1), "rows": 0}
+    keys, t = self._list_chunks(), "data"
+    if not keys:
+      self.state[t] = {"next": 1, "open": None, "rows": 0}
+      logger.info(f"tranche new: next=1")
       return
-    n = self._idx(ks[-1]) + 1
-    self.st = {"next": n, "open": self._lp(n), "rows": 0}
+
+    last = keys[-1]
+    n = self._rows_in_remote(last)
+    idx = self._chunk_idx(last)
+
+    if n < self.max_rows:
+      self.state[t] = {"next": idx, "open": last, "rows": n}
+      logger.info(f"tranche open: idx={idx} rows={n}")
+    else:
+      self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
+      logger.info(f"tranche rotate: next={idx + 1}")
+
+  def _list_chunks(self):
+    pref = hive_prefix(self.base) + "/"
+    keys = []
+    for obj in self.store.list_keys(self.bucket, pref):
+      k = obj["Key"]
+      if k.endswith(".parquet") and "/chunk_" in k:
+        keys.append(k)
+    return sorted(keys, key=self._chunk_idx)
+
+  def _chunk_idx(self, key):
+    base = os.path.basename(key)
+    name, _ = os.path.splitext(base)
+    try:
+      return int(name.split("_")[1])
+    except:
+      return 1
+
+  def _write_chunk(self, df, idx, mode="new", existing_local=None):
+    os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
+    local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
+
+    if mode == "append" and existing_local:
+      old = pd.read_parquet(existing_local)
+      df = pd.concat([old, df], ignore_index=True)
+
+    df.to_parquet(local, index=False)
+    self.store.upload_file(local, self.bucket, os_key)
+
+    if not existing_local:
+      try:
+        os.remove(local)
+      except:
+        pass
+
+    return os_key
 
   def flush(self, rows, schema_cols):
-    if not rows: return
+    if not rows:
+      return self.ensure()
     self.ensure()
-    df = pd.DataFrame(rows)
-    cols = self._esc(schema_cols)
-    i = self.st["next"]
-    if not self.st["open"]:
-      self.st["open"] = self._lp(i)
-    r = len(df); s = 0
-    while r > 0:
-      space = self.max_rows - self.st["rows"]
-      take = min(space, r)
-      if take > 0:
-        part = df.iloc[s:s+take]
-        self._wopen(i, cols)
-        self._append(part, cols)
-        r -= take; s += take
-      if self.st["rows"] >= self.max_rows:
-        self._closeup(i)
-        self.st["next"] += 1
-        i = self.st["next"]
-        self.st["open"] = self._lp(i)
-        self.st["rows"] = 0
-  
+    st = self.state["data"]
+    df_all = pd.DataFrame(rows)
+
+    for col in schema_cols:
+      if col not in df_all.columns:
+        df_all[col] = pd.Series([None] * len(df_all))
+    df_all = df_all[schema_cols]
+
+    remaining = len(df_all)
+    start = 0
+
+    logger.info(f"flush: tranche rows={remaining}")
+
+    if st["open"]:
+      tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
+      try:
+        self.store.download_file(self.bucket, st["open"], tmp)
+        space = self.max_rows - st["rows"]
+        take = min(space, remaining)
+
+        if take > 0:
+          part = df_all.iloc[start : start + take]
+          self._write_chunk(part, st["next"], mode="append", existing_local=tmp)
+          st["rows"] += take
+          remaining -= take
+          start += take
+          logger.info(f"flush: appended tranche idx={st['next']} +{take} -> {st['rows']}")
+
+        if st["rows"] >= self.max_rows:
+          st["next"] += 1
+          st["open"] = None
+          st["rows"] = 0
+          logger.info(f"flush: closed tranche next={st['next']}")
+      finally:
+        try:
+          os.remove(tmp)
+        except:
+          pass
+
+    while remaining > 0:
+      take = min(self.max_rows, remaining)
+      part = df_all.iloc[start : start + take]
+      os_key = self._write_chunk(part, st["next"], mode="new")
+
+      if take < self.max_rows:
+        st["open"] = os_key
+        st["rows"] = take
+        logger.info(f"flush: new open tranche idx={st['next']} rows={take}")
+      else:
+        st["next"] += 1
+        st["open"] = None
+        st["rows"] = 0
+        logger.info(f"flush: full tranche idx={st['next'] - 1} rows={take}")
+
+      remaining -= take
+      start += take
+
 
 class _SinkWriter:
   def __init__(self, store, bucket, model_id, model_version, tmpdir):
