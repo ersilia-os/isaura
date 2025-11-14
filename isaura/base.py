@@ -1,4 +1,4 @@
-import boto3, duckdb, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys, uuid
+import boto3, duckdb, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys
 
 from isaura.helpers import (
   MINIO_ENDPOINT,
@@ -21,6 +21,7 @@ from isaura.helpers import (
   make_temp,
   post_apprx,
   query,
+  cpu_cnt
 )
 
 from botocore.config import Config
@@ -143,7 +144,8 @@ class DuckDBMinio:  # Singleton design here
 
     self.endpoint, self.access, self.secret = endpoint, access, secret
     self.con = duckdb.connect(":memory:")
-    self.con.execute(f"PRAGMA threads={threads};")
+    self.con.execute("PRAGMA enable_object_cache")
+    self.con.execute(f"PRAGMA threads={cpu_cnt(ratio=1)};")
     self.con.execute("INSTALL httpfs; LOAD httpfs;")
     self.con.execute("SET s3_access_key_id=?", [access])
     self.con.execute("SET s3_secret_access_key=?", [secret])
@@ -368,8 +370,7 @@ class _SinkWriter:
   def finalize(self, metadata_local=None, schema_cols=None):
     for k in list(self.buffers.keys()):
       if self.buffers[k]:
-        r, c = k
-        self.tranche.flush(r, c, self.buffers[k], schema_cols)
+        self.tranche.flush(self.buffers[k], schema_cols)
         self.buffers[k].clear()
     self.bi.persist()
     if metadata_local:
