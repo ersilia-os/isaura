@@ -42,14 +42,15 @@ class IsauraChecker(AbstractContextManager):
   def __init__(
     self,
     bucket,
-    base_prefix,
+    model_id,
+    model_version,
     store=None,
     store_directory=".",
     bloom_filename=BLOOM_FILENAME,
     checkpoint_every=CHECKPOINT_EVERY,
   ):
     self.bucket = bucket
-    self.base_prefix = base_prefix
+    self.base_prefix = get_base(model_id, model_version)
     self.store = store or MinioStore()
     self.local_dir = store_directory
     self.checkpoint_every = checkpoint_every
@@ -65,6 +66,9 @@ class IsauraChecker(AbstractContextManager):
   def seen(self, v):
     return self.bi.seen(v)
 
+  def seen_many(self, vs):
+    return self.bi.seen_many(vs)
+  
   def register(self, v, rc=None):
     self.bi.register(v, rc=rc)
     self._added += 1

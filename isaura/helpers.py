@@ -34,6 +34,7 @@ logger.level("SUCCESS", color="<black><bold><bg green>")
 
 ACCESS_FILE = "access.json"
 INDEX_FILE = "index.json"
+MIN_NNS_RESULT_SIZE = 1_000
 MAX_ROWS = 2_000_000
 
 MW_BINS = [200, 500]
