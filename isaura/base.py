@@ -205,6 +205,9 @@ class BloomIndex:
   def seen(self, v):
     return v in self.sbf
 
+  def seen_many(self, vs):
+    return {v: self.seen(v) for v in vs}
+
   def rc(self, v):
     return self.index.get(v)
 
