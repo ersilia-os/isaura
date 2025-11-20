@@ -268,7 +268,7 @@ class IsauraReader:
         wanted.append(v)
       if h:
         header_set.add(h)
-    if len(index) < MIN_NNS_RESULT_SIZE and self.approximate:
+    if index and len(index) < MIN_NNS_RESULT_SIZE and self.approximate:
       logger.error(
         f"Minimum precalculation size for enabling nearest neighbor search is {MIN_NNS_RESULT_SIZE}, found {len(index)}. Aborting the Ops!"
       )
