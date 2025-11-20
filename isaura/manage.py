@@ -45,14 +45,13 @@ class IsauraChecker(AbstractContextManager):
     model_id,
     model_version,
     store=None,
-    store_directory=".",
     bloom_filename=BLOOM_FILENAME,
     checkpoint_every=CHECKPOINT_EVERY,
   ):
     self.bucket = bucket
     self.base_prefix = get_base(model_id, model_version)
     self.store = store or MinioStore()
-    self.local_dir = store_directory
+    self.local_dir = make_temp("isaura_checker_")
     self.checkpoint_every = checkpoint_every
     self.bi = BloomIndex(
       self.store,
