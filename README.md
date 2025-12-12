@@ -1,15 +1,18 @@
 <div id="top"></div>
 
 <p align="center">
-  <img src="/assets/isaura.png" height="110" alt="Isaura logo"><br><br>
+  <img src="./assets/isaura.png" height="110" alt="Isaura logo"><br><br>
   <img src="https://img.shields.io/badge/python-%3E%3D3.8-blue.svg?style=flat-square&logo=python&logoColor=white" alt="Python >=3.8">
   <img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square&logo=python&logoColor=white" alt="Code style: Black">
 </p>
 
+
 <h3 align="center">The Ersilia's Precalculation Store</h3>
 
 
-This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub. Initial benchmark is made and can be found [here](BENCHMARK.md).
+
+
+This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub. Initial benchmark is made and can be found [here](BENCHMARK.md). And the detailed mechanism on to how it works [here](HOW_IT_WORKS.md).
 
 ---
 
@@ -94,6 +97,7 @@ export MINIO_CLOUD_SK = <Key here> # secrete key
 export MINIO_PRIV_CLOUD_AK = <Key here> # access key
 export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
 ```
+
 
 
 ### Command at a Glance

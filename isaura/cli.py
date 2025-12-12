@@ -203,6 +203,7 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
 def cmd_inspect_models(project_name, cloud):
   insp = IsauraInspect(model_id="_", model_version="_", cloud=cloud)
   rows = insp.inspect_models(project_name, prefix_filter="")
+  print(rows)
   if not rows:
     console.print(f"[yellow]No models found in {project_name}[/]")
     return
