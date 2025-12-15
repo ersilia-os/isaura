@@ -105,7 +105,8 @@ def run_docker_compose(up=True):
 
 
 def show_figlet():
-  path = Path(__file__).parent.parent / "assets" / "figlet.txt"
+  path = Path(__file__).parent / "assets" / "figlet.txt"
+  print(path)
   text = Path(path).read_text(encoding="utf-8")
   start_color = (0, 255, 255)
   end_color = (255, 0, 255)
