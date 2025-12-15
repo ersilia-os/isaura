@@ -31,7 +31,7 @@ dependencies = [
 isaura = "isaura.cli:cli"
 
 [tool.setuptools.package-data]
-isaura = ["assets/*"]  
+isaura = ["assets/**", "configs/**"]
 
 [tool.setuptools.packages.find]
 include = ["isaura*"]
