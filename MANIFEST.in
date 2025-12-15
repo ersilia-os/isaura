@@ -1,0 +1,2 @@
+recursive-include isaura/assets *
+recursive-include isaura/configs *
