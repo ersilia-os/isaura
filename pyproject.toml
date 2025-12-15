@@ -30,6 +30,9 @@ dependencies = [
 [project.scripts]
 isaura = "isaura.cli:cli"
 
+[tool.setuptools.package-data]
+isaura = ["assets/*"]  
+
 [tool.setuptools.packages.find]
 include = ["isaura*"]
 exclude = ["files*", "tests*", "docs*"]
