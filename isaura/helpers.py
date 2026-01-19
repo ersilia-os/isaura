@@ -37,6 +37,11 @@ INDEX_FILE = "index.json"
 MIN_NNS_RESULT_SIZE = 1_000
 MAX_ROWS = 2_000_000
 
+BUILD_STATUS_TIMEOUT = 5
+BUILD_START_TIMEOUT = 30
+BUILD_POLL_INTERVAL = 0.5
+BUILD_MAX_WAIT = 1.0
+
 MW_BINS = [200, 500]
 LOGP_BINS = [-1, 5]
 
@@ -44,7 +49,7 @@ COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 TIMEOUT = os.getenv("TIMEOUT", 3600)
 MINIO_ENDPOINT_CLOUD = os.getenv("MINIO_ENDPOINT_CLOUD") or "http://83.48.73.209:8080"
-NNS_ENDPOINT_BASE = os.getenv("NNS_ENDPOINT") or "http://127.0.0.1:8080/"
+NNS_ENDPOINT_BASE = os.getenv("NNS_ENDPOINT") or "http://127.0.0.1:8080"
 MINIO_LOCAL_AK = os.getenv("MINIO_LOCAL_AK", "minioadmin123")
 MINIO_LOCAL_SK = os.getenv("MINIO_LOCAL_SK", "minioadmin1234")
 MINIO_CLOUD_AK = os.getenv("MINIO_CLOUD_AK", None)
@@ -202,35 +207,130 @@ def line_gen(df, chunksize=100_000):
   log("finished streaming")
 
 
-def post_apprx(df, colelction):
+def build_index_status(collection):
+  r = requests.get(
+    f"{NNS_ENDPOINT_BASE}/build_index",
+    params={"collection": collection},
+    timeout=BUILD_STATUS_TIMEOUT,
+  )
+  r.raise_for_status()
+  return r.json()
+
+
+def start_build_index(collection, nlist=None, rebuild=False, wait=False):
+  params = {"collection": collection}
+  if nlist is not None:
+    params["nlist"] = str(nlist)
+  if rebuild:
+    params["rebuild"] = "1"
+  if wait:
+    params["wait"] = "1"
+  r = requests.post(
+    f"{NNS_ENDPOINT_BASE}/build_index",
+    params=params,
+    timeout=BUILD_START_TIMEOUT,
+  )
+  r.raise_for_status()
+  return r.json()
+
+
+def ensure_index_ready(collection, max_wait_s=BUILD_MAX_WAIT):
+  st = build_index_status(collection)
+
+  if not st.get("exists", False):
+    try:
+      start_build_index(collection, wait=False)
+    except requests.RequestException as e:
+      return False, {"error": f"start_build_index_failed: {e}", "status": st}
+
+    st = build_index_status(collection)
+
+  if st.get("is_failed", False):
+    return False, {"error": "index_failed", "status": st}
+
+  if st.get("is_finished", False) and not st.get("is_building", False):
+    return True, {"status": st}
+
+  t_end = time.time() + max_wait_s
+  while time.time() < t_end:
+    time.sleep(BUILD_POLL_INTERVAL)
+    st = build_index_status(collection)
+    if st.get("is_failed", False):
+      return False, {"error": "index_failed", "status": st}
+    if st.get("is_finished", False) and not st.get("is_building", False):
+      return True, {"status": st}
+
+  return False, {"error": "index_building", "status": st}
+
+
+def post_apprx(df, collection, nlist=None):
   t0 = time.time()
   try:
     with requests.Session() as s:
       log("start streaming to nns api. This process sometimes appears to be slow. Please have some patience!")
       resp = s.post(
         f"{NNS_ENDPOINT_BASE}/insert",
-        params=get_params(colelction),
+        params=get_params(collection),
         data=line_gen(df),
         headers=get_header(),
         timeout=None,
       )
     dt = (time.time() - t0) * 1000
     log(f"done total_ms={dt:.0f}. Body: {resp.text[:1000]}")
+
+    try:
+      start_build_index(collection, nlist=nlist, rebuild=False, wait=False)
+      st = build_index_status(collection)
+      logger.info(
+        f"index build triggered collection={collection} exists={st.get('exists')} "
+        f"building={st.get('is_building')} finished={st.get('is_finished')} "
+        f"progress={st.get('progress_pct')}"
+      )
+    except requests.RequestException as e:
+      logger.error(f"index build trigger failed collection={collection}: {e}")
+
+    return resp
   except requests.RequestException as e:
     logger.error(f"approx NN search failed. The NNS server container may not be sarted!: {e}")
-    return []
+    return None
 
 
-def get_apprx(inputs, collection):
+def get_apprx(inputs, collection, fallback_search=None):
   try:
     logger.info(f"Sending {len(inputs)} inputs for ANN search server to get top 1 similar compounds")
+
+    ok, meta = ensure_index_ready(collection, max_wait_s=BUILD_MAX_WAIT)
+    if not ok:
+      st = meta.get("status", {})
+      err = meta.get("error", "index_not_ready")
+      msg = (
+        f"ANN index not ready collection={collection} error={err} "
+        f"exists={st.get('exists')} building={st.get('is_building')} "
+        f"finished={st.get('is_finished')} failed={st.get('is_failed')} "
+        f"progress={st.get('progress_pct')}"
+      )
+      logger.error(msg)
+      if callable(fallback_search):
+        logger.info("Please use conventional/exact search")
+        return fallback_search(inputs, collection)
+      return []
+
     r = requests.post(
-      f"{NNS_ENDPOINT_BASE}/search", json={"collection": collection, "smiles": inputs}, timeout=TIMEOUT
+      f"{NNS_ENDPOINT_BASE}/search",
+      json={"collection": collection, "smiles": inputs},
+      timeout=TIMEOUT,
     )
     r.raise_for_status()
-    return [x["input"] for x in r.json().get("results", [])]
+
+    payload = r.json() or {}
+    results = payload.get("results", [])
+    return [x.get("match") for x in results if "match" in x]
+
   except requests.RequestException as e:
     logger.error(f"approx NN search failed. The NNS server container may not be sarted!: {e}")
+    if callable(fallback_search):
+      logger.info("Falling back to conventional/exact search")
+      return fallback_search(inputs, collection)
     return []
 
 
