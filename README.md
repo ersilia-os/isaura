@@ -132,7 +132,7 @@ export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
 
 ## Ersilia ↔ Isaura Integration: Initial Setup Failure Troubleshooting
 
-This README documents a practical cleanup-and-verify workflow for cases where the **initial setup stage fails** during the **Ersilia + Isaura integration**, or when retrieval stays slow after setup.
+This documents a practical cleanup-and-verify workflow for cases where the **initial setup stage fails** during the **Ersilia + Isaura integration**, or when retrieval stays slow after setup.
 
 ---
 
