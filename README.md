@@ -126,38 +126,44 @@ export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
 | 📋 **List available model results**      | `isaura inspect -m eos8a4x -v v1  -o reports/available.csv`                                      | List all available inputs or files related to a model/version.                                            |
 | 📚 **Catalog project models**    | `isaura catalog -pn myproject`                                                                 | Display all models within a project                                    |
 
-### Troubleshooting Initial Setup Failures (Ersilia ↔ Isaura Integration)
+<br>
 
-This guide lists practical cleanup + restart steps to resolve failures during the **initial setup stage** of the **Ersilia + Isaura integration**, especially when retrieval stays slow after setup.
 
----
 
-#### When to use this
+## Ersilia ↔ Isaura Integration: Initial Setup Failure Troubleshooting
 
-Use these steps if you see any of the following:
-
-* Setup fails during first-time initialization
-* Models don’t load correctly
-* Retrieval is slow even after a successful run
-* You suspect stale buckets/volumes/containers are causing inconsistent behavior
+This README documents a practical cleanup-and-verify workflow for cases where the **initial setup stage fails** during the **Ersilia + Isaura integration**, or when retrieval stays slow after setup.
 
 ---
 
-### Prerequisites
+### What this helps with
 
-* You have access to:
+Typical symptoms:
 
-  * Local MinIO console at `http://localhost:9000/`
-  * Docker (for containers/images)
-  * Isaura CLI (`isaura`)
-  * Ersilia CLI (`ersilia`)
-* You know the model ID you’re testing (e.g. `eosxxxx`)
+* Setup fails early / won’t complete cleanly
+* NN server failed for some reason
+* Old model artifacts keep getting reused unexpectedly
+* Milvus index/collection looks wrong or stale or not index built in Milvus
+* Retrieval remains slow even after a successful run
 
 ---
 
-### Step-by-step troubleshooting
+### Components involved (local)
 
-#### 1) Clean stale model artifacts from MinIO
+* **MinIO console** (buckets): `http://localhost:9000/`
+* **Milvus** (index/collections): `http://localhost:8080/`
+
+---
+
+### ⚠️ Important warning
+
+These steps delete local data (buckets, containers/images, volumes). Only proceed if you’re okay wiping local state and rebuilding.
+
+---
+
+## Step-by-step recovery workflow
+
+### 1) Clean model artifacts from MinIO buckets
 
 1. Open: `http://localhost:9000/`
 2. In each of these buckets:
@@ -165,57 +171,92 @@ Use these steps if you see any of the following:
    * `isaura-public`
    * `isaura-private`
    * `ersilia`
-3. Locate the **model of interest** and **remove its stored artifacts** (select → remove).
+3. Find the model you’re troubleshooting (e.g., `eosxxxx`) and **remove its stored artifacts** (select → delete).
 
-This helps eliminate stale cached model files and index artifacts that can break or slow setup.
+This helps ensure you’re not reusing stale or corrupted objects.
 
 ---
 
-#### 2) Remove old Milvus volumes (local data reset)
-
-If you’re using local Milvus storage, remove old volumes:
+### 2) Remove old Milvus volumes (local storage reset)
 
 ```bash
 sudo rm -rf ~/isaura
 ```
 
-⚠️ **Warning:** This deletes local Isaura/Milvus persisted state.
+This resets local persisted Milvus/Isaura state (if your deployment uses that path).
 
 ---
 
-#### 3) Remove Isaura-related Docker images and containers
+### 3) Remove Isaura-related Docker containers/images
 
-Remove all containers and images related to:
+Check what’s running / installed:
 
-* Milvus
-* `ersiliaos/nns`
+```bash
+docker ps
+docker images
+```
 
-Use your usual Docker cleanup approach (stop/remove containers, then remove images).
-This is meant to guarantee you’re not running with stale layers or a broken container state.
+Remove problematic containers:
+
+```bash
+docker rm -f <container_id>
+```
+
+Remove images (examples):
+
+```bash
+docker rmi ersiliaos/nns
+docker rmi milvus
+```
+
+If you suspect the container is just stuck, you can restart instead:
+
+```bash
+docker restart <container_id>
+```
 
 ---
 
-#### 4) Restart the Milvus container
+### 4) Inspect Milvus collection/index contents
 
-After cleanup, restart Milvus so it comes up fresh and healthy.
+To inspect the contents/metadata for a Milvus collection:
 
-(If you manage Milvus via `docker compose`, restart through that; otherwise restart the container directly.)
+```bash
+curl -X POST "http://localhost:8080/info?collection=eosxxxx_v1" | jq
+```
+
+Replace `eosxxxx_v1` with your real collection name.
 
 ---
 
-#### 5) Reinstall Isaura and reinitialize the engine
+### 5) Restart the Milvus container
 
-If there were any changes (or you suspect version/config mismatch), reinstall Isaura, then run:
+If Milvus is running but behaving inconsistently, restart it:
+
+```bash
+docker restart <milvus_container_id>
+```
+
+(Use `docker ps` to locate the container ID/name.)
+
+---
+
+### 6) Reinstall Isaura and re-run engine setup
+
+If anything changed (or state is inconsistent), reinstall Isaura in ersilia venv or its own venv, then run:
+
+```bash
+pip uninstall isaura
+pip install git+https://github.com/ersilia-os/isaura.git
+```
 
 ```bash
 isaura engine -s
 ```
 
-This reboots the Isaura engine setup path and recreates needed runtime state.
-
 ---
 
-#### 6) Re-serve the model and run a retrieval test
+### 7) Serve the model and run a batch inference test
 
 Serve the model:
 
@@ -223,7 +264,7 @@ Serve the model:
 ersilia serve eosxxxx -rs -ws -a public
 ```
 
-Run a batch test:
+Run inference:
 
 ```bash
 ersilia run -i input.csv -o output.csv -b 10000
@@ -231,31 +272,48 @@ ersilia run -i input.csv -o output.csv -b 10000
 
 ---
 
-#### 7) Run it twice and compare performance
+### 8) Run it twice to validate retrieval performance
 
-Run the same `ersilia run ...` command **two times**.
+Run the same inference command **two times**.
 
-Expected behavior:
-
-* **First run:** may be slower (initial indexing/warmup)
-* **Second run:** should show **fast retrieval**
-
-If the **second run is still slow**, the issue is likely not resolved.
+* The **second run should be fast** (i.e., retrieval/caching kicks in).
+* If the **second run is still slow**, the issue is likely not resolved.
 
 ---
 
-### If it’s still slow after the second run
+#### Expected outcome
 
-At that point:
+After cleanup + rebuild, you should see:
+
+* Clean model artifacts in buckets
+* Milvus collection present and consistent
+* First run: slower (index/build/warm-up)
+* Second run: **fast retrieval**
+
+---
+
+#### If it’s still broken
+
+If the second run is not fast:
 
 * Contact the admin
 * Open an issue with:
 
-  * the model ID (`eosxxxx`)
-  * logs from Milvus + Isaura + Ersilia (startup + run)
-  * confirmation you cleaned MinIO buckets and removed `~/isaura`
+  * What model (`eosxxxx`) and collection name (`eosxxxx_v1`)
+  * Output of:
 
-#### API usage examples
+    * `docker ps`
+    * `curl -X POST "http://localhost:8080/info?collection=..." | jq`
+  * Any errors from:
+
+    * `isaura engine -s`
+    * `ersilia serve ...`
+    * `ersilia run ...`
+
+---
+
+
+### API usage examples
 ```python
 from isaura.manage import (
     IsauraWriter,
