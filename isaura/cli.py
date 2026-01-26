@@ -1,4 +1,4 @@
-import sys
+import datetime, os, sys
 
 import rich_click as click
 import rich_click.rich_click as rc
@@ -12,6 +12,7 @@ from isaura.manage import (
   IsauraInspect,
   IsauraPull,
   IsauraPush,
+  IsauraStat,
 )
 from isaura.helpers import (
   DEFAULT_BUCKET_NAME,
@@ -101,6 +102,22 @@ opt_start = click.option(
   is_flag=True,
   default=False,
   help="Specifies to start isuara main engines such as minio, milvus, nns server.",
+)
+
+opt_isaura_dir = click.option(
+  "--isaura-dir",
+  "-d",
+  required=False,
+  default=".",
+  show_default=True,
+  help="Path to an isaura folder (used mainly to resolve output defaults).",
+)
+
+opt_stats_outdir = click.option(
+  "--output-dir",
+  "-o",
+  required=True,
+  help="Folder where the stats JSON will be written.",
 )
 
 
@@ -201,9 +218,8 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
 @cli.command("catalog")
 @apply_opts(opt_project, opt_cloud)
 def cmd_inspect_models(project_name, cloud):
-  insp = IsauraInspect(model_id="_", model_version="_", cloud=cloud)
+  insp = IsauraInspect(cloud=cloud)
   rows = insp.inspect_models(project_name, prefix_filter="")
-  print(rows)
   if not rows:
     console.print(f"[yellow]No models found in {project_name}[/]")
     return
@@ -213,6 +229,22 @@ def cmd_inspect_models(project_name, cloud):
     rows,
   )
   console.print(table)
+
+
+@cli.command("stats")
+@apply_opts(opt_project, opt_access, opt_cloud, opt_stats_outdir, opt_isaura_dir)
+def cmd_stats(project_name, access, cloud, output_dir, isaura_dir):
+  ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+  out_path = os.path.join(output_dir, f"isaura_stats_{ts}.json")
+
+  st = IsauraStat(
+    project_name=project_name,
+    access=access,
+    cloud=cloud,
+    endpoint=None,
+  )
+  written = st.write_json(out_path)
+  logger.info(f"isaura stats wrote: {written}")
 
 
 if __name__ == "__main__":

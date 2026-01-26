@@ -1,5 +1,5 @@
-import csv, json, os, shutil, sys, time, uuid
-
+import csv, datetime, json, os, shutil, sys, time, uuid
+from collections import defaultdict, Counter
 import pandas as pd
 from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio
 from isaura.helpers import (
@@ -17,6 +17,7 @@ from isaura.helpers import (
   MINIO_PRIV_CLOUD_AK as mcpak,
   MINIO_PRIV_CLOUD_SK as mcpsk,
   logger,
+  fetch_schema_from_github,
   get_acc_key,
   get_apprx,
   get_base,
@@ -67,7 +68,7 @@ class IsauraChecker(AbstractContextManager):
 
   def seen_many(self, vs):
     return self.bi.seen_many(vs)
-  
+
   def register(self, v, rc=None):
     self.bi.register(v, rc=rc)
     self._added += 1
@@ -303,142 +304,6 @@ class IsauraReader:
     return out
 
 
-class IsauraInspect:
-  def __init__(self, model_id, model_version, cloud, project_name=None, access="both"):
-    self.mid, self.mv, self.proj, self.acc, self.cloud = model_id, model_version, project_name, access, cloud
-    self.base = get_base(self.mid, self.mv)
-    self.idx_key = get_idx_key(self.base)
-    endpoint = MINIO_ENDPOINT_CLOUD if cloud else None
-    self.s = MinioStore(endpoint=endpoint)
-    logger.info(f"inspect init model={self.mid} version={self.mv} project={self.proj} access={self.acc}")
-
-  def _buckets(self):
-    return (
-      [self.proj]
-      if self.proj
-      else ([PUB] if self.acc == "public" else [PRI] if self.acc == "private" else [PUB, PRI])
-    )
-
-  def _idx(self, b):
-    try:
-      if self.cloud and b == PUB:
-        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
-      if self.cloud and b == PRI:
-        self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
-      o = self.s.client.get_object(Bucket=b, Key=self.idx_key)
-      d = json.loads(o["Body"].read().decode("utf-8"))
-      logger.info(f"loaded index: bucket={b} entries={len(d)}")
-      return d
-    except Exception as e:
-      logger.warning(e)
-      return None
-
-  def _union(self):
-    if self.proj:
-      try:
-        d = self._idx(self.proj)
-      except Exception as e:
-        raise RuntimeError(f"project bucket not available or missing index.json: {self.proj} ({e})")
-      return {s: self.proj for s in d.keys()}
-    own = {}
-    for b in self._buckets():
-      try:
-        for s in self._idx(b).keys():
-          own[s] = b
-      except Exception as e:
-        logger.info(f"no index in {b}: {e}")
-    return own
-
-  def _candidate_buckets(self):
-    if self.proj:
-      return [self.proj]
-    if self.acc == "public":
-      return [PUB]
-    if self.acc == "private":
-      return [PRI]
-    return [PUB, PRI]
-
-  def _load_indices_union(self):
-    buckets = self._candidate_buckets()
-    union = {}
-    owners = {}
-    for b in buckets:
-      idx = self._idx(b)
-      if idx:
-        for smi in idx.keys():
-          if smi not in union:
-            union[smi] = True
-            owners[smi] = b
-    return union, owners
-
-  def list_available(self, output_csv=None):
-    _, owner = self._load_indices_union()
-    rows = [{"input": smi, "bucket": b} for smi, b in owner.items()]
-    df = pd.DataFrame(rows)
-    if output_csv:
-      df.to_csv(output_csv, index=False)
-      logger.info(f"inspect list wrote={len(df)} path={output_csv}")
-    return df
-
-  def inspect_inputs(self, input_csv, output_csv=None):
-    own = self._union()
-    with open(input_csv, newline="", encoding="utf-8") as f:
-      wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
-    logger.info(f"parsed inputs csv={input_csv} count={len(wanted)}")
-    df = pd.DataFrame([{"input": s, "available": s in own, "bucket": own.get(s, "")} for s in wanted])
-    if output_csv:
-      df.to_csv(output_csv, index=False)
-      logger.info(f"inspect inputs wrote={len(df)} path={output_csv}")
-    return df
-
-  def inspect_models(self, project_name, prefix_filter=""):
-    if self.cloud and project_name == PUB:
-      self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcak, secret=mcsk)
-    if self.cloud and project_name == PRI:
-      self.s = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mcpak, secret=mcpsk)
-    c = self.s.client
-    rows = []
-    p = c.get_paginator("list_objects_v2")
-
-    def list_prefixes(pref):
-      try:
-        for page in p.paginate(Bucket=project_name, Prefix=pref, Delimiter="/"):
-          for cp in page.get("CommonPrefixes", []):
-            yield cp["Prefix"]
-      except Exception as e:
-        logger.error(e)
-
-    def count_chunks(base):
-      tr = set()
-      ch = 0
-      for page in p.paginate(Bucket=project_name, Prefix=base):
-        for obj in page.get("Contents", []):
-          k = obj["Key"]
-          if "/chunk_" in k and k.endswith(".parquet"):
-            ch += 1
-            i = k.find("data")
-            if i != -1:
-              tr.add(k[i:].split("/")[0])
-      return len(tr), ch
-
-    for m_pref in list_prefixes(""):
-      model = m_pref.strip("/")
-      if prefix_filter and not model.startswith(prefix_filter):
-        continue
-      for v_pref in list_prefixes(m_pref):
-        ver = v_pref[len(m_pref) :].strip("/")
-        try:
-          obj = c.get_object(Bucket=project_name, Key=get_idx_key(get_base(model, ver)))
-          idx = json.loads(obj["Body"].read().decode("utf-8"))
-          entries = len(idx)
-        except Exception as e:
-          logger.error(e)
-          entries = 0
-        tr, ch = count_chunks(get_pref(model, ver))
-        rows.append({"model": get_pref(model, ver), "entries": entries, "chunks": ch})
-    return rows
-
-
 class IsauraCopy(_BaseTransfer):
   def copy(self):
     meta_local, meta = self._load_metadata()
@@ -533,3 +398,243 @@ class IsauraPush:
         secrete=mcs,
       ) as w:
         w.write(df=df)
+
+
+class IsauraInspect:
+  def __init__(
+    self, model_id=None, model_version=None, cloud=False, project_name=None, access="both", endpoint=None
+  ):
+    self.model_id, self.model_version = model_id, model_version
+    self.cloud, self.project_name, self.access = cloud, project_name, access
+    self.endpoint = MINIO_ENDPOINT_CLOUD if cloud else endpoint
+    self._cache = {}
+
+  def buckets(self):
+    if self.project_name:
+      return [self.project_name]
+    if self.access == "public":
+      return [PUB]
+    if self.access == "private":
+      return [PRI]
+    return [PUB, PRI]
+
+  def _creds(self, bucket):
+    if not self.cloud:
+      return {"endpoint": self.endpoint}
+    if bucket == PUB:
+      return {"endpoint": MINIO_ENDPOINT_CLOUD, "access": mcak, "secret": mcsk}
+    if bucket == PRI:
+      return {"endpoint": MINIO_ENDPOINT_CLOUD, "access": mcpak, "secret": mcpsk}
+    return {"endpoint": MINIO_ENDPOINT_CLOUD}
+
+  def _clients(self, bucket):
+    k = (bucket, self.cloud, self.endpoint)
+    if k not in self._cache:
+      c = self._creds(bucket)
+      self._cache[k] = (MinioStore(**c), DuckDBMinio(**c))
+    return self._cache[k]
+
+  def _paginator(self, bucket):
+    return self._clients(bucket)[0].client.get_paginator("list_objects_v2")
+
+  def list_prefixes(self, bucket, prefix=""):
+    p = self._paginator(bucket)
+    for page in p.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+      for cp in page.get("CommonPrefixes", []):
+        yield cp["Prefix"]
+
+  def list_objects(self, bucket, prefix=""):
+    p = self._paginator(bucket)
+    for page in p.paginate(Bucket=bucket, Prefix=prefix):
+      for obj in page.get("Contents", []):
+        yield obj["Key"]
+
+  def get_json(self, bucket, key):
+    store = self._clients(bucket)[0]
+    try:
+      o = store.client.get_object(Bucket=bucket, Key=key)
+      return json.loads(o["Body"].read().decode("utf-8"))
+    except Exception:
+      return None
+
+  def iter_models(self, bucket, prefix_filter=""):
+    if self.model_id:
+      m = self.model_id
+      if self.model_version:
+        yield m, self.model_version
+        return
+      for v_pref in self.list_prefixes(bucket, f"{m}/"):
+        mv = v_pref[len(f"{m}/") :].strip("/")
+        if mv:
+          yield m, mv
+      return
+
+    for m_pref in self.list_prefixes(bucket, ""):
+      mid = m_pref.strip("/")
+      if prefix_filter and not mid.startswith(prefix_filter):
+        continue
+      for v_pref in self.list_prefixes(bucket, m_pref):
+        mv = v_pref[len(m_pref) :].strip("/")
+        if mv:
+          yield mid, mv
+
+  def load_index(self, bucket, model_id, model_version):
+    return self.get_json(bucket, get_idx_key(get_base(model_id, model_version))) or {}
+
+  def load_metadata(self, bucket, model_id, model_version):
+    base = get_base(model_id, model_version)
+    return self.get_json(bucket, f"{base}/{ACCESS_FILE}")
+
+  def _indices_union(self):
+    union, owner = {}, {}
+    for b in self.buckets():
+      for mid, mv in self.iter_models(b):
+        idx = self.load_index(b, mid, mv)
+        for smi in idx.keys():
+          if smi not in union:
+            union[smi] = True
+            owner[smi] = b
+    return union, owner
+
+  def list_available(self, output_csv=None):
+    _, owner = self._indices_union()
+    df = pd.DataFrame([{"input": smi, "bucket": b} for smi, b in owner.items()])
+    if output_csv:
+      df.to_csv(output_csv, index=False)
+    return df
+
+  def inspect_inputs(self, input_csv, output_csv=None):
+    _, owner = self._indices_union()
+    with open(input_csv, newline="", encoding="utf-8") as f:
+      wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
+    df = pd.DataFrame([{"input": s, "available": s in owner, "bucket": owner.get(s, "")} for s in wanted])
+    if output_csv:
+      df.to_csv(output_csv, index=False)
+    return df
+
+  def inspect_models(self, bucket, prefix_filter=""):
+    return [
+      {
+        "bucket": bucket,
+        "model_id": mid,
+        "model_version": mv,
+        "model": f"{mid}/{mv}",
+        "entries": len(self.load_index(bucket, mid, mv)),
+      }
+      for mid, mv in self.iter_models(bucket, prefix_filter=prefix_filter)
+    ]
+
+  def find_any_chunk_key(self, bucket, model_id, model_version):
+    pref = get_pref(model_id, model_version)
+    for k in self.list_objects(bucket, pref):
+      if "/chunk_" in k and k.endswith(".parquet"):
+        return k
+    return None
+
+  def duckdb_columns(self, bucket, parquet_key):
+    if not parquet_key:
+      return None
+    duck = self._clients(bucket)[1]
+    try:
+      url = f"s3://{bucket}/{parquet_key}"
+      rows = duck.con.execute(f"DESCRIBE SELECT * FROM read_parquet('{url}')").fetchall()
+      return [r[0] for r in rows if r and r[0]]
+    except Exception:
+      return None
+
+
+class IsauraStat:
+  def __init__(
+    self,
+    project_name=None,
+    access="both",
+    cloud=False,
+    endpoint=None,
+    include_columns=True,
+    include_column_names=False,
+    schema_version="1",
+    producer="isaura stats",
+  ):
+    self.insp = IsauraInspect(cloud=cloud, project_name=project_name, access=access, endpoint=endpoint)
+    self.include_columns = bool(include_columns)
+    self.include_column_names = bool(include_column_names)
+    self.schema_version = str(schema_version)
+    self.producer = str(producer)
+
+  def _percentile(self, sorted_vals, p):
+    if not sorted_vals:
+      return None
+    n = len(sorted_vals)
+    i = int(round((p / 100.0) * (n - 1)))
+    i = max(0, min(i, n - 1))
+    return sorted_vals[i]
+
+  def compute(self):
+    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    buckets = self.insp.buckets()
+
+    models = []
+    models_per_molecule = Counter()
+    models_total_by_bucket = defaultdict(int)
+
+    for b in buckets:
+      for mid, mv in self.insp.iter_models(b):
+        idx = self.insp.load_index(b, mid, mv)
+        for smi in idx.keys():
+          models_per_molecule[smi] += 1
+
+        meta_out = fetch_schema_from_github(mid)
+
+        cols = None
+        ncols = None
+        if self.include_columns:
+          ck = self.insp.find_any_chunk_key(b, mid, mv)
+          cols = self.insp.duckdb_columns(b, ck) if ck else None
+          ncols = len(cols) if cols else None
+
+        row = {
+          "bucket": b,
+          "model_id": mid,
+          "model_version": mv,
+          "model_key": f"{b}:{mid}:{mv}",
+          "model": f"{mid}/{mv}",
+          "molecules": len(idx),
+          "n_columns": ncols,
+          "metadata": meta_out,
+        }
+        if self.include_column_names:
+          row["columns"] = cols
+
+        models.append(row)
+        models_total_by_bucket[b] += 1
+
+    counts = sorted(models_per_molecule.values())
+    hist = Counter(counts)
+    hist_out = [{"models": k, "molecules": v} for k, v in sorted(hist.items(), key=lambda x: x[0])]
+
+    return {
+      "schema_version": self.schema_version,
+      "producer": self.producer,
+      "generated_at_utc": generated_at,
+      "buckets": buckets,
+      "models_total": len(models),
+      "models_total_by_bucket": dict(models_total_by_bucket),
+      "models": models,
+      "models_per_molecule": {
+        "molecules_total_unique": len(models_per_molecule),
+        "min": min(counts) if counts else None,
+        "max": max(counts) if counts else None,
+        "p50": self._percentile(counts, 50),
+        "p95": self._percentile(counts, 95),
+        "histogram": hist_out,
+      },
+    }
+
+  def write_json(self, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tmp = output_path + ".tmp"
+    data = self.compute()
+    with open(tmp, "w", encoding="utf-8") as f:
+      json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, output_path)
+    return output_path

@@ -1,5 +1,6 @@
-import os, pandas as pd, numpy as np, json, math, os, psutil, requests, subprocess, sys, tempfile, time
+import os, pandas as pd, numpy as np, json, math, os, psutil, requests, subprocess, sys, tempfile, time, yaml
 from contextlib import contextmanager
+from io import StringIO
 from collections import defaultdict
 from loguru import logger
 from typing import TypeVar, Optional
@@ -44,7 +45,10 @@ BUILD_MAX_WAIT = 1.0
 
 MW_BINS = [200, 500]
 LOGP_BINS = [-1, 5]
-
+GITHUB_ORG = "ersilia-os"
+GITHUB_CONTENT_URL = f"https://raw.githubusercontent.com/{GITHUB_ORG}"
+METADATA_JSON = "metadata.json"
+METADATA_YML = "metadata.yml"
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 TIMEOUT = os.getenv("TIMEOUT", 3600)
@@ -70,8 +74,27 @@ BATCH = int(os.getenv("BATCH", 10_000))
 FLUSH_EVERY = os.getenv("FLUSH_EVERY", 10_000)
 proc = psutil.Process(os.getpid())
 
+# metdata keys
+MKEYS = [
+  "Status",
+  "Deployment",
+  "Source",
+  "Source Type",
+  "Subtask",
+  "Output",
+  "Output Dimension",
+  "Tag",
+  "Biomedical Area",
+  "Target Organism",
+  "Publication Type",
+  "Publication Year",
+]
+
+_INT_KEYS = {"Output Dimension", "Publication Year"}
+
 
 # fmt: off
+def get(mid, file): return requests.get(f"{GITHUB_CONTENT_URL}/{mid}/main/{file}")
 def get_base(mdi, ver): return f"{get_pref(mdi, ver)}/tranches"
 def get_desc(pref, wanted): return f"Fetching hive partitions {pref} ({len(wanted)} inputs)"
 def get_files_glob(bucket, base): return f"s3://{bucket}/{base}/*/chunk_*.parquet"
@@ -90,6 +113,38 @@ def avail_mem(): return int(psutil.virtual_memory().available)
 def mem_gb_lim(ratio=0.8, floor_gb=1): return max(floor_gb, int(avail_mem() * ratio / (1024**3)))
 def cpu_cnt(ratio=0.6): return max(1, int(math.floor((os.cpu_count() or 1) * ratio)))
 # fmt: on
+
+
+def pick_meta(d: dict) -> dict:
+  f = (
+    lambda v: None
+    if v is None
+    else (None if (isinstance(v, list) and not v) else (v[0] if isinstance(v, list) else v))
+  )
+  out = {}
+  for k in MKEYS:
+    v = f(d.get(k))
+    if v is None:
+      out[k] = None
+      continue
+    if k in _INT_KEYS:
+      try:
+        out[k] = int(v)
+        continue
+      except:
+        pass
+    out[k] = str(v)
+  return out
+
+
+def fetch_schema_from_github(model_id):
+  try:
+    response = get(model_id, METADATA_JSON)
+    data = json.load(StringIO(response.text))
+  except:
+    response = get(model_id, METADATA_YML)
+    data = yaml.safe_load(StringIO(response.text))
+  return pick_meta(data)
 
 
 def run_docker_compose(up=True):
