@@ -23,6 +23,12 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv  
+    load_dotenv(override=False)    
+except Exception:
+    pass
+
 logger.remove()
 console = Console()
 logger.level("DEBUG", color="<cyan><bold>")
@@ -49,6 +55,9 @@ GITHUB_ORG = "ersilia-os"
 GITHUB_CONTENT_URL = f"https://raw.githubusercontent.com/{GITHUB_ORG}"
 METADATA_JSON = "metadata.json"
 METADATA_YML = "metadata.yml"
+
+
+
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 TIMEOUT = os.getenv("TIMEOUT", 3600)
@@ -60,9 +69,11 @@ MINIO_CLOUD_AK = os.getenv("MINIO_CLOUD_AK", None)
 MINIO_CLOUD_SK = os.getenv("MINIO_CLOUD_SK", None)
 MINIO_PRIV_CLOUD_AK = os.getenv("MINIO_PRIV_CLOUD_AK", None)
 MINIO_PRIV_CLOUD_SK = os.getenv("MINIO_PRIV_CLOUD_SK", None)
+
 isaura_temp = os.path.join(Path.home(), "isaura", "isaura-temp")
 if not os.path.exists(isaura_temp):
-  os.makedirs(isaura_temp)
+    os.makedirs(isaura_temp)
+
 STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
