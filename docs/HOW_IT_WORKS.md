@@ -1,7 +1,7 @@
 ## How it wotks
 
 <p align="center">
-  <img src="./isaura/assets/isaura_mechanism.png" alt="Isaura logo"><br><br>
+  <img src="../isaura/assets/isaura_mechanism.png" alt="Isaura logo"><br><br>
 </p>
 
 
