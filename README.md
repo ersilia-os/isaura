@@ -1,408 +1,222 @@
-<div id="top"></div>
+<div align="center">
 
-<p align="center">
-  <img src="./isaura/assets/isaura.png" height="110" alt="Isaura logo"><br><br>
-  <img src="https://img.shields.io/badge/python-%3E%3D3.8-blue.svg?style=flat-square&logo=python&logoColor=white" alt="Python >=3.8">
-  <img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square&logo=python&logoColor=white" alt="Code style: Black">
-</p>
+<img src="./isaura/assets/isaura.png" height="120" alt="Isaura logo" />
 
+### Ersilia’s Precalculation Store
 
-<h3 align="center">The Ersilia's Precalculation Store</h3>
+Fast, reproducible access to **precalculated model outputs** from the **Ersilia Model Hub** — with a CLI and Python API built for batch workflows.
 
+<br/>
 
+[![Python](https://img.shields.io/badge/Python-%3E%3D3.8-3776AB?style=flat-square&logo=python&logoColor=white)](#)
+[![uv](https://img.shields.io/badge/uv-supported-111111?style=flat-square&logo=astral&logoColor=white)](https://docs.astral.sh/uv/)
+[![Docker](https://img.shields.io/badge/Docker-required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000?style=flat-square&logo=python&logoColor=white)](https://github.com/psf/black)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](#license)
 
+<br/>
 
-This repository provides an interface and a CLI to the precalculated data available from the Ersilia Model Hub. Initial benchmark is made and can be found [here](BENCHMARK.md). And the detailed mechanism on to how it works [here](HOW_IT_WORKS.md).
+[Quickstart](#quickstart) ·
+[CLI](#cli) ·
+[Python API](#python-api) ·
+[Configuration](#configuration) ·
+[Docs](#docs) ·
+[Contributing](#contributing)
+
+</div>
 
 ---
 
-## Quick start guide
-First install a high-performance python project manager called `uv` based on this [manual](https://docs.astral.sh/uv/getting-started/installation/)
-### 1. Clone the repository
+## Why Isaura?
+Isaura is Ersilia’s precalculation store: it **precomputes and persistently stores model outputs** so researchers can retrieve results instantly instead of repeatedly running expensive inference. This delivers a major research speed-up—especially in low-resource settings where compute, bandwidth, or infrastructure are limited—by turning repeated calculations into reusable shared artifacts. To support equitable access, Ersilia also provides **free access to public precalculations**, making high-value model outputs available even when local compute isn’t.
+
+
+Isaura provides a structured store for model results so you can:
+
+- ⚡ **Skip recomputation** by reusing precalculated outputs
+- 🧱 Keep artifacts **versioned and organized** (model → version → bucket/project)
+- 📦 Store and retrieve results via **S3-compatible object storage (MinIO)**  
+- 🔎 Enable **fast retrieval** using its fast engine developed on top of duckdb and for ANN uses vector search / indexing components (Milvus + NN service)
+
+If you’re integrating Ersilia with Isaura, you typically:
+1) run once (generate/store), then  
+2) subsequent runs become fast (retrieve).
+
+---
+
+## Architecture (high level)
+
+- **MinIO**: artifact store (S3-compatible buckets)
+- **Milvus**: indexing / retrieval support
+- **NN service**: fast approximate retrieval
+- **Isaura CLI / Python API**: read/write/copy/move/inspect tools
+
+See the deep dive: **[How it works →](docs/HOW_IT_WORKS.md)**
+
+---
+
+## Quickstart
+
+### 1) Install dependencies & setup env
+
+We recommend using `uv`.
 
 ```bash
 git clone https://github.com/ersilia-os/isaura.git
 cd isaura
 uv sync
 source .venv/bin/activate
-```
-### 2. Install all isaura services
-#### Prerequisites
+````
 
-- [Docker](https://www.docker.com/get-started) installed and running
-- `docker-compose` ubuntu we need to have them installed. Use this instruction for more detail [here](https://docs.docker.com/engine/install/ubuntu/).
-- `docker-compose` macOS as `brew install docker-compose`
+### 2) Start local services (Docker required)
 
----
-#### Fastest way to start all the services
 ```bash
 isaura engine --start
 ```
 
-#### 3. Install MinIO Client (mc) for fine grained control and management over the object store
+**Local dashboards**
 
-The MinIO Client (`mc`) is a command-line tool to interact with MinIO or any S3-compatible storage.
+* MinIO Console: `http://localhost:9001`
+* Milvus API: `http://localhost:8080`
 
-#### Install (Linux/macOS)
-
-```bash
-curl -O https://dl.min.io/client/mc/release/linux-amd64/mc
-chmod +x mc
-sudo mv mc /usr/local/bin/
-```
-
-#### Or with Homebrew (macOS)
-
-```bash
-brew install minio/stable/mc
-```
+> Default MinIO credentials (local dev):
+>
+> * Username: `minioadmin123`
+> * Password: `minioadmin1234`
 
 ---
 
-#### Configure the MinIO Client
+## CLI
+
+### Common commands
+
+#### Write (upload/store outputs)
 
 ```bash
-mc alias set local http://localhost:9000 minioadmin123 minioadmin1234
+isaura write -i data/ersilia_output.csv -m eos8a4x -v v2 -pn myproject --access public
 ```
-- Example command to list the projects for `local`:
+
+#### Read (download/retrieve outputs)
 
 ```bash
-mc ls local
+isaura read -i data/inputs.csv -m eos8a4x -v v2 -pn myproject -o data/outputs.csv
 ```
 
-You can find more detailed docs [here](https://github.com/minio/mc?tab=readme-ov-file) on how to use `mc`.
+#### Copy artifacts to local directory
 
-#### Access the Web Console
-
-Open your browser and go to:
-👉 [http://localhost:9001](http://localhost:9001)
-
-Login using:
-
-```
-Username: minioadmin123
-Password: minioadmin1234
-```
-
----
-### Cloud functionality usage
-You can export the following env varibles:
-- For read/write the could public data
 ```bash
-export MINIO_CLOUD_AK = <Key here> # access key
-export MINIO_CLOUD_SK = <Key here> # secrete key
+isaura copy -m eos8a4x -v v1 -pn myproject -o ~/Documents/isaura-backup/
 ```
-- For read/write the could private data
+
+#### Inspect available entries
+
 ```bash
-export MINIO_PRIV_CLOUD_AK = <Key here> # access key
-export MINIO_PRIV_CLOUD_SK = <Key here> # secrete key
+isaura inspect -m eos8a4x -v v1 -o reports/available.csv
 ```
 
-
-
-### Command at a Glance
-
-| Command   | Alias | Required Options                                                      | Optional Options                                                                                                                                     | What it does                                                                                                                                       |                        |                                                                           |
-| --------- | ----- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------- |
-| `write`   | —     | `-i/--input-file`, `-m/--model`                                       | `-pn/--project-name`, `--access [public                                                                                                              | private                                                                                                                                            | both]`, `-v/--version` | Upload/write outputs for the given model & version using rows from a CSV. The output csv file should have an input header named `input` not `smiles`. This prevent collision when uploading the results for the second time and better for standardize.  |
-| `read`    | —     | `-i/--input-file`, `-m/--model`                                       | `-pn/--project-name`, `--access`, `-v/--version`, `-o/--output-file`, `-nn`                                                                                 | Read/download results for inputs in a CSV and optionally save as CSV/HDF5.                                                                         |                        |                                                                           |
-| `copy`    | `cp`  | `-m/--model`, `-v/--version`, `-pn/--project-name`, `-o/--output-dir` | —                                                                                                                                                    | Copy all artifacts for a model/version from a project to a local directory. If `-o` is omitted in code, it logs counts; with `-o` it writes files. |                        |                                                                           |
-| `move`    | `mv`  | `-m/--model`, `-v/--version`, `-pn/--project-name`                    | —                                                                                                                                                    | Move/relocate server-side artifacts for a model/version within the project space.                                                                  |                        |                                                                           |
-| `remove`  | `rm`  | `-m/--model`, `-v/--version`, `-pn/--project-name`, `-y/--yes`        | —                                                                                                                                                    | Permanently delete artifacts for a model/version from a project. Safety-guarded by `--yes`.                                                        |                        |                                                                           |
-| `inspect` | —     | `-m/--model`, `-v/--version`, `-o/--output-file`                       | `-pn/--project-name`, `--access`, `-i/--input-file`, `--cloud`| Inspect available items or validate inputs. With `-i`, validates inputs and writes a report; without `-i`, lists available entries.                |                        |                                                                           |
-| `catalog` | —     | `-pn/--project-name`                                                                    |  `--cloud`                                                                                                            | List models present in a project (bucket), optionally filtered by an id prefix.                                                                    |                        |                                                                           |
-
-### Brief CLI usage examples
-> Buckets: are just a storage directory for model calcultaion (just a term used by the minio). 
-
-| **Simple Example**                      | **Command**                                                                                                   | **Description**                                                                                           |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| 🧾 **Write results calculation**           | `isaura write -i data/ersilia_output.csv -m eos8a4x -v v2 -pn myproject --access public`                        | Upload/write outputs(needs to have the input column named as `input`) for the given model and version using a CSV as input.                                |
-| 📥 **Read results**              | `isaura read -i data/inputs.csv -m eos8a4x -v v2 -pn myproject -o data/outputs.csv`                     | Read results corresponding to inputs and save them to an output CSV file.                                 |
-| 📂 **Copy buckets**    | `isaura copy -m eos8a4x -v v1 -pn myproject-private -o ~/Documents/files/`                                     | Copy all model artifacts from a project to a local directory.                                             |
-| 🚚 **Move buckets**            | `isaura move -m eos9876 -v v1 -pn myproject-private`                                                           | Move or relocate artifacts for a specific model/version within the project.                               |
-| 🗑️ **Remove buckets**         | `isaura remove -m eos8a4x -v v1 -pn myproject-private --yes`                                                   | Permanently delete all artifacts for a model/version from a project (requires confirmation with `--yes`). |
-| 🔍 **Inspect inputs (validate)** | `isaura inspect inputs -m eos8a4x -v v1 -pn myproject -i data/inputs.csv -o reports/inspect_report.csv` | Validate input data for a model and output a report.                                                      |
-| 📋 **List available model results**      | `isaura inspect -m eos8a4x -v v1  -o reports/available.csv`                                      | List all available inputs or files related to a model/version.                                            |
-| 📚 **Catalog project models**    | `isaura catalog -pn myproject`                                                                 | Display all models within a project                                    |
-
-<br>
-
-
-
-## Ersilia ↔ Isaura Integration: Initial Setup Failure Troubleshooting
-
-This documents a practical cleanup-and-verify workflow for cases where the **initial setup stage fails** during the **Ersilia + Isaura integration**, or when retrieval stays slow after setup.
 
 ---
 
-### What this helps with
+## Python API
 
-Typical symptoms:
-
-* Setup fails early / won’t complete cleanly
-* NN server failed for some reason
-* Old model artifacts keep getting reused unexpectedly
-* Milvus index/collection looks wrong or stale or not index built in Milvus
-* Retrieval remains slow even after a successful run
-
----
-
-### Components involved (local)
-
-* **MinIO console** (buckets): `http://localhost:9000/`
-* **Milvus** (index/collections): `http://localhost:8080/`
-
----
-
-### ⚠️ Important warning
-
-These steps delete local data (buckets, containers/images, volumes). Only proceed if you’re okay wiping local state and rebuilding.
-
----
-
-## Step-by-step recovery workflow
-
-### 1) Clean model artifacts from MinIO buckets
-
-1. Open: `http://localhost:9000/`
-2. In each of these buckets:
-
-   * `isaura-public`
-   * `isaura-private`
-   * `ersilia`
-3. Find the model you’re troubleshooting (e.g., `eosxxxx`) and **remove its stored artifacts** (select → delete).
-
-This helps ensure you’re not reusing stale or corrupted objects.
-
----
-
-### 2) Remove old Milvus volumes (local storage reset)
-
-```bash
-sudo rm -rf ~/isaura
-```
-
-This resets local persisted Milvus/Isaura state (if your deployment uses that path).
-
----
-
-### 3) Remove Isaura-related Docker containers/images
-
-Check what’s running / installed:
-
-```bash
-docker ps
-docker images
-```
-
-Remove problematic containers:
-
-```bash
-docker rm -f <container_id>
-```
-
-Remove images (examples):
-
-```bash
-docker rmi ersiliaos/nns
-docker rmi milvus
-```
-
-If you suspect the container is just stuck, you can restart instead:
-
-```bash
-docker restart <container_id>
-```
-
----
-
-### 4) Inspect Milvus collection/index contents
-
-To inspect the contents/metadata for a Milvus collection:
-
-```bash
-curl -X POST "http://localhost:8080/info?collection=eosxxxx_v1" | jq
-```
-
-Replace `eosxxxx_v1` with your real collection name.
-
----
-
-### 5) Restart the Milvus container
-
-If Milvus is running but behaving inconsistently, restart it:
-
-```bash
-docker restart <milvus_container_id>
-```
-
-(Use `docker ps` to locate the container ID/name.)
-
----
-
-### 6) Reinstall Isaura and re-run engine setup
-
-If anything changed (or state is inconsistent), reinstall Isaura in ersilia venv or its own venv, then run:
-
-```bash
-pip uninstall isaura
-pip install git+https://github.com/ersilia-os/isaura.git
-```
-
-```bash
-isaura engine -s
-```
-
----
-
-### 7) Serve the model and run a batch inference test
-
-Serve the model:
-
-```bash
-ersilia serve eosxxxx -rs -ws -a public
-```
-
-Run inference:
-
-```bash
-ersilia run -i input.csv -o output.csv -b 10000
-```
-
----
-
-### 8) Run it twice to validate retrieval performance
-
-Run the same inference command **two times**.
-
-* The **second run should be fast** (i.e., retrieval/caching kicks in).
-* If the **second run is still slow**, the issue is likely not resolved.
-
----
-
-#### Expected outcome
-
-After cleanup + rebuild, you should see:
-
-* Clean model artifacts in buckets
-* Milvus collection present and consistent
-* First run: slower (index/build/warm-up)
-* Second run: **fast retrieval**
-
----
-
-#### If it’s still broken
-
-If the second run is not fast:
-
-* Contact the admin
-* Open an issue with:
-
-  * What model (`eosxxxx`) and collection name (`eosxxxx_v1`)
-  * Output of:
-
-    * `docker ps`
-    * `curl -X POST "http://localhost:8080/info?collection=..." | jq`
-  * Any errors from:
-
-    * `isaura engine -s`
-    * `ersilia serve ...`
-    * `ersilia run ...`
-
----
-
-
-### API usage examples
 ```python
-from isaura.manage import (
-    IsauraWriter,
-    IsauraReader,
-    IsauraMover,
-    IsauraCopy,
-    IsauraRemover,
-    IsauraInspect,
-    IsauraPull,
-    IsauraPush,
-)
-
+from isaura.manage import IsauraWriter, IsauraReader
 
 writer = IsauraWriter(
     input_csv="data/input.csv",
     model_id="eos8a4x",
     model_version="v1",
     bucket="my-project",
-    access="public",  # can be 'public', 'private', or 'both'
+    access="public",
 )
 writer.write()
-
 
 reader = IsauraReader(
     model_id="eos8a4x",
     model_version="v1",
     bucket="my-project",
     input_csv="data/query.csv",
-    approximate=False,  # use ANN if True
+    approximate=False,
 )
 reader.read(output_csv="results.csv")
-
-
-puller = IsauraPull(
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-    input_csv="data/ids.csv",
-)
-puller.pull()
-
-
-pusher = IsauraPush(
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-)
-pusher.push()
-
-
-copier = IsauraCopy(
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-    output_dir="backups/",
-)
-copier.copy()
-
-
-mover = IsauraMover(
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-)
-mover.move()
-
-
-remover = IsauraRemover(
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-)
-remover.remove()
-
-
-inspector = IsauraInspect(
-    model_id="eos8a4x",
-    model_version="v1",
-    project_name="my-project",
-    access="public",
-    cloud=False,
-)
-
-# List available inputs
-df_inputs = inspector.list_available(output_file="inputs.csv")
-
-# Inspect specific input CSV
-df_inspected = inspector.inspect_inputs("data/input.csv", "inspected_results.csv")
-
-# Inspect all models in a project
-df_models = inspector.inspect_models("my-project")
 ```
+
+More examples for CLI and API usage: **[API and CLI usage](docs/API_AND_CLI_USAGE.md)**
+
+---
+
+## Configuration
+
+Isaura reads configuration from environment variables.
+
+### Recommended: `.env`
+
+Create a `.env` file in the repo root:
+
+```bash
+MINIO_ENDPOINT=http://127.0.0.1:9000
+NNS_ENDPOINT=http://127.0.0.1:8080
+DEFAULT_BUCKET_NAME=isaura-public
+DEFAULT_PRIVATE_BUCKET_NAME=isaura-private
+```
+
+### Cloud credentials (optional)
+
+```bash
+export MINIO_CLOUD_AK="<access_key>"
+export MINIO_CLOUD_SK="<secret_key>"
+
+export MINIO_PRIV_CLOUD_AK="<access_key>"
+export MINIO_PRIV_CLOUD_SK="<secret_key>"
+```
+
+See the full list: **[CONFIGURATION](docs/CONFIGURATION.md)**
+
+---
+
+## MinIO Client (optional but recommended)
+
+Install `mc` to manage buckets:
+
+```bash
+brew install minio/stable/mc   # macOS
+# or Linux:
+curl -O https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x mc && sudo mv mc /usr/local/bin/
+```
+
+Configure alias:
+
+```bash
+mc alias set local http://localhost:9000 minioadmin123 minioadmin1234
+mc ls local
+```
+
+---
+
+## Docs
+
+* 📘 **How it works**: [here](docs/HOW_IT_WORKS.md)
+* ⚙️ **Configuration**: [here](docs/CONFIGURATION.md)
+* 🧰 **CLI and API reference**: [here](docs/API_AND_CLI_USAGE.md)
+* 🧪 **Benchmark**: [here](docs/BENCHMARK.md)
+* 🩹 **Troubleshooting / recovery**: [here](docs/TROUBLESHOOTING.md)
+
+---
+
+## Contributing
+
+PRs are welcome. Please run format + lint before pushing:
+
+```bash
+uv run ruff format .
+```
+
+If you’re changing CLI behavior, please update **[here](docs/API_AND_CLI_USAGE.md)**.
+
+---
+
+## About the Ersilia Open Source Initiative
+
+The [Ersilia Open Source Initiative](https://ersilia.io) is a tech-nonprofit organization fueling sustainable research in the Global South. Ersilia's main asset is the [Ersilia Model Hub](https://github.com/ersilia-os/ersilia), an open-source repository of AI/ML models for antimicrobial drug discovery.
+
+![Ersilia Logo](isaura/assets/Ersilia_Brand.png)

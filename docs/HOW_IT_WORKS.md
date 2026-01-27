@@ -31,7 +31,7 @@ You provide a **CSV file** containing a list of inputs.
 - **DuckDB** is the query + write engine over Parquet
 - **MinIO** stores Parquet data + indexes
 - **Milvus** stores input fingerprints for approximate search
-- **NNS** is a Go-based REST API sitting in front of Milvus for high-performance ingest/query:
+- **NNS** is a Go-based REST API sitting in front of Milvus for high-performance ingest/query from the Milvus:
   - https://github.com/ersilia-os/nn-search/tree/main/api
 
 ---
