@@ -43,13 +43,17 @@ If you’re integrating Ersilia with Isaura, you typically:
 2) subsequent runs become fast (retrieve).
 
 ---
-
 ## Architecture (high level)
 
-- **MinIO**: artifact store (S3-compatible buckets)
-- **Milvus**: indexing / retrieval support
-- **NN service**: fast approximate retrieval
-- **Isaura CLI / Python API**: read/write/copy/move/inspect tools
+* 📝 **Write path:** `CLI / Python API → MinIO`
+  Precomputed outputs are stored as chunked artifacts (e.g., Parquet) under `model_id/version`, and Isaura updates lightweight registries (index/metadata/bloom) for deduplication and fast lookup.
+
+* 📥 **Read path (exact):** `CLI / Python API → DuckDB query on MinIO → results`
+  Inputs are matched against the index, then the corresponding rows are fetched directly from the stored chunks without downloading everything.
+
+* ⚡ **Read path (approx / ANN, optional):** `CLI / Python API → NN service (+ Milvus) → nearest match → exact fetch from MinIO`
+  For unseen inputs, the NN service finds the closest indexed compound(s); Isaura then retrieves the authoritative stored result from MinIO.
+
 
 See the deep dive: **[How it works →](docs/HOW_IT_WORKS.md)**
 
@@ -169,6 +173,7 @@ export MINIO_CLOUD_SK="<secret_key>"
 export MINIO_PRIV_CLOUD_AK="<access_key>"
 export MINIO_PRIV_CLOUD_SK="<secret_key>"
 ```
+> You can define those credentials in the .env as well
 
 See the full list: **[CONFIGURATION](docs/CONFIGURATION.md)**
 
