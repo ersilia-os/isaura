@@ -103,6 +103,15 @@ MKEYS = [
 
 _INT_KEYS = {"Output Dimension", "Publication Year"}
 
+_KEYMAP = {
+  "Source Type": "SourceType",
+  "Output Dimension": "OutputDimension",
+  "Biomedical Area": "BiomedicalArea",
+  "Target Organism": "TargetOrganism",
+  "Publication Type": "PublicationType",
+  "Publication Year": "PublicationYear",
+}
+
 
 # fmt: off
 def get(mid, file): return requests.get(f"{GITHUB_CONTENT_URL}/{mid}/main/{file}")
@@ -127,34 +136,41 @@ def cpu_cnt(ratio=0.6): return max(1, int(math.floor((os.cpu_count() or 1) * rat
 
 
 def pick_meta(d: dict) -> dict:
-  f = (
-    lambda v: None
-    if v is None
-    else (None if (isinstance(v, list) and not v) else (v[0] if isinstance(v, list) else v))
-  )
+  def first(v):
+    if v is None:
+      return None
+    if isinstance(v, list):
+      return None if not v else v[0]
+    return v
+
   out = {}
   for k in MKEYS:
-    v = f(d.get(k))
+    v = first(d.get(k))
+    kk = _KEYMAP.get(k, k)
+
     if v is None:
-      out[k] = None
+      out[kk] = None
       continue
+
     if k in _INT_KEYS:
       try:
-        out[k] = int(v)
+        out[kk] = int(v)
         continue
       except:
         pass
-    out[k] = str(v)
+
+    out[kk] = str(v)
+
   return out
 
 
 def fetch_schema_from_github(model_id):
   try:
-    response = get(model_id, METADATA_JSON)
-    data = json.load(StringIO(response.text))
+    r = get(model_id, METADATA_JSON)
+    data = json.load(StringIO(r.text))
   except:
-    response = get(model_id, METADATA_YML)
-    data = yaml.safe_load(StringIO(response.text))
+    r = get(model_id, METADATA_YML)
+    data = yaml.safe_load(StringIO(r.text))
   return pick_meta(data)
 
 
