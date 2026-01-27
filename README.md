@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./isaura/assets/isaura.png" height="120" alt="Isaura logo" />
+<img src="./isaura/assets/isaura_v2.png" height="160" alt="Isaura logo" />
 
 ### Ersilia’s Precalculation Store
 
