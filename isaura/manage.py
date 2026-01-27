@@ -364,17 +364,21 @@ class IsauraPush:
       cloud=False,
     )
     df = insp.list_available()
+    if df.empty:
+      logger.error("No data found in any default bucket for a given model! Aborting push.")
+      sys.exit(1)
+      
     files = split_csv(df)
 
     if not files:
-      logger.error("No data found in any default bucket! Aborting pull.")
+      logger.error("No data found in any default bucket! Aborting push.")
       sys.exit(1)
 
     file1 = files[0]
     file2 = files[1] if len(files) > 1 else None
 
     if not file2:
-      logger.warning("Private bucket has no data! Skipping pull for it.")
+      logger.warning("Private bucket has no data! Skipping push for it.")
 
     for access, file, mck, mcs in [("public", file1, mcak, mcsk), ("private", file2, mcpak, mcpsk)]:
       if not file:
