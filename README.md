@@ -38,21 +38,21 @@ Isaura provides a structured store for model results so you can:
 - 📦 Store and retrieve results via **S3-compatible object storage (MinIO)**  
 - 🔎 Enable **fast retrieval** using its fast engine developed on top of duckdb and for ANN uses vector search / indexing components (Milvus + NN service)
 
-If you’re integrating Ersilia with Isaura, you typically:
+If you’re integrating Ersilia with Isaura, you typically (check Ersilia Model Hub for more info [here](https://github.com/ersilia-os/ersilia)):
 1) run once (generate/store), then  
 2) subsequent runs become fast (retrieve).
 
 ---
 ## Architecture (high level)
 
-* 📝 **Write path:** `CLI / Python API → MinIO`
+* 📝 **Write:** `CLI / Python API → MinIO`
   Precomputed outputs are stored as chunked artifacts (e.g., Parquet) under `model_id/version`, and Isaura updates lightweight registries (index/metadata/bloom) for deduplication and fast lookup.
 
-* 📥 **Read path (exact):** `CLI / Python API → DuckDB query on MinIO → results`
-  Inputs are matched against the index, then the corresponding rows are fetched directly from the stored chunks without downloading everything.
+* 📥 **Read(exact):** `CLI / Python API → DuckDB query on MinIO → results`
+  Inputs are matched against the index, then the corresponding rows are fetched directly from the stored chunks.
 
-* ⚡ **Read path (approx / ANN, optional):** `CLI / Python API → NN service (+ Milvus) → nearest match → exact fetch from MinIO`
-  For unseen inputs, the NN service finds the closest indexed compound(s); Isaura then retrieves the authoritative stored result from MinIO.
+* ⚡ **Read (approx / ANN, optional):** `CLI / Python API → NN service (+ Milvus) → nearest match → exact fetch from MinIO`
+  For unseen inputs, the NN service finds the closest indexed compound(s); Isaura then retrieves the corresponding stored result from MinIO.
 
 
 See the deep dive: **[How it works →](docs/HOW_IT_WORKS.md)**
@@ -81,12 +81,12 @@ isaura engine --start
 **Local dashboards**
 
 * MinIO Console: `http://localhost:9001`
-* Milvus API: `http://localhost:8080`
 
-> Default MinIO credentials (local dev):
->
-> * Username: `minioadmin123`
-> * Password: `minioadmin1234`
+**Default MinIO credentials (local dev):**
+```
+Username: minioadmin123
+Password: minioadmin1234
+```
 
 ---
 
@@ -94,13 +94,13 @@ isaura engine --start
 
 ### Common commands
 
-#### Write (upload/store outputs)
+#### Write (store outputs)
 
 ```bash
 isaura write -i data/ersilia_output.csv -m eos8a4x -v v2 -pn myproject --access public
 ```
 
-#### Read (download/retrieve outputs)
+#### Read (retrieve outputs)
 
 ```bash
 isaura read -i data/inputs.csv -m eos8a4x -v v2 -pn myproject -o data/outputs.csv
@@ -125,7 +125,9 @@ isaura inspect -m eos8a4x -v v1 -o reports/available.csv
 
 ```python
 from isaura.manage import IsauraWriter, IsauraReader
-
+```
+Write the precalculation
+```python
 writer = IsauraWriter(
     input_csv="data/input.csv",
     model_id="eos8a4x",
@@ -134,7 +136,9 @@ writer = IsauraWriter(
     access="public",
 )
 writer.write()
-
+```
+Read the stored calculation
+```python
 reader = IsauraReader(
     model_id="eos8a4x",
     model_version="v1",

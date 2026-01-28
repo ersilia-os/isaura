@@ -315,7 +315,7 @@ def start_build_index(collection, nlist=None, rebuild=False, wait=False):
   r.raise_for_status()
   return r.json()
 
-
+# Approximare search helpers
 def ensure_index_ready(collection, max_wait_s=BUILD_MAX_WAIT):
   st = build_index_status(collection)
 
@@ -450,7 +450,7 @@ def tranche_coordinates(smiles):
 
   return row, col, mw, logp
 
-
+# Table + progress bar helpers
 def make_table(title, cols, rows):
   t = Table(title=title)
   for c in cols:
