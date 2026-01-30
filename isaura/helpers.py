@@ -91,6 +91,7 @@ MKEYS = [
   "Deployment",
   "Source",
   "Source Type",
+  "Task",
   "Subtask",
   "Output",
   "Output Dimension",
