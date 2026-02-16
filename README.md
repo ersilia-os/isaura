@@ -70,6 +70,9 @@ git clone https://github.com/ersilia-os/isaura.git
 cd isaura
 uv sync
 source .venv/bin/activate
+# if you have conda env
+# use uv as below
+uv pip install -e . 
 ````
 
 ### 2) Start local services (Docker required)
