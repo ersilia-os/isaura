@@ -1,9 +1,8 @@
 import os, pandas as pd, numpy as np, json, math, os, psutil, requests, subprocess, sys, tempfile, time, yaml
-from contextlib import contextmanager
 from io import StringIO
 from collections import defaultdict
 from loguru import logger
-from typing import TypeVar, Optional
+from typing import TypeVar
 from rich.progress import (
   Progress,
   SpinnerColumn,
@@ -11,8 +10,6 @@ from rich.progress import (
   BarColumn,
   TimeRemainingColumn,
   TimeElapsedColumn,
-  ProgressColumn,
-  Task,
 )
 from rich.text import Text
 from rich.table import Table
@@ -24,10 +21,11 @@ from rdkit.Chem import Descriptors, Crippen
 from pathlib import Path
 
 try:
-    from dotenv import load_dotenv  
-    load_dotenv(override=False)    
+  from dotenv import load_dotenv
+
+  load_dotenv(override=False)
 except Exception:
-    pass
+  pass
 
 logger.remove()
 console = Console()
@@ -57,7 +55,6 @@ METADATA_JSON = "metadata.json"
 METADATA_YML = "metadata.yml"
 
 
-
 COLLECTION = os.getenv("COLLECTION", "eos3b5e")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
 TIMEOUT = os.getenv("TIMEOUT", 3600)
@@ -72,7 +69,7 @@ MINIO_PRIV_CLOUD_SK = os.getenv("MINIO_PRIV_CLOUD_SK", None)
 
 isaura_temp = os.path.join(Path.home(), "isaura", "isaura-temp")
 if not os.path.exists(isaura_temp):
-    os.makedirs(isaura_temp)
+  os.makedirs(isaura_temp)
 
 STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
@@ -194,7 +191,6 @@ def run_docker_compose(up=True):
 
 def show_figlet():
   path = Path(__file__).parent / "assets" / "figlet.txt"
-  print(path)
   text = Path(path).read_text(encoding="utf-8")
   start_color = (0, 255, 255)
   end_color = (255, 0, 255)
@@ -256,10 +252,11 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   return out
 
 
-def group_inputs(wanted, index, force=False):
-  logger.debug(f"Checking {len(wanted)} inputs in the index!")
+def group_inputs(wanted, index, bloom=None, force=False):
+  logger.debug(f"Checking {len(wanted)} inputs in the {len(index)} index!")
   try:
-    miss = [s for s in wanted if s not in index]
+    if bloom:
+      miss = [s for s in wanted if not bloom.seen(s)]
     g = defaultdict(set)
     if miss and not force:
       logger.error(
@@ -315,6 +312,7 @@ def start_build_index(collection, nlist=None, rebuild=False, wait=False):
   )
   r.raise_for_status()
   return r.json()
+
 
 # Approximare search helpers
 def ensure_index_ready(collection, max_wait_s=BUILD_MAX_WAIT):
@@ -451,6 +449,7 @@ def tranche_coordinates(smiles):
 
   return row, col, mw, logp
 
+
 # Table + progress bar helpers
 def make_table(title, cols, rows):
   t = Table(title=title)
@@ -470,34 +469,33 @@ inspect_table = [
 T = TypeVar("T")
 
 
-class RowCountColumn(ProgressColumn):
-  def render(self, task: Task) -> Text:
-    return Text(f"{int(task.completed):,} rows")
+def track_write_progress(rows, total=None, description="Writing rows", console=None):
+  if total is None:
+    progress = Progress(
+      SpinnerColumn(),
+      TextColumn("[progress.description]{task.description}"),
+      TextColumn("{task.completed} rows"),
+      TimeElapsedColumn(),
+      console=console,
+      transient=True,
+    )
+  else:
+    progress = Progress(
+      SpinnerColumn(),
+      TextColumn("[progress.description]{task.description}"),
+      BarColumn(),
+      TextColumn("{task.completed}/{task.total}"),
+      TimeElapsedColumn(),
+      TimeRemainingColumn(),
+      console=console,
+      transient=True,
+    )
 
-
-class RowSpeedColumn(ProgressColumn):
-  def render(self, task: Task) -> Text:
-    return Text(f"{task.speed:,.0f} rows/s" if task.speed else "– rows/s", style="dim")
-
-
-def make_row_progress(transient: bool = True) -> Progress:
-  return Progress(
-    SpinnerColumn(),
-    TextColumn("[bold cyan]{task.fields[desc]}[/]"),
-    BarColumn(),
-    RowCountColumn(),
-    RowSpeedColumn(),
-    TimeElapsedColumn(),
-    TimeRemainingColumn(),
-    transient=transient,
-  )
-
-
-@contextmanager
-def progress(desc: str, total_rows: Optional[int] = None, transient: bool = True):
-  with make_row_progress(transient=transient) as prog:
-    task_id = prog.add_task("rows", total=total_rows, desc=desc)
-    yield prog, task_id
+  with progress:
+    task_id = progress.add_task(description, total=total)
+    for row in rows:
+      yield row
+      progress.advance(task_id, 1)
 
 
 def spinner(message, fn, *args, **kwargs):
@@ -520,12 +518,18 @@ class Logger:
       rich_handler = RichHandler(
         rich_tracebacks=True, markup=True, log_time_format="%H:%M:%S", show_path=False
       )
+      self._rich_console = rich_handler.console
+
       self._console = self.logger.add(
         rich_handler,
         format="{message}",
         colorize=True,
       )
 
+  @property
+  def console(self):
+    return self._rich_console
+  
   def _unlog_from_console(self):
     if self._console is not None:
       try:

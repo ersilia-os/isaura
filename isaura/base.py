@@ -9,6 +9,8 @@ from isaura.helpers import (
   BLOOM_FILENAME,
   ACCESS_FILE,
   INDEX_FILE,
+  DEFAULT_BUCKET_NAME as pub_bucket,
+  DEFAULT_PRIVATE_BUCKET_NAME as priv_bucket,
   logger,
   get_acc_key,
   get_base,
@@ -27,8 +29,8 @@ from isaura.helpers import (
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from collections import defaultdict
-
-
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from pybloom_live import ScalableBloomFilter
 
 
@@ -95,7 +97,8 @@ class MinioStore:
     try:
       self.client.download_file(bucket, key, local, Config=self.transfer_config)
     except Exception as e:
-      logger.warning(f"The file {key} is not found in bucket {bucket}. Operation Abort!. Details -> {e}")
+      logger.warning(f"The file {key} is not found in bucket {bucket}. Details -> {e}")
+      raise
 
   def upload_file(self, local, bucket, key, extra_args=None):
     self.client.upload_file(local, bucket, key, ExtraArgs=extra_args or {}, Config=self.transfer_config)
@@ -169,13 +172,13 @@ class BloomIndex:
     base_prefix,
     local_dir,
     bloom_filename=BLOOM_FILENAME,
-    error_rate=0.001,
+    error_rate=1e-14,
     initial_capacity=1_000_000,
   ):
     self.store = store
     self.bucket = bucket
     self.base = base_prefix.strip("/")
-    self.bloom_key = f"{self.base}/{BLOOM_FILENAME}"
+    self.bloom_key = f"{self.base}/{bloom_filename}"
     self.index_key = f"{self.base}/{INDEX_FILE}"
     self.local_bloom = os.path.join(local_dir, bloom_filename)
     self.local_index = os.path.join(local_dir, "index.json")
@@ -206,7 +209,9 @@ class BloomIndex:
     return v in self.sbf
 
   def seen_many(self, vs):
-    return {v: [self.seen(v), self.bucket] for v in vs}
+    sbf = self.sbf
+    b = self.bucket
+    return {v: [v in sbf, b] for v in vs}
 
   def rc(self, v):
     return self.index.get(v)
@@ -380,6 +385,18 @@ class TrancheState:
       start += take
 
 
+@dataclass
+class AddRowsStats:
+  in_count: int
+  added: int = 0
+  skipped_seen: int = 0
+  skipped_blank: int = 0
+  skipped_error: int = 0
+  sample_seen: List[Any] = field(default_factory=list)
+  sample_errors: List[Dict[str, Any]] = field(default_factory=list)
+  new_rows: List[Dict[str, Any]] = field(default_factory=list)
+
+
 class _SinkWriter:
   def __init__(self, store, bucket, model_id, model_version, tmpdir):
     self.store = store
@@ -395,21 +412,81 @@ class _SinkWriter:
     self.buffers = defaultdict(list)
 
   def add_rows(self, r, c, df):
-    if df.empty:
+    try:
+      if df is None or df.empty:
+        logger.info(f"[add_rows] tranche=({r},{c}) df is empty -> added=0")
+        return 0
+
+      stats = AddRowsStats(in_count=len(df))
+
+      logger.info(
+        f"[add_rows] tranche=({r},{c}) in={stats.in_count} "
+        f"bucket={getattr(self, 'bucket', None)} bloom_bucket={getattr(self.bi, 'bucket', None)}"
+      )
+
+      for i, row in df.iterrows():
+        smi: Optional[str] = None
+        try:
+          smi = row.get("input") if hasattr(row, "get") else row["input"]
+          smi = (smi or "").strip() if isinstance(smi, str) else smi
+
+          if not smi:
+            stats.skipped_blank += 1
+            continue
+
+          if not self.bi.seen(smi):
+            stats.new_rows.append(dict(row))
+            self.bi.register(smi, rc=(r, c))
+            stats.added += 1
+          else:
+            stats.skipped_seen += 1
+            if len(stats.sample_seen) < 3:
+              stats.sample_seen.append(smi)
+
+        except Exception as e:
+          stats.skipped_error += 1
+          if len(stats.sample_errors) < 3:
+            stats.sample_errors.append({"row_idx": i, "smi": smi, "err": repr(e)})
+          logger.info(f"[add_rows] tranche=({r},{c}) row_idx={i} smi={smi!r} -> skipped due to error: {e}")
+
+      if not stats.new_rows:
+        logger.info(
+          f"[add_rows] tranche=({r},{c}) in={stats.in_count} added=0 "
+          f"skipped_seen={stats.skipped_seen} skipped_blank={stats.skipped_blank} skipped_error={stats.skipped_error} "
+          f"{'sample_seen=' + str(stats.sample_seen) if stats.sample_seen else ''} "
+          f"{'sample_errors=' + str(stats.sample_errors) if stats.sample_errors else ''}"
+        )
+        return 0
+
+      try:
+        self.buffers[(r, c)].extend(stats.new_rows)
+      except Exception as e:
+        logger.info(
+          f"[add_rows] tranche=({r},{c}) failed to extend buffer with {len(stats.new_rows)} rows: {e}"
+        )
+        return stats.added
+
+      buf_len = len(self.buffers[(r, c)])
+      logger.info(
+        f"[add_rows] tranche=({r},{c}) in={stats.in_count} added={stats.added} "
+        f"skipped_seen={stats.skipped_seen} skipped_blank={stats.skipped_blank} skipped_error={stats.skipped_error} "
+        f"buffer={buf_len}/{self.max_rows}"
+      )
+
+      if buf_len >= self.max_rows:
+        try:
+          logger.info(f"[add_rows] tranche=({r},{c}) buffer reached max_rows -> flushing {buf_len} rows")
+          self.tranche.flush(self.buffers[(r, c)], list(df.keys()))
+          self.buffers[(r, c)].clear()
+          logger.info(f"[add_rows] tranche=({r},{c}) flush complete -> buffer cleared")
+        except Exception as e:
+          logger.error(f"[add_rows] tranche=({r},{c}) flush FAILED (buffer kept, len={buf_len}): {e}")
+
+      return stats.added
+
+    except Exception as e:
+      logger.error(f"[add_rows] tranche=({r},{c}) FATAL error: {e}")
       return 0
-    new_rows = []
-    for _, row in df.iterrows():
-      smi = row["input"]
-      if smi and not self.bi.seen(smi):
-        new_rows.append(dict(row))
-        self.bi.register(smi, rc=(r, c))
-    if not new_rows:
-      return 0
-    self.buffers[(r, c)].extend(new_rows)
-    if len(self.buffers[(r, c)]) >= self.max_rows:
-      self.tranche.flush(r, c, self.buffers[(r, c)], list(df.keys()))
-      self.buffers[(r, c)].clear()
-    return len(new_rows)
 
   def finalize(self, metadata_local=None, schema_cols=None):
     for k in list(self.buffers.keys()):
@@ -435,10 +512,18 @@ class _BaseTransfer:
     self.collection = get_coll(self.model_id, self.model_version)
     self.store = MinioStore()
     self.tmpdir = make_temp("isaura_xfer_")
+    self.tmpdir_sinkw = make_temp("isaura_sinkw_")
     self.duck = DuckDBMinio(
       endpoint=self.store.endpoint,
       access=self.store.access,
       secret=self.store.secret,
+    )
+    self.bi = BloomIndex(
+      self.store,
+      self.bucket,
+      self.tranches,
+      self.tmpdir,
+      bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
     )
 
   def _download_if_exists(self, key, local):
@@ -468,7 +553,7 @@ class _BaseTransfer:
     with open(local, "r", encoding="utf-8") as f:
       return json.load(f), local
 
-  def select_rows(self, r, c, wanted, input_col="input"):
+  def select_rows(self, wanted, input_col="input"):
     return query(self.duck.con, input_col, wanted, get_files_glob(self.bucket, self.tranches))
 
   def _delete(self):
@@ -476,7 +561,7 @@ class _BaseTransfer:
 
   def _pull(self, df, index):
     input = df["input"].astype(str).to_list()
-    gp = group_inputs(input, index, force=True)
+    gp = group_inputs(input, index, bloom=self.bi, force=True)
     wt = _SinkWriter(self.store, self.bucket, self.model_id, self.model_version, self.tmpdir)
     tp, tu, dfs = 0, 0, []
     if gp is None:
@@ -525,25 +610,29 @@ class _BaseTransfer:
       if (d.get("access") or "").lower() == "public" and (d.get("input") or "").strip()
     ]
     index, _ = self._load_index()
-    gp = group_inputs(priv, index) if priv else {}
-    gu = group_inputs(pub, index) if pub else {}
+    self.bi.bucket = priv_bucket
+    gp = group_inputs(priv, index, bloom=self.bi) if priv else {}
+    self.bi.bucket = pub_bucket
+    gu = group_inputs(pub, index, bloom=self.bi) if pub else {}
     w_priv = (
-      _SinkWriter(self.store, "isaura-private", self.model_id, self.model_version, self.tmpdir)
+      _SinkWriter(self.store, priv_bucket, self.model_id, self.model_version, self.tmpdir_sinkw)
       if gp
       else None
     )
     w_pub = (
-      _SinkWriter(self.store, "isaura-public", self.model_id, self.model_version, self.tmpdir) if gu else None
+      _SinkWriter(self.store, pub_bucket, self.model_id, self.model_version, self.tmpdir_sinkw)
+      if gu
+      else None
     )
     tp, tu, dfs = 0, 0, []
     for (r, c), want in gp.items():
-      df = self.select_rows(r, c, want)
+      df = self.select_rows(want)
       _tp = w_priv.add_rows(r, c, df)
       if _tp != 0:
         dfs.append(df)
       tp += _tp
     for (r, c), want in gu.items():
-      df = self.select_rows(r, c, want)
+      df = self.select_rows(want)
       _tu = w_pub.add_rows(r, c, df)
       if _tu != 0:
         dfs.append(df)

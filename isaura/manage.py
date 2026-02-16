@@ -31,6 +31,7 @@ from isaura.helpers import (
   split_csv,
   spinner,
   tranche_coordinates,
+  track_write_progress,
   write_access_file,
 )
 
@@ -130,12 +131,12 @@ class IsauraWriter:
       self.store.download_file(self.bucket, self.access_key, local)
       with open(local, "r", encoding="utf-8") as f:
         return json.load(f)
-    except Exception as e:
+    except Exception:
       return None
     finally:
       try:
         os.remove(local)
-      except:
+      except Exception:
         pass
 
   def _upload_metadata(self, inputs):
@@ -160,35 +161,65 @@ class IsauraWriter:
       self.tranche.flush(buf, self.schema_cols)
       self.buffers[(r, c)].clear()
 
-  def write(self, df=None):
+  def write(self, df=None, show_progress: bool = True):
     total = dupes = 0
     new, buffs = [], []
-    rows = df.to_dict("records") if df is not None else None
-    if rows is None:
-      with open(self.input_csv, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    for row in rows:
-      self._set_schema(row)
-      smi = (row.get("input") or row.get("smiles") or "").strip()
-      if not smi:
-        continue
-      if self.bi.seen(smi):
-        dupes += 1
-        continue
-      try:
-        r, c, _, _ = tranche_coordinates(smi)
-        if r < 1 or c < 1:
-          raise ValueError("Tranche coordinates must be >= 1")
-      except Exception:
-        logger.warning("invalid SMILES or tranche mapping; skipped")
-        continue
-      new.append(smi)
-      self.buffers[(r, c)].append(dict(row))
-      self.bi.register(smi, rc=(r, c))
-      total += 1
-      self._flush_if_needed(r, c)
-      if self.bi._added >= int(CHECKPOINT_EVERY):
-        self.bi.persist()
+
+    rows_iter, total_rows = None, None
+
+    if df is not None:
+      rows_list = df.to_dict("records")
+      rows_iter = rows_list
+      total_rows = len(rows_list)
+    else:
+      f = open(self.input_csv, newline="", encoding="utf-8")
+      reader = csv.DictReader(f)
+      rows_iter = reader
+      total_rows = None
+
+    try:
+      if show_progress:
+        rows_iter = track_write_progress(
+          rows_iter,
+          total=total_rows,
+          description="Writing rows",
+          console=logger.console,
+        )
+
+      for row in rows_iter:
+        self._set_schema(row)
+        smi = (row.get("input") or row.get("smiles") or "").strip()
+        if not smi:
+          continue
+
+        if not self.bi.seen(smi):
+          try:
+            r, c, _, _ = tranche_coordinates(smi)
+            if r < 1 or c < 1:
+              raise ValueError("Tranche coordinates must be >= 1")
+          except Exception:
+            logger.warning("invalid SMILES or tranche mapping; skipped")
+            continue
+
+          new.append(smi)
+          self.buffers[(r, c)].append(dict(row))
+          self.bi.register(smi, rc=(r, c))
+          total += 1
+
+          self._flush_if_needed(r, c)
+          if self.bi._added >= int(CHECKPOINT_EVERY):
+            self.bi.persist()
+        else:
+          dupes += 1
+          continue
+
+    finally:
+      if df is None and "f" in locals():
+        try:
+          f.close()
+        except Exception:
+          pass
+
     for (r, c), buf in list(self.buffers.items()):
       if buf:
         buffs.extend(buf)
@@ -196,14 +227,16 @@ class IsauraWriter:
 
     self.tranche.flush(buffs, self.schema_cols)
     self.bi.persist()
+
     if new:
       self._upload_metadata(new)
+
     logger.info(f"write done: new={total} dupes={dupes}")
 
   def close(self):
     try:
       shutil.rmtree(self.tmpdir)
-    except:
+    except Exception:
       pass
 
   def __enter__(self):
@@ -238,6 +271,13 @@ class IsauraReader:
     self.tmpdir = make_temp("isaura_reader_")
     self.store = MinioStore(endpoint=self.endpoint, access=access_key, secret=secrete)
     self.duck = DuckDBMinio(endpoint=self.endpoint, access=access_key, secret=secrete)
+    self.bi = BloomIndex(
+      self.store,
+      self.bucket,
+      self.base,
+      self.tmpdir,
+      bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
+    )
     logger.info(f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv}")
 
   def _load_index(self):
@@ -279,7 +319,7 @@ class IsauraReader:
       et = time.perf_counter()
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
     header = list(header_set)[0] if header_set else "smiles"
-    group_inputs(wanted, index)
+    group_inputs(wanted, index, bloom=self.bi)
     if not wanted:
       return pd.DataFrame()
     try:
@@ -367,7 +407,7 @@ class IsauraPush:
     if df.empty:
       logger.error("No data found in any default bucket for a given model! Aborting push.")
       sys.exit(1)
-      
+
     files = split_csv(df)
 
     if not files:
