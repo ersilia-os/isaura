@@ -1,4 +1,10 @@
 import boto3, duckdb, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys, uuid
+from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+from pybloom_live import ScalableBloomFilter
 
 from isaura.helpers import (
   MINIO_ENDPOINT,
@@ -26,12 +32,88 @@ from isaura.helpers import (
   cpu_cnt,
 )
 
-from botocore.config import Config
-from boto3.s3.transfer import TransferConfig
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-from pybloom_live import ScalableBloomFilter
+class _S3RangeFile:
+    def __init__(self, client, bucket, key, size, block_size=262144):
+        self._client = client
+        self._bucket = bucket
+        self._key = key
+        self._size = int(size or 0)
+        self._block_size = int(block_size)
+        self._pos = 0
+        self._cache = {}
+        self.closed = False
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            new_pos = int(offset)
+        elif whence == 1:
+            new_pos = int(self._pos + offset)
+        elif whence == 2:
+            new_pos = int(self._size + offset)
+        else:
+            raise ValueError("invalid whence")
+        if new_pos < 0:
+            new_pos = 0
+        if new_pos > self._size:
+            new_pos = self._size
+        self._pos = new_pos
+        return self._pos
+
+    def _get_block(self, block_idx):
+        if block_idx in self._cache:
+            return self._cache[block_idx]
+        start = block_idx * self._block_size
+        if start >= self._size:
+            data = b""
+            self._cache[block_idx] = data
+            return data
+        end = min(self._size - 1, start + self._block_size - 1)
+        resp = self._client.get_object(
+            Bucket=self._bucket, Key=self._key, Range=f"bytes={start}-{end}"
+        )
+        body = resp["Body"].read()
+        try:
+            resp["Body"].close()
+        except Exception:
+            pass
+        self._cache[block_idx] = body
+        return body
+
+    def read(self, n=-1):
+        if self.closed:
+            return b""
+        if n is None or n < 0:
+            n = self._size - self._pos
+        n = int(n)
+        if n <= 0 or self._pos >= self._size:
+            return b""
+        end_pos = min(self._size, self._pos + n)
+        out = bytearray()
+        while self._pos < end_pos:
+            block_idx = self._pos // self._block_size
+            block_off = self._pos % self._block_size
+            block = self._get_block(block_idx)
+            if not block:
+                break
+            take = min(len(block) - block_off, end_pos - self._pos)
+            if take <= 0:
+                break
+            out += block[block_off : block_off + take]
+            self._pos += take
+        return bytes(out)
+
+    def close(self):
+        self.closed = True
+        self._cache.clear()
 
 
 class MinioStore:
