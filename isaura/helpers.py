@@ -204,7 +204,7 @@ def show_figlet():
     gradient.append(ch, style=f"rgb({r},{g},{b})")
   print()
   console.print(gradient, justify="center")
-  console.print(Text(f"Version 2.0.1", style="bold bright_black"), justify="center")
+  console.print(Text(f"[🚀] [New] Version 2.1.16", style="bold bright_black"), justify="center")
   print()
 
 
