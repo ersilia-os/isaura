@@ -279,17 +279,35 @@ class IsauraReader:
 
   def _load_index(self):
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
-    self.store.download_file(self.bucket, self.index_key, local)
+    downloaded = False
+
     try:
-      with open(local, "r", encoding="utf-8") as f:
-        return json.load(f)
-    except Exception as e:
-      logger.error(e)
+      try:
+        self.store.download_file(self.bucket, self.index_key, local)
+        downloaded = True
+      except Exception as e:
+        logger.error(
+          f"Exception occurred when downloading the index "
+          f"(bucket={self.bucket}, key={self.index_key}, local={local}): {e}"
+        )
+        return []
+
+      if not downloaded or not os.path.exists(local):
+        return []
+
+      try:
+        with open(local, "r", encoding="utf-8") as f:
+          return json.load(f)
+      except Exception as e:
+        logger.error(f"Exception occurred when reading/parsing index JSON (local={local}): {e}")
+        return []
+
     finally:
       try:
-        os.remove(local)
-      except:
-        pass
+        if os.path.exists(local):
+          os.remove(local)
+      except Exception as e:
+        logger.error(f"Exception occurred when removing temp index file (local={local}): {e}")
 
   def read(self, output_csv=None, df=None):
     index = self._load_index()
@@ -441,278 +459,273 @@ class IsauraPush:
         w.write(df=df)
 
 
-
 class IsauraInspect:
-    def __init__(
-        self,
-        model_id=None,
-        model_version=None,
-        cloud=False,
-        project_name=None,
-        access="both",
-        endpoint=None,
-        parquet_block_size=262144,
-        max_small_json_bytes=20000000,
-        heavy_index=False,
-    ):
-        self.model_id, self.model_version = model_id, model_version
-        self.cloud, self.project_name, self.access = cloud, project_name, access
-        self.endpoint = MINIO_ENDPOINT_CLOUD if cloud else endpoint
-        self.parquet_block_size = int(parquet_block_size)
-        self.max_small_json_bytes = int(max_small_json_bytes)
-        self.heavy_index = bool(heavy_index)
-        self._cache = {}
-        self._rowcount_cache = {}
+  def __init__(
+    self,
+    model_id=None,
+    model_version=None,
+    cloud=False,
+    project_name=None,
+    access="both",
+    endpoint=None,
+    parquet_block_size=262144,
+    max_small_json_bytes=20000000,
+    heavy_index=False,
+  ):
+    self.model_id, self.model_version = model_id, model_version
+    self.cloud, self.project_name, self.access = cloud, project_name, access
+    self.endpoint = MINIO_ENDPOINT_CLOUD if cloud else endpoint
+    self.parquet_block_size = int(parquet_block_size)
+    self.max_small_json_bytes = int(max_small_json_bytes)
+    self.heavy_index = bool(heavy_index)
+    self._cache = {}
+    self._rowcount_cache = {}
 
-    def buckets(self):
-        if self.project_name:
-            return [self.project_name]
-        if self.access == "public":
-            return [PUB]
-        if self.access == "private":
-            return [PRI]
-        return [PUB, PRI]
+  def buckets(self):
+    if self.project_name:
+      return [self.project_name]
+    if self.access == "public":
+      return [PUB]
+    if self.access == "private":
+      return [PRI]
+    return [PUB, PRI]
 
-    def _creds(self, bucket):
-        if not self.cloud:
-            return {"endpoint": self.endpoint}
-        if bucket == PUB:
-            return {"endpoint": MINIO_ENDPOINT_CLOUD, "access": mcak, "secret": mcsk}
-        if bucket == PRI:
-            return {"endpoint": MINIO_ENDPOINT_CLOUD, "access": mcpak, "secret": mcpsk}
-        return {"endpoint": MINIO_ENDPOINT_CLOUD}
+  def _creds(self, bucket):
+    if not self.cloud:
+      return {"endpoint": self.endpoint}
+    if bucket == PUB:
+      return {"endpoint": MINIO_ENDPOINT_CLOUD, "access": mcak, "secret": mcsk}
+    if bucket == PRI:
+      return {"endpoint": MINIO_ENDPOINT_CLOUD, "access": mcpak, "secret": mcpsk}
+    return {"endpoint": MINIO_ENDPOINT_CLOUD}
 
-    def _clients(self, bucket):
-        k = (bucket, self.cloud, self.endpoint)
-        if k not in self._cache:
-            c = self._creds(bucket)
-            self._cache[k] = (MinioStore(**c),)
-        return self._cache[k]
+  def _clients(self, bucket):
+    k = (bucket, self.cloud, self.endpoint)
+    if k not in self._cache:
+      c = self._creds(bucket)
+      self._cache[k] = (MinioStore(**c),)
+    return self._cache[k]
 
-    def _client(self, bucket):
-        return self._clients(bucket)[0].client
+  def _client(self, bucket):
+    return self._clients(bucket)[0].client
 
-    def _paginator(self, bucket):
-        return self._client(bucket).get_paginator("list_objects_v2")
+  def _paginator(self, bucket):
+    return self._client(bucket).get_paginator("list_objects_v2")
 
-    def list_prefixes(self, bucket, prefix=""):
-        p = self._paginator(bucket)
-        for page in p.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-            for cp in page.get("CommonPrefixes", []):
-                yield cp["Prefix"]
+  def list_prefixes(self, bucket, prefix=""):
+    p = self._paginator(bucket)
+    for page in p.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+      for cp in page.get("CommonPrefixes", []):
+        yield cp["Prefix"]
 
-    def list_objects(self, bucket, prefix=""):
-        p = self._paginator(bucket)
-        for page in p.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                yield obj["Key"]
+  def list_objects(self, bucket, prefix=""):
+    p = self._paginator(bucket)
+    for page in p.paginate(Bucket=bucket, Prefix=prefix):
+      for obj in page.get("Contents", []):
+        yield obj["Key"]
 
-    def iter_object_meta(self, bucket, prefix=""):
-        p = self._paginator(bucket)
-        for page in p.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                yield {
-                    "Key": obj.get("Key", ""),
-                    "Size": obj.get("Size", 0),
-                    "LastModified": obj.get("LastModified"),
-                    "ETag": obj.get("ETag"),
-                    "StorageClass": obj.get("StorageClass"),
-                }
+  def iter_object_meta(self, bucket, prefix=""):
+    p = self._paginator(bucket)
+    for page in p.paginate(Bucket=bucket, Prefix=prefix):
+      for obj in page.get("Contents", []):
+        yield {
+          "Key": obj.get("Key", ""),
+          "Size": obj.get("Size", 0),
+          "LastModified": obj.get("LastModified"),
+          "ETag": obj.get("ETag"),
+          "StorageClass": obj.get("StorageClass"),
+        }
 
-    def get_json(self, bucket, key, max_bytes=None):
-        client = self._client(bucket)
-        lim = self.max_small_json_bytes if max_bytes is None else int(max_bytes)
-        try:
-            try:
-                h = client.head_object(Bucket=bucket, Key=key)
-                if h and int(h.get("ContentLength", 0) or 0) > lim:
-                    return None
-            except Exception:
-                pass
-            o = client.get_object(Bucket=bucket, Key=key)
-            body = o["Body"].read()
-            try:
-                o["Body"].close()
-            except Exception:
-                pass
-            return json.loads(body.decode("utf-8"))
-        except Exception:
-            return None
+  def get_json(self, bucket, key, max_bytes=None):
+    client = self._client(bucket)
+    lim = self.max_small_json_bytes if max_bytes is None else int(max_bytes)
+    try:
+      try:
+        h = client.head_object(Bucket=bucket, Key=key)
+        if h and int(h.get("ContentLength", 0) or 0) > lim:
+          return None
+      except Exception:
+        pass
+      o = client.get_object(Bucket=bucket, Key=key)
+      body = o["Body"].read()
+      try:
+        o["Body"].close()
+      except Exception:
+        pass
+      return json.loads(body.decode("utf-8"))
+    except Exception:
+      return None
 
-    def iter_models(self, bucket, prefix_filter=""):
-        if self.model_id:
-            m = self.model_id
-            if self.model_version:
-                yield m, self.model_version
-                return
-            for v_pref in self.list_prefixes(bucket, f"{m}/"):
-                mv = v_pref[len(f"{m}/") :].strip("/")
-                if mv:
-                    yield m, mv
-            return
+  def iter_models(self, bucket, prefix_filter=""):
+    if self.model_id:
+      m = self.model_id
+      if self.model_version:
+        yield m, self.model_version
+        return
+      for v_pref in self.list_prefixes(bucket, f"{m}/"):
+        mv = v_pref[len(f"{m}/") :].strip("/")
+        if mv:
+          yield m, mv
+      return
 
-        for m_pref in self.list_prefixes(bucket, ""):
-            mid = m_pref.strip("/")
-            if prefix_filter and not mid.startswith(prefix_filter):
-                continue
-            for v_pref in self.list_prefixes(bucket, m_pref):
-                mv = v_pref[len(m_pref) :].strip("/")
-                if mv:
-                    yield mid, mv
+    for m_pref in self.list_prefixes(bucket, ""):
+      mid = m_pref.strip("/")
+      if prefix_filter and not mid.startswith(prefix_filter):
+        continue
+      for v_pref in self.list_prefixes(bucket, m_pref):
+        mv = v_pref[len(m_pref) :].strip("/")
+        if mv:
+          yield mid, mv
 
-    def load_index(self, bucket, model_id, model_version):
-        base = get_base(model_id, model_version)
-        key = get_idx_key(base)
-        if self.heavy_index or not self.cloud:
-            return self.get_json(bucket, key, max_bytes=10**18) or {}
-        return {}
+  def load_index(self, bucket, model_id, model_version):
+    base = get_base(model_id, model_version)
+    key = get_idx_key(base)
+    if self.heavy_index or not self.cloud:
+      return self.get_json(bucket, key, max_bytes=10**18) or {}
+    return {}
 
-    def load_metadata(self, bucket, model_id, model_version):
-        base = get_base(model_id, model_version)
-        return self.get_json(bucket, f"{base}/{ACCESS_FILE}")
+  def load_metadata(self, bucket, model_id, model_version):
+    base = get_base(model_id, model_version)
+    return self.get_json(bucket, f"{base}/{ACCESS_FILE}")
 
-    def _indices_union(self):
-        union, owner = {}, {}
-        for b in self.buckets():
-            for mid, mv in self.iter_models(b):
-                idx = self.load_index(b, mid, mv)
-                for smi in idx.keys():
-                    if smi not in union:
-                        union[smi] = True
-                        owner[smi] = b
-        return union, owner
+  def _indices_union(self):
+    union, owner = {}, {}
+    for b in self.buckets():
+      for mid, mv in self.iter_models(b):
+        idx = self.load_index(b, mid, mv)
+        for smi in idx.keys():
+          if smi not in union:
+            union[smi] = True
+            owner[smi] = b
+    return union, owner
 
-    def list_available(self, output_csv=None):
-        _, owner = self._indices_union()
-        df = pd.DataFrame([{"input": smi, "bucket": b} for smi, b in owner.items()])
-        if output_csv:
-            df.to_csv(output_csv, index=False)
-        return df
+  def list_available(self, output_csv=None):
+    _, owner = self._indices_union()
+    df = pd.DataFrame([{"input": smi, "bucket": b} for smi, b in owner.items()])
+    if output_csv:
+      df.to_csv(output_csv, index=False)
+    return df
 
-    def inspect_inputs(self, input_csv, output_csv=None):
-        _, owner = self._indices_union()
-        with open(input_csv, newline="", encoding="utf-8") as f:
-            wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
-        df = pd.DataFrame([{"input": s, "available": s in owner, "bucket": owner.get(s, "")} for s in wanted])
-        if output_csv:
-            df.to_csv(output_csv, index=False)
-        return df
+  def inspect_inputs(self, input_csv, output_csv=None):
+    _, owner = self._indices_union()
+    with open(input_csv, newline="", encoding="utf-8") as f:
+      wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
+    df = pd.DataFrame([{"input": s, "available": s in owner, "bucket": owner.get(s, "")} for s in wanted])
+    if output_csv:
+      df.to_csv(output_csv, index=False)
+    return df
 
-    def find_chunk_keys(self, bucket, model_id, model_version):
-        pref = get_pref(model_id, model_version)
-        for obj in self.iter_object_meta(bucket, pref):
-            k = obj.get("Key") or ""
-            if "/chunk_" in k and k.endswith(".parquet"):
-                yield k, int(obj.get("Size") or 0)
+  def find_chunk_keys(self, bucket, model_id, model_version):
+    pref = get_pref(model_id, model_version)
+    for obj in self.iter_object_meta(bucket, pref):
+      k = obj.get("Key") or ""
+      if "/chunk_" in k and k.endswith(".parquet"):
+        yield k, int(obj.get("Size") or 0)
 
-    def parquet_num_rows(self, bucket, parquet_key, size=None):
-        if pq is None or not parquet_key:
-            return None
-        ck = (bucket, parquet_key)
-        if ck in self._rowcount_cache:
-            return self._rowcount_cache[ck]
-        client = self._client(bucket)
-        try:
-            if size is None:
-                h = client.head_object(Bucket=bucket, Key=parquet_key)
-                size = int(h.get("ContentLength", 0) or 0)
-            size = int(size or 0)
-            if size <= 0:
-                return None
-            f = _S3RangeFile(
-                client,
-                bucket,
-                parquet_key,
-                size=size,
-                block_size=self.parquet_block_size,
-            )
-            pf = pq.ParquetFile(f)
-            md = pf.metadata
-            n = int(md.num_rows) if md is not None else None
-            try:
-                f.close()
-            except Exception:
-                pass
-            if n is not None:
-                self._rowcount_cache[ck] = n
-            return n
-        except Exception:
-            return None
-
-    def entries_from_chunks(self, bucket, model_id, model_version):
-        total = 0
-        n_chunks = 0
-        for k, sz in self.find_chunk_keys(bucket, model_id, model_version):
-            n_chunks += 1
-            n = self.parquet_num_rows(bucket, k, size=sz)
-            if n is not None:
-                total += int(n)
-        return total, n_chunks
-
-    def inspect_models(self, bucket, prefix_filter=""):
-        out = []
-        for mid, mv in self.iter_models(bucket, prefix_filter=prefix_filter):
-            if self.cloud and not self.heavy_index:
-                entries, chunks = self.entries_from_chunks(bucket, mid, mv)
-                out.append(
-                    {
-                        "bucket": bucket,
-                        "model_id": mid,
-                        "model_version": mv,
-                        "model": f"{mid}/{mv}",
-                        "entries": int(entries),
-                        "chunks": int(chunks),
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "bucket": bucket,
-                        "model_id": mid,
-                        "model_version": mv,
-                        "model": f"{mid}/{mv}",
-                        "entries": len(self.load_index(bucket, mid, mv)),
-                        "chunks": None,
-                    }
-                )
-        return out
-
-    def find_any_chunk_key(self, bucket, model_id, model_version):
-        pref = get_pref(model_id, model_version)
-        for k in self.list_objects(bucket, pref):
-            if "/chunk_" in k and k.endswith(".parquet"):
-                return k
+  def parquet_num_rows(self, bucket, parquet_key, size=None):
+    if pq is None or not parquet_key:
+      return None
+    ck = (bucket, parquet_key)
+    if ck in self._rowcount_cache:
+      return self._rowcount_cache[ck]
+    client = self._client(bucket)
+    try:
+      if size is None:
+        h = client.head_object(Bucket=bucket, Key=parquet_key)
+        size = int(h.get("ContentLength", 0) or 0)
+      size = int(size or 0)
+      if size <= 0:
         return None
+      f = _S3RangeFile(
+        client,
+        bucket,
+        parquet_key,
+        size=size,
+        block_size=self.parquet_block_size,
+      )
+      pf = pq.ParquetFile(f)
+      md = pf.metadata
+      n = int(md.num_rows) if md is not None else None
+      try:
+        f.close()
+      except Exception:
+        pass
+      if n is not None:
+        self._rowcount_cache[ck] = n
+      return n
+    except Exception:
+      return None
 
-    def parquet_columns(self, bucket, parquet_key):
-        if not parquet_key or pq is None:
-            return None
-        client = self._client(bucket)
-        try:
-            h = client.head_object(Bucket=bucket, Key=parquet_key)
-            size = int(h.get("ContentLength", 0) or 0)
-            if size <= 0:
-                return None
-            f = _S3RangeFile(
-                client,
-                bucket,
-                parquet_key,
-                size=size,
-                block_size=self.parquet_block_size,
-            )
-            pf = pq.ParquetFile(f)
-            cols = list(pf.schema_arrow.names)
-            try:
-                f.close()
-            except Exception:
-                pass
-            return cols
-        except Exception:
-            return None
-        
-    def duckdb_columns(self, bucket, parquet_key):
-        return self.parquet_columns(bucket, parquet_key)
-    
+  def entries_from_chunks(self, bucket, model_id, model_version):
+    total = 0
+    n_chunks = 0
+    for k, sz in self.find_chunk_keys(bucket, model_id, model_version):
+      n_chunks += 1
+      n = self.parquet_num_rows(bucket, k, size=sz)
+      if n is not None:
+        total += int(n)
+    return total, n_chunks
+
+  def inspect_models(self, bucket, prefix_filter=""):
+    out = []
+    for mid, mv in self.iter_models(bucket, prefix_filter=prefix_filter):
+      if self.cloud and not self.heavy_index:
+        entries, chunks = self.entries_from_chunks(bucket, mid, mv)
+        out.append({
+          "bucket": bucket,
+          "model_id": mid,
+          "model_version": mv,
+          "model": f"{mid}/{mv}",
+          "entries": int(entries),
+          "chunks": int(chunks),
+        })
+      else:
+        out.append({
+          "bucket": bucket,
+          "model_id": mid,
+          "model_version": mv,
+          "model": f"{mid}/{mv}",
+          "entries": len(self.load_index(bucket, mid, mv)),
+          "chunks": None,
+        })
+    return out
+
+  def find_any_chunk_key(self, bucket, model_id, model_version):
+    pref = get_pref(model_id, model_version)
+    for k in self.list_objects(bucket, pref):
+      if "/chunk_" in k and k.endswith(".parquet"):
+        return k
+    return None
+
+  def parquet_columns(self, bucket, parquet_key):
+    if not parquet_key or pq is None:
+      return None
+    client = self._client(bucket)
+    try:
+      h = client.head_object(Bucket=bucket, Key=parquet_key)
+      size = int(h.get("ContentLength", 0) or 0)
+      if size <= 0:
+        return None
+      f = _S3RangeFile(
+        client,
+        bucket,
+        parquet_key,
+        size=size,
+        block_size=self.parquet_block_size,
+      )
+      pf = pq.ParquetFile(f)
+      cols = list(pf.schema_arrow.names)
+      try:
+        f.close()
+      except Exception:
+        pass
+      return cols
+    except Exception:
+      return None
+
+  def duckdb_columns(self, bucket, parquet_key):
+    return self.parquet_columns(bucket, parquet_key)
+
 
 class IsauraStat:
   def __init__(
