@@ -8,7 +8,7 @@ Fast, reproducible access to **precalculated model outputs** from the **Ersilia 
 
 <br/>
 
-[![Python](https://img.shields.io/badge/Python-%3E%3D3.8-3776AB?style=flat-square&logo=python&logoColor=white)](#)
+[![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB?style=flat-square&logo=python&logoColor=white)](#)
 [![uv](https://img.shields.io/badge/uv-supported-111111?style=flat-square&logo=astral&logoColor=white)](https://docs.astral.sh/uv/)
 [![Docker](https://img.shields.io/badge/Docker-required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000?style=flat-square&logo=python&logoColor=white)](https://github.com/psf/black)
@@ -16,7 +16,7 @@ Fast, reproducible access to **precalculated model outputs** from the **Ersilia 
 
 <br/>
 
-[Quickstart](#quickstart) ·
+[Installation](#installation) ·
 [CLI](#cli) ·
 [Python API](#python-api) ·
 [Configuration](#configuration) ·
@@ -59,33 +59,89 @@ See the deep dive: **[How it works →](docs/HOW_IT_WORKS.md)**
 
 ---
 
-## Quickstart
+## Installation
 
-### 1) Install dependencies & setup env
+### Prerequisites
 
-We recommend using `uv`.
+Before installing Isaura, make sure you have the following:
+
+- **Python 3.10+** — [download here](https://www.python.org/downloads/)
+- **Git** — used to download the project ([download here](https://git-scm.com/downloads))
+- **Docker** — required to run local services like MinIO. [Download Docker Desktop](https://www.docker.com/products/docker-desktop/)
+
+---
+
+### Option A: Standard install *(recommended for most users)*
+
+This is the simplest path. Open a terminal and run the following commands one by one.
+
+**1. Clone the repository** — this downloads the project to your computer:
+
+```bash
+git clone https://github.com/ersilia-os/isaura.git
+```
+
+**2. Navigate into the project folder:**
+
+```bash
+cd isaura
+```
+
+**3. Install Isaura:**
+
+```bash
+pip install -e .
+```
+
+The `-e` flag installs it in "editable" mode, meaning any changes you make to the source code are reflected immediately without reinstalling.
+
+---
+
+### Option B: Install with uv *(recommended for developers)*
+
+[uv](https://docs.astral.sh/uv/) is a faster alternative to pip. If you don't have it yet, [install it first](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 git clone https://github.com/ersilia-os/isaura.git
 cd isaura
 uv sync
-source .venv/bin/activate
-# if you have conda env
-# use uv as below
-uv pip install -e . 
-````
+source .venv/bin/activate  # on Windows: .venv\Scripts\activate
+```
 
-### 2) Start local services (Docker required)
+`uv sync` creates an isolated virtual environment and installs all dependencies automatically.
+
+To install into an existing environment (e.g. conda) instead:
+
+```bash
+uv pip install -e .
+```
+
+---
+
+### Verify installation
+
+Once installed, confirm everything is working by running:
+
+```bash
+isaura --help
+```
+
+You should see the list of available commands printed to your terminal.
+
+---
+
+### Start local services
+
+Isaura relies on local infrastructure (MinIO for storage, and optionally Milvus + NNS for approximate search). Make sure Docker is running, then start everything with:
 
 ```bash
 isaura engine --start
 ```
 
-**Local dashboards**
+Local dashboards once running:
+- MinIO Console: `http://localhost:9001`
 
-* MinIO Console: `http://localhost:9001`
-
-**Default MinIO credentials (local dev):**
+Default local credentials:
 ```
 Username: minioadmin123
 Password: minioadmin1234
@@ -120,6 +176,48 @@ isaura copy -m eos8a4x -v v1 -pn myproject -o ~/Documents/isaura-backup/
 ```bash
 isaura inspect -m eos8a4x -v v1 -o reports/available.csv
 ```
+
+#### Upload to cloud store
+
+The cloud only hosts two canonical buckets: `isaura-public` and `isaura-private`. If your local work uses a custom project name, you need to copy (or move) it into the appropriate canonical bucket first, then push to cloud.
+
+**Step 1 — write outputs to your local project:**
+
+```bash
+isaura write -i data/ersilia_output.csv -m eos8a4x -v v1 -pn myproject --access public
+```
+
+**Step 2 — copy (or move) into the canonical bucket:**
+
+Isaura routes each entry automatically based on the `--access` tag set during write: `public` → `isaura-public`, `private` → `isaura-private`.
+
+```bash
+# copy (keeps data in myproject as well)
+isaura copy -m eos8a4x -v v1 -pn myproject
+
+# or move (removes data from myproject after copying)
+isaura move -m eos8a4x -v v1 -pn myproject
+```
+
+**Step 3 — push the canonical bucket to cloud:**
+
+```bash
+isaura push -m eos8a4x -v v1 -pn isaura-public
+# or for private data:
+isaura push -m eos8a4x -v v1 -pn isaura-private
+```
+
+Cloud credentials must be set beforehand (in `.env` or exported):
+
+```bash
+export MINIO_ENDPOINT_CLOUD="<cloud-endpoint>"
+export MINIO_CLOUD_AK="<access-key>"        # public bucket
+export MINIO_CLOUD_SK="<secret-key>"
+export MINIO_PRIV_CLOUD_AK="<access-key>"   # private bucket
+export MINIO_PRIV_CLOUD_SK="<secret-key>"
+```
+
+> See [CONFIGURATION](docs/CONFIGURATION.md) for the full list of env vars.
 
 
 ---
