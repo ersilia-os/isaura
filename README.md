@@ -28,8 +28,7 @@ Fast, reproducible access to **precalculated model outputs** from the **Ersilia 
 ---
 
 ## Why Isaura?
-Isaura is Ersilia’s precalculation store: it **precomputes and persistently stores model outputs** so researchers can retrieve results instantly instead of repeatedly running expensive inference. This delivers a major research speed-up—especially in low-resource settings where compute, bandwidth, or infrastructure are limited—by turning repeated calculations into reusable shared artifacts. To support equitable access, Ersilia also provides **free access to public precalculations**, making high-value model outputs available even when local compute isn’t.
-
+Isaura is Ersilia’s precalculation store: it **persistently stores model outputs** so researchers can retrieve results instantly instead of repeatedly runningtime-consuming inference. This delivers a major research speed-up—especially in low-resource settings where compute, bandwidth, or infrastructure are limited—by turning repeated calculations into reusable shared artifacts. To support equitable access, Ersilia also provides **free access to public precalculations**, making high-value model outputs available even when local compute isn’t.
 
 Isaura provides a structured store for model results so you can:
 
@@ -37,10 +36,6 @@ Isaura provides a structured store for model results so you can:
 - 🧱 Keep artifacts **versioned and organized** (model → version → bucket/project)
 - 📦 Store and retrieve results via **S3-compatible object storage (MinIO)**  
 - 🔎 Enable **fast retrieval** using its fast engine developed on top of duckdb and for ANN uses vector search / indexing components (Milvus + NN service)
-
-If you’re integrating Ersilia with Isaura, you typically (check Ersilia Model Hub for more info [here](https://github.com/ersilia-os/ersilia)):
-1) run once (generate/store), then  
-2) subsequent runs become fast (retrieve).
 
 ---
 ## Architecture (high level)
@@ -68,6 +63,8 @@ Before installing Isaura, make sure you have the following:
 - **Python 3.10+** — [download here](https://www.python.org/downloads/)
 - **Git** — used to download the project ([download here](https://git-scm.com/downloads))
 - **Docker** — required to run local services like MinIO. [Download Docker Desktop](https://www.docker.com/products/docker-desktop/)
+- **Docker Compose** — use docker-compose v2
+- **Write permissions**  — make sure you have write permissions in your filesystem
 
 ---
 
@@ -87,9 +84,10 @@ git clone https://github.com/ersilia-os/isaura.git
 cd isaura
 ```
 
-**3. Install Isaura:**
+**3a. Install Isaura through pip:**
 
 ```bash
+conda activate <your_env>
 pip install -e .
 ```
 
@@ -98,22 +96,13 @@ The `-e` flag installs it in "editable" mode, meaning any changes you make to th
 ---
 
 ### Option B: Install with uv *(recommended for developers)*
-
 [uv](https://docs.astral.sh/uv/) is a faster alternative to pip. If you don't have it yet, [install it first](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 git clone https://github.com/ersilia-os/isaura.git
 cd isaura
-uv sync
+uv sync #creates an isolated virtual environment and installs all dependencies automatically.
 source .venv/bin/activate  # on Windows: .venv\Scripts\activate
-```
-
-`uv sync` creates an isolated virtual environment and installs all dependencies automatically.
-
-To install into an existing environment (e.g. conda) instead:
-
-```bash
-uv pip install -e .
 ```
 
 ---
@@ -145,6 +134,11 @@ Default local credentials:
 ```
 Username: minioadmin123
 Password: minioadmin1234
+```
+If you plan to upload/download large volumes of data, we recommend disabling Milvus if you will not use the NNS search, as the indexing can use a lot of memory:
+
+```
+docker stop milvus-standalone
 ```
 
 ---
@@ -207,7 +201,7 @@ isaura push -m eos8a4x -v v1 -pn isaura-public
 isaura push -m eos8a4x -v v1 -pn isaura-private
 ```
 
-Cloud credentials must be set beforehand (in `.env` or exported):
+Cloud credentials must be set beforehand (in `.env` or exported in the terminal in each session):
 
 ```bash
 export MINIO_ENDPOINT_CLOUD="<cloud-endpoint>"
