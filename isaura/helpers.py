@@ -252,6 +252,40 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
   return out
 
 
+def query_batched(conn, header, wanted, file_glob, batch_size=10_000, columns="*", tmpdir="/tmp"):
+  if not wanted:
+    return
+  try:
+    conn.execute(f"SET memory_limit='{mem_gb_lim()}GB'")
+    conn.execute(f"SET temp_directory='{tmpdir}'")
+    conn.execute("PRAGMA enable_object_cache")
+    conn.execute(f"SET threads TO {cpu_cnt()}")
+  except Exception:
+    pass
+  wanted_list = list(wanted)
+  order = np.arange(len(wanted_list), dtype=np.int64)
+  wdf = pd.DataFrame({header: wanted_list, "__o": order})
+  conn.register("wanted_inputs_batched", wdf)
+  sql = f"""
+        WITH p AS (
+          SELECT {columns}
+          FROM read_parquet('{file_glob}')
+          WHERE {header} IN (SELECT {header} FROM wanted_inputs_batched)
+        )
+        SELECT p.*
+        FROM p
+        JOIN wanted_inputs_batched w
+          ON p.{header} = w.{header}
+        ORDER BY w.__o
+    """
+  try:
+    rb_reader = conn.execute(sql).fetch_record_batch(batch_size)
+    for batch in rb_reader:
+      yield batch.to_pandas()
+  finally:
+    conn.unregister("wanted_inputs_batched")
+
+
 def group_inputs(wanted, index, bloom=None, force=False):
   logger.debug(f"Checking {len(wanted)} inputs in the {len(index)} index!")
   try:

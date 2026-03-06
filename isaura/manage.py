@@ -29,6 +29,7 @@ from isaura.helpers import (
   group_inputs,
   make_temp,
   query,
+  query_batched,
   split_csv,
   spinner,
   tranche_coordinates,
@@ -356,6 +357,55 @@ class IsauraReader:
       f"(query elapsed)={elapsed:.2f}s rate={rate:.1f}/s (total time elapsed)={te:.2f}s"
     )
     return out
+
+  def read_batched(self, batch_size=10_000, output_csv=None, df=None):
+    index = self._load_index()
+    t0, wanted, header_set = time.time(), [], set()
+    rows = df.to_dict("records") if df is not None else None
+    if rows is None:
+      with open(self.input_csv, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for row in rows:
+      h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+      v = (row.get(h) or "").strip()
+      if v:
+        wanted.append(v)
+      if h:
+        header_set.add(h)
+    if index and len(index) < MIN_NNS_RESULT_SIZE and self.approximate:
+      logger.error(
+        f"Minimum precalculation size for enabling nearest neighbor search is {MIN_NNS_RESULT_SIZE}, "
+        f"found {len(index)}. Aborting the Ops!"
+      )
+      sys.exit(1)
+    if self.approximate:
+      st = time.perf_counter()
+      wanted = get_apprx(wanted, self.collection)
+      et = time.perf_counter()
+      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
+    header = list(header_set)[0] if header_set else "smiles"
+    group_inputs(wanted, index, bloom=self.bi)
+    if not wanted:
+      return
+    files = get_files_glob(self.bucket, self.base)
+    first_chunk = True
+    total_rows = 0
+    try:
+      for chunk in query_batched(self.duck.con, header, wanted, files, batch_size=batch_size):
+        if output_csv:
+          chunk.to_csv(output_csv, mode="a", header=first_chunk, index=False)
+          first_chunk = False
+        total_rows += len(chunk)
+        yield chunk
+    except Exception as e:
+      logger.error(e)
+      sys.exit(1)
+    elapsed = time.time() - t0
+    rate = (total_rows / elapsed) if elapsed > 0 and total_rows else 0.0
+    logger.success(
+      f"read_batched done model+version={self.pref} bucket={self.bucket} "
+      f"inputs={len(wanted)} matched={total_rows} elapsed={elapsed:.2f}s rate={rate:.1f}/s"
+    )
 
 
 class IsauraCopy(_BaseTransfer):
