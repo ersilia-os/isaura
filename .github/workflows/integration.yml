@@ -19,8 +19,6 @@ jobs:
 
     env:
       MINIO_ENDPOINT: http://localhost:9000
-      MINIO_LOCAL_AK: minioadmin
-      MINIO_LOCAL_SK: minioadmin
       ISAURA_TEST_MODEL: eos3b5e
       ISAURA_TEST_VERSION: v1
       ISAURA_TEST_BUCKET: isaura-test
