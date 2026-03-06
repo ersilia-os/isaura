@@ -1,0 +1,57 @@
+name: Integration tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+
+    services:
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fs http://localhost:9000/minio/health/ready"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MINIO_ENDPOINT:    http://localhost:9000
+      MINIO_LOCAL_AK:    minioadmin
+      MINIO_LOCAL_SK:    minioadmin
+      ISAURA_TEST_MODEL:   eos3b5e
+      ISAURA_TEST_VERSION: v1
+      ISAURA_TEST_BUCKET:  isaura-test
+      ISAURA_TEST_INPUT:   tests/data.csv
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4.0.0
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:9000/minio/health/ready && break
+            sleep 2
+          done
+
+      - name: Run workflow tests
+        run: poetry run pytest tests/test_workflow.py -v --tb=short
