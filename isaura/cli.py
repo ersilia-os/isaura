@@ -58,6 +58,7 @@ def cli():
 show_figlet()
 
 opt_model = click.option("--model", "-m", required=True, help="Ersilia model id (eosxxxx)")
+opt_model_opt = click.option("--model", "-m", required=False, default=None, help="Ersilia model id (eosxxxx)")
 opt_version = click.option("--version", "-v", default="v1", show_default=True, help="Model version")
 opt_project = click.option(
   "--project-name", "-pn", required=False, default=None, help="Project (bucket) name"
@@ -191,14 +192,18 @@ def engine(start):
 
 
 @cli.command("remove")
-@apply_opts(opt_model, opt_version, opt_project_req, opt_yes_flag)
+@apply_opts(opt_model_opt, opt_version, opt_project_req, opt_yes_flag)
 def rm(model, version, project_name, yes):
   if not yes:
     logger.info("Add --yes to confirm deletion")
     sys.exit(1)
-  r = IsauraRemover(model_id=model, model_version=version, bucket=project_name)
+  if model:
+    r = IsauraRemover(model_id=model, model_version=version, bucket=project_name)
+    logger.info(f"Remove done for {model}/{version} in {project_name}")
+  else:
+    r = IsauraRemover(project_name=project_name)
+    logger.info(f"Remove done for all data in {project_name}")
   r.remove()
-  logger.info(f"Remove done for {model}/{version} in {project_name}")
 
 
 @cli.command("inspect")

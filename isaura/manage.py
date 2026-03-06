@@ -160,7 +160,7 @@ class IsauraWriter:
 
   def write(self, df=None, show_progress: bool = True):
     total = dupes = 0
-    new, buffs = [], []
+    new = []
 
     rows_iter, total_rows = None, None
 
@@ -219,10 +219,9 @@ class IsauraWriter:
 
     for (r, c), buf in list(self.buffers.items()):
       if buf:
-        buffs.extend(buf)
+        self.tranche.flush(buf, self.schema_cols)
         self.buffers[(r, c)].clear()
 
-    self.tranche.flush(buffs, self.schema_cols)
     self.bi.persist()
 
     if new:
@@ -374,9 +373,21 @@ class IsauraMover(_BaseTransfer):
 
 
 class IsauraRemover(_BaseTransfer):
+  def __init__(self, model_id=None, model_version=None, bucket=None, project_name=None):
+    self._project_name = project_name
+    if project_name:
+      self._store = MinioStore()
+    else:
+      super().__init__(model_id, model_version, bucket)
+
   def remove(self):
-    n = self._delete()
-    logger.info(f"removed objects={n}")
+    if self._project_name:
+      store = self._store
+      n = store.delete_prefix(self._project_name, "")
+      logger.info(f"removed all objects in project={self._project_name} count={n}")
+    else:
+      n = self._delete()
+      logger.info(f"removed objects={n}")
 
 
 class IsauraPull(_BaseTransfer):

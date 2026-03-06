@@ -390,10 +390,22 @@ class TrancheState:
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
 
     if mode == "append" and existing_local:
-      old = pd.read_parquet(existing_local)
-      df = pd.concat([old, df], ignore_index=True)
+      new_table = pa.Table.from_pandas(df, preserve_index=False)
+      tmp = local + ".merged"
+      old_pf = pq.ParquetFile(existing_local)
+      schema = old_pf.schema_arrow
+      try:
+        new_table = new_table.cast(schema)
+      except Exception:
+        schema = new_table.schema
+      with pq.ParquetWriter(tmp, schema) as writer:
+        for batch in old_pf.iter_batches(batch_size=2048):
+          writer.write_batch(batch)
+        writer.write_table(new_table)
+      os.replace(tmp, local)
+    else:
+      df.to_parquet(local, index=False)
 
-    df.to_parquet(local, index=False)
     self.store.upload_file(local, self.bucket, os_key)
 
     if not existing_local:
