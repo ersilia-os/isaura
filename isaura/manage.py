@@ -364,7 +364,9 @@ class IsauraReader:
       return pd.DataFrame()
     try:
       files = get_files_glob(self.bucket, self.base)
-      out = spinner("Fetching queries. Please wait!", query, self.duck.con, header, wanted, files, tmpdir=self.tmpdir)
+      out = spinner(
+        "Fetching queries. Please wait!", query, self.duck.con, header, wanted, files, tmpdir=self.tmpdir
+      )
       elapsed = time.time() - t0
       logger.success(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
     except Exception as e:
@@ -391,7 +393,9 @@ class IsauraReader:
     first_chunk = True
     total_rows = 0
     try:
-      for chunk in query_batched(self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir):
+      for chunk in query_batched(
+        self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir
+      ):
         if output_csv:
           chunk.to_csv(output_csv, mode="a", header=first_chunk, index=False)
           first_chunk = False
@@ -506,7 +510,6 @@ class IsauraPush:
         approximate=False,
         bucket=f"isaura-{access}",
       )
-      df = r.read()
       with IsauraWriter(
         input_csv=file,
         model_id=self.model_id,
@@ -517,7 +520,8 @@ class IsauraPush:
         access_key=mck,
         secrete=mcs,
       ) as w:
-        w.write(df=df)
+        for chunk in r.read_batched():
+          w.write(df=chunk, show_progress=False)
 
 
 class IsauraInspect:
