@@ -818,6 +818,14 @@ class IsauraStat:
     i = max(0, min(i, n - 1))
     return sorted_vals[i]
 
+  def _model_storage(self, bucket, model_id, model_version):
+    base = get_base(model_id, model_version).strip("/") + "/"
+    total_bytes = 0
+    for obj in self.insp.iter_object_meta(bucket, base):
+      total_bytes += int(obj.get("Size") or 0)
+    total_gb = round(total_bytes / (1024**3), 6)
+    return total_bytes, total_gb
+
   def compute(self):
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     buckets = self.insp.buckets()
@@ -836,6 +844,7 @@ class IsauraStat:
 
         cols = None
         ncols = None
+        total_bytes, total_gb = self._model_storage(b, mid, mv)
         if self.include_columns:
           ck = self.insp.find_any_chunk_key(b, mid, mv)
           cols = self.insp.duckdb_columns(b, ck) if ck else None
@@ -848,6 +857,8 @@ class IsauraStat:
           "model_key": f"{b}:{mid}:{mv}",
           "model": f"{mid}/{mv}",
           "molecules": len(idx),
+          "total_bytes": total_bytes,
+          "total_gb": total_gb,
           "n_columns": ncols,
           "metadata": meta_out,
         }
