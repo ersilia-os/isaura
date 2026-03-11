@@ -29,6 +29,7 @@ from isaura.helpers import (
   make_temp,
   post_apprx,
   query,
+  query_batched,
   cpu_cnt,
 )
 
@@ -255,6 +256,7 @@ class BloomIndex:
     bloom_filename=BLOOM_FILENAME,
     error_rate=1e-14,
     initial_capacity=1_000_000,
+    load_index=True,
   ):
     self.store = store
     self.bucket = bucket
@@ -276,14 +278,18 @@ class BloomIndex:
         error_rate=error_rate,
       )
       logger.info("created new bloom")
-    try:
-      self.store.download_file(self.bucket, self.index_key, self.local_index)
-      with open(self.local_index, "r", encoding="utf-8") as f:
-        self.index = json.load(f)
-      logger.info(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
-    except Exception:
-      self.index = {}
-      logger.info("created new index")
+    if load_index:
+      try:
+        self.store.download_file(self.bucket, self.index_key, self.local_index)
+        with open(self.local_index, "r", encoding="utf-8") as f:
+          self.index = json.load(f)
+        logger.info(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
+      except Exception:
+        self.index = {}
+        logger.info("created new index")
+    else:
+      self.index = None
+      logger.info("skipped index load")
     self._added = 0
 
   def seen(self, v):
@@ -295,11 +301,11 @@ class BloomIndex:
     return {v: [v in sbf, b] for v in vs}
 
   def rc(self, v):
-    return self.index.get(v)
+    return self.index.get(v) if self.index is not None else None
 
   def register(self, v, rc=None):
     self.sbf.add(v)
-    if rc is not None and v not in self.index:
+    if rc is not None and self.index is not None and v not in self.index:
       self.index[v] = list(rc)
     self._added += 1
     if self._added >= CHECKPOINT_EVERY:
@@ -314,14 +320,15 @@ class BloomIndex:
       self.store.upload_file(self.local_bloom, self.bucket, self.bloom_key)
     except Exception as e:
       logger.warning(f"bloom upload failed: {e}")
-    ti = f"{self.local_index}.tmp"
-    with open(ti, "w", encoding="utf-8") as f:
-      json.dump(self.index, f, separators=(",", ":"), ensure_ascii=False)
-    os.replace(ti, self.local_index)
-    try:
-      self.store.upload_file(self.local_index, self.bucket, self.index_key)
-    except Exception as e:
-      logger.warning(f"index upload failed: {e}")
+    if self.index is not None:
+      ti = f"{self.local_index}.tmp"
+      with open(ti, "w", encoding="utf-8") as f:
+        json.dump(self.index, f, separators=(",", ":"), ensure_ascii=False)
+      os.replace(ti, self.local_index)
+      try:
+        self.store.upload_file(self.local_index, self.bucket, self.index_key)
+      except Exception as e:
+        logger.warning(f"index upload failed: {e}")
     self._added = 0
 
 
@@ -332,7 +339,20 @@ class TrancheState:
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
+    self.write_batch_rows = 2048
     self.state = {}
+
+  def _rows_to_frame(self, rows, schema_cols):
+    df = pd.DataFrame.from_records(rows)
+    for col in schema_cols:
+      if col not in df.columns:
+        df[col] = None
+    return df[schema_cols]
+
+  def _iter_tables(self, rows, schema_cols):
+    for start in range(0, len(rows), self.write_batch_rows):
+      frame = self._rows_to_frame(rows[start : start + self.write_batch_rows], schema_cols)
+      yield pa.Table.from_pandas(frame, preserve_index=False)
 
   def _rows_in_remote(self, key):
     local = os.path.join(self.tmpdir, f"inspect_{uuid.uuid4().hex}.parquet")
@@ -358,15 +378,9 @@ class TrancheState:
       return
 
     last = keys[-1]
-    n = self._rows_in_remote(last)
     idx = self._chunk_idx(last)
-
-    if n < self.max_rows:
-      self.state[t] = {"next": idx, "open": last, "rows": n}
-      logger.info(f"tranche open: idx={idx} rows={n}")
-    else:
-      self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
-      logger.info(f"tranche rotate: next={idx + 1}")
+    self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
+    logger.info(f"tranche next: {idx + 1}")
 
   def _list_chunks(self):
     pref = hive_prefix(self.base) + "/"
@@ -385,26 +399,32 @@ class TrancheState:
     except:
       return 1
 
-  def _write_chunk(self, df, idx, mode="new", existing_local=None):
+  def _write_chunk(self, rows, schema_cols, idx, mode="new", existing_local=None):
     os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
 
     if mode == "append" and existing_local:
-      new_table = pa.Table.from_pandas(df, preserve_index=False)
       tmp = local + ".merged"
       old_pf = pq.ParquetFile(existing_local)
       schema = old_pf.schema_arrow
-      try:
-        new_table = new_table.cast(schema)
-      except Exception:
-        schema = new_table.schema
       with pq.ParquetWriter(tmp, schema) as writer:
-        for batch in old_pf.iter_batches(batch_size=2048):
+        for batch in old_pf.iter_batches(batch_size=self.write_batch_rows):
           writer.write_batch(batch)
-        writer.write_table(new_table)
+        for table in self._iter_tables(rows, schema_cols):
+          writer.write_table(table.cast(schema))
       os.replace(tmp, local)
     else:
-      df.to_parquet(local, index=False)
+      tmp = local + ".tmp"
+      writer = None
+      try:
+        for table in self._iter_tables(rows, schema_cols):
+          if writer is None:
+            writer = pq.ParquetWriter(tmp, table.schema)
+          writer.write_table(table)
+      finally:
+        if writer is not None:
+          writer.close()
+      os.replace(tmp, local)
 
     self.store.upload_file(local, self.bucket, os_key)
 
@@ -421,14 +441,7 @@ class TrancheState:
       return self.ensure()
     self.ensure()
     st = self.state["data"]
-    df_all = pd.DataFrame(rows)
-
-    for col in schema_cols:
-      if col not in df_all.columns:
-        df_all[col] = pd.Series([None] * len(df_all))
-    df_all = df_all[schema_cols]
-
-    remaining = len(df_all)
+    remaining = len(rows)
     start = 0
 
     logger.info(f"flush: tranche rows={remaining}")
@@ -441,8 +454,8 @@ class TrancheState:
         take = min(space, remaining)
 
         if take > 0:
-          part = df_all.iloc[start : start + take]
-          self._write_chunk(part, st["next"], mode="append", existing_local=tmp)
+          part = rows[start : start + take]
+          self._write_chunk(part, schema_cols, st["next"], mode="append", existing_local=tmp)
           st["rows"] += take
           remaining -= take
           start += take
@@ -461,8 +474,8 @@ class TrancheState:
 
     while remaining > 0:
       take = min(self.max_rows, remaining)
-      part = df_all.iloc[start : start + take]
-      os_key = self._write_chunk(part, st["next"], mode="new")
+      part = rows[start : start + take]
+      os_key = self._write_chunk(part, schema_cols, st["next"], mode="new")
 
       if take < self.max_rows:
         st["open"] = os_key
@@ -503,6 +516,7 @@ class _SinkWriter:
     self.bi = BloomIndex(self.store, self.bucket, self.base, tmpdir)
     self.tranche = TrancheState(self.store, self.bucket, self.base, tmpdir, self.max_rows)
     self.buffers = defaultdict(list)
+    self.schema_cols = None
 
   def add_rows(self, r, c, df):
     try:
@@ -511,13 +525,15 @@ class _SinkWriter:
         return 0
 
       stats = AddRowsStats(in_count=len(df))
+      if self.schema_cols is None:
+        self.schema_cols = list(df.keys())
 
       logger.info(
         f"[add_rows] tranche=({r},{c}) in={stats.in_count} "
         f"bucket={getattr(self, 'bucket', None)} bloom_bucket={getattr(self.bi, 'bucket', None)}"
       )
 
-      for i, row in df.iterrows():
+      for i, row in enumerate(df.to_dict("records")):
         smi: Optional[str] = None
         try:
           smi = row.get("input") if hasattr(row, "get") else row["input"]
@@ -569,7 +585,7 @@ class _SinkWriter:
       if buf_len >= self.max_rows:
         try:
           logger.info(f"[add_rows] tranche=({r},{c}) buffer reached max_rows -> flushing {buf_len} rows")
-          self.tranche.flush(self.buffers[(r, c)], list(df.keys()))
+          self.tranche.flush(self.buffers[(r, c)], self.schema_cols)
           self.buffers[(r, c)].clear()
           logger.info(f"[add_rows] tranche=({r},{c}) flush complete -> buffer cleared")
         except Exception as e:
@@ -582,6 +598,7 @@ class _SinkWriter:
       return 0
 
   def finalize(self, metadata_local=None, schema_cols=None):
+    schema_cols = schema_cols or self.schema_cols
     for k in list(self.buffers.keys()):
       if self.buffers[k]:
         self.tranche.flush(self.buffers[k], schema_cols)
@@ -649,6 +666,11 @@ class _BaseTransfer:
   def select_rows(self, wanted, input_col="input"):
     return query(self.duck.con, input_col, wanted, get_files_glob(self.bucket, self.tranches))
 
+  def select_rows_batched(self, wanted, input_col="input", batch_size=10_000):
+    files = get_files_glob(self.bucket, self.tranches)
+    for chunk in query_batched(self.duck.con, input_col, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir):
+      yield chunk
+
   def _delete(self):
     return self.store.delete_prefix(self.bucket, self.tranches)
 
@@ -661,7 +683,7 @@ class _BaseTransfer:
       return 0, 0
     for (r, c), want in gp.items():
       df_ = df[df["input"].isin(list(want))]
-      _tp = wt.add_rows(r, c, df)
+      _tp = wt.add_rows(r, c, df_)
       if _tp != 0:
         dfs.append(df_)
       tp += _tp
@@ -718,22 +740,30 @@ class _BaseTransfer:
       else None
     )
     tp, tu, dfs = 0, 0, []
+    priv_schema_cols = None
+    pub_schema_cols = None
     for (r, c), want in gp.items():
-      df = self.select_rows(want)
-      _tp = w_priv.add_rows(r, c, df)
-      if _tp != 0:
-        dfs.append(df)
-      tp += _tp
+      for df in self.select_rows_batched(want):
+        if df is None or df.empty:
+          continue
+        priv_schema_cols = list(df.keys())
+        _tp = w_priv.add_rows(r, c, df)
+        if _tp != 0:
+          dfs.append(df)
+        tp += _tp
     for (r, c), want in gu.items():
-      df = self.select_rows(want)
-      _tu = w_pub.add_rows(r, c, df)
-      if _tu != 0:
-        dfs.append(df)
-      tu += _tu
+      for df in self.select_rows_batched(want):
+        if df is None or df.empty:
+          continue
+        pub_schema_cols = list(df.keys())
+        _tu = w_pub.add_rows(r, c, df)
+        if _tu != 0:
+          dfs.append(df)
+        tu += _tu
     if w_priv:
-      w_priv.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
+      w_priv.finalize(metadata_local=meta_local, schema_cols=priv_schema_cols)
     if w_pub:
-      w_pub.finalize(metadata_local=meta_local, schema_cols=list(df.keys()))
+      w_pub.finalize(metadata_local=meta_local, schema_cols=pub_schema_cols)
     if dfs:
       dfs = pd.concat(dfs, ignore_index=True)
       post_apprx(dfs, self.collection)

@@ -274,8 +274,57 @@ class IsauraReader:
       self.base,
       self.tmpdir,
       bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
+      load_index=False,
     )
     logger.info(f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv}")
+
+  def _wanted(self, df=None):
+    wanted, header_set = [], set()
+    rows = df.to_dict("records") if df is not None else None
+    if rows is None:
+      with open(self.input_csv, newline="", encoding="utf-8") as f:
+        rows = csv.DictReader(f)
+        for row in rows:
+          h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+          v = (row.get(h) or "").strip()
+          if v:
+            wanted.append(v)
+          if h:
+            header_set.add(h)
+    else:
+      for row in rows:
+        h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
+        v = (row.get(h) or "").strip()
+        if v:
+          wanted.append(v)
+        if h:
+          header_set.add(h)
+    return wanted, list(header_set)[0] if header_set else "smiles"
+
+  def _prepare_read(self, df=None):
+    index = None
+    t0 = time.time()
+    wanted, header = self._wanted(df=df)
+    if self.approximate:
+      index = self._load_index()
+      if index and len(index) < MIN_NNS_RESULT_SIZE:
+        logger.error(
+          f"Minimum precalculation size for enabling nearest neighbor search is {MIN_NNS_RESULT_SIZE}, found {len(index)}. Aborting the Ops!"
+        )
+        sys.exit(1)
+      st = time.perf_counter()
+      wanted = get_apprx(wanted, self.collection)
+      et = time.perf_counter()
+      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
+      group_inputs(wanted, index, bloom=self.bi)
+    else:
+      missing = [v for v in wanted if not self.bi.seen(v)]
+      if missing:
+        logger.error(
+          f"inputs not indexed: {missing[:5]}{'...' if len(missing) > 5 else ''} total_missing={len(missing)}"
+        )
+        sys.exit(1)
+    return t0, wanted, header
 
   def _load_index(self):
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
@@ -310,36 +359,12 @@ class IsauraReader:
         logger.error(f"Exception occurred when removing temp index file (local={local}): {e}")
 
   def read(self, output_csv=None, df=None):
-    index = self._load_index()
-    t0, wanted, header_set = time.time(), [], set()
-    rows = df.to_dict("records") if df is not None else None
-    if rows is None:
-      with open(self.input_csv, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    for row in rows:
-      h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-      v = (row.get(h) or "").strip()
-      if v:
-        wanted.append(v)
-      if h:
-        header_set.add(h)
-    if index and len(index) < MIN_NNS_RESULT_SIZE and self.approximate:
-      logger.error(
-        f"Minimum precalculation size for enabling nearest neighbor search is {MIN_NNS_RESULT_SIZE}, found {len(index)}. Aborting the Ops!"
-      )
-      sys.exit(1)
-    if self.approximate:
-      st = time.perf_counter()
-      wanted = get_apprx(wanted, self.collection)
-      et = time.perf_counter()
-      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
-    header = list(header_set)[0] if header_set else "smiles"
-    group_inputs(wanted, index, bloom=self.bi)
+    t0, wanted, header = self._prepare_read(df=df)
     if not wanted:
       return pd.DataFrame()
     try:
       files = get_files_glob(self.bucket, self.base)
-      out = spinner("Fetching queries. Please wait!", query, self.duck.con, header, wanted, files)
+      out = spinner("Fetching queries. Please wait!", query, self.duck.con, header, wanted, files, tmpdir=self.tmpdir)
       elapsed = time.time() - t0
       logger.success(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
     except Exception as e:
@@ -359,39 +384,14 @@ class IsauraReader:
     return out
 
   def read_batched(self, batch_size=10_000, output_csv=None, df=None):
-    index = self._load_index()
-    t0, wanted, header_set = time.time(), [], set()
-    rows = df.to_dict("records") if df is not None else None
-    if rows is None:
-      with open(self.input_csv, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    for row in rows:
-      h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-      v = (row.get(h) or "").strip()
-      if v:
-        wanted.append(v)
-      if h:
-        header_set.add(h)
-    if index and len(index) < MIN_NNS_RESULT_SIZE and self.approximate:
-      logger.error(
-        f"Minimum precalculation size for enabling nearest neighbor search is {MIN_NNS_RESULT_SIZE}, "
-        f"found {len(index)}. Aborting the Ops!"
-      )
-      sys.exit(1)
-    if self.approximate:
-      st = time.perf_counter()
-      wanted = get_apprx(wanted, self.collection)
-      et = time.perf_counter()
-      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
-    header = list(header_set)[0] if header_set else "smiles"
-    group_inputs(wanted, index, bloom=self.bi)
+    t0, wanted, header = self._prepare_read(df=df)
     if not wanted:
       return
     files = get_files_glob(self.bucket, self.base)
     first_chunk = True
     total_rows = 0
     try:
-      for chunk in query_batched(self.duck.con, header, wanted, files, batch_size=batch_size):
+      for chunk in query_batched(self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir):
         if output_csv:
           chunk.to_csv(output_csv, mode="a", header=first_chunk, index=False)
           first_chunk = False

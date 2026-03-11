@@ -148,7 +148,8 @@ def read(input_file, project_name, model, version, output_file, approximate):
   r = IsauraReader(
     model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
   )
-  r.read(output_csv=output_file)
+  for _ in r.read_batched(output_csv=output_file):
+    pass
 
 
 @cli.command("pull")

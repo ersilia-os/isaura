@@ -220,36 +220,10 @@ def split_csv(df):
 
 
 def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp"):
-  if not wanted:
+  chunks = list(query_batched(conn, header, wanted, file_glob, columns=columns, tmpdir=tmpdir))
+  if not chunks:
     return pd.DataFrame()
-  try:
-    conn.execute(f"SET memory_limit='{mem_gb_lim()}GB'")
-    conn.execute(f"SET temp_directory='{tmpdir}'")
-    conn.execute("PRAGMA enable_object_cache")
-    conn.execute(f"SET threads TO {cpu_cnt()}")
-  except Exception:
-    pass
-  wanted_list = list(wanted)
-  order = np.arange(len(wanted_list), dtype=np.int64)
-  wdf = pd.DataFrame({header: wanted_list, "__o": order})
-  conn.register("wanted_inputs", wdf)
-  sql = f"""
-        WITH p AS (
-          SELECT {columns}
-          FROM read_parquet('{file_glob}')
-          WHERE {header} IN (SELECT {header} FROM wanted_inputs)
-        )
-        SELECT p.*
-        FROM p
-        JOIN wanted_inputs w
-          ON p.{header} = w.{header}
-        ORDER BY w.__o
-    """
-  try:
-    out = conn.execute(sql).fetchdf()
-  finally:
-    conn.unregister("wanted_inputs")
-  return out
+  return pd.concat(chunks, ignore_index=True)
 
 
 def query_batched(conn, header, wanted, file_glob, batch_size=10_000, columns="*", tmpdir="/tmp"):
@@ -263,9 +237,7 @@ def query_batched(conn, header, wanted, file_glob, batch_size=10_000, columns="*
   except Exception:
     pass
   wanted_list = list(wanted)
-  order = np.arange(len(wanted_list), dtype=np.int64)
-  wdf = pd.DataFrame({header: wanted_list, "__o": order})
-  conn.register("wanted_inputs_batched", wdf)
+  wanted_batch_size = max(1, min(len(wanted_list), int(BATCH)))
   sql = f"""
         WITH p AS (
           SELECT {columns}
@@ -278,12 +250,17 @@ def query_batched(conn, header, wanted, file_glob, batch_size=10_000, columns="*
           ON p.{header} = w.{header}
         ORDER BY w.__o
     """
-  try:
-    rb_reader = conn.execute(sql).fetch_record_batch(batch_size)
-    for batch in rb_reader:
-      yield batch.to_pandas()
-  finally:
-    conn.unregister("wanted_inputs_batched")
+  for start in range(0, len(wanted_list), wanted_batch_size):
+    batch_wanted = wanted_list[start : start + wanted_batch_size]
+    order = np.arange(len(batch_wanted), dtype=np.int64)
+    wdf = pd.DataFrame({header: batch_wanted, "__o": order})
+    conn.register("wanted_inputs_batched", wdf)
+    try:
+      rb_reader = conn.execute(sql).fetch_record_batch(batch_size)
+      for batch in rb_reader:
+        yield batch.to_pandas()
+    finally:
+      conn.unregister("wanted_inputs_batched")
 
 
 def group_inputs(wanted, index, bloom=None, force=False):
