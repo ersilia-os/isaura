@@ -1,7 +1,7 @@
 import csv, datetime, json, os, shutil, sys, time, uuid, pyarrow.parquet as pq, pandas as pd
 from collections import defaultdict, Counter
-from collections import defaultdict
 from contextlib import AbstractContextManager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio, _S3RangeFile
 from isaura.helpers import (
   ACCESS_FILE,
@@ -793,6 +793,8 @@ class IsauraInspect:
 
 
 class IsauraStat:
+  _MAX_WORKERS = 8
+
   def __init__(
     self,
     project_name=None,
@@ -803,12 +805,14 @@ class IsauraStat:
     include_column_names=False,
     schema_version="1",
     producer="isaura stats",
+    max_workers=None,
   ):
     self.insp = IsauraInspect(cloud=cloud, project_name=project_name, access=access, endpoint=endpoint)
     self.include_columns = bool(include_columns)
     self.include_column_names = bool(include_column_names)
     self.schema_version = str(schema_version)
     self.producer = str(producer)
+    self.max_workers = int(max_workers) if max_workers is not None else self._MAX_WORKERS
 
   def _percentile(self, sorted_vals, p):
     if not sorted_vals:
@@ -818,59 +822,109 @@ class IsauraStat:
     i = max(0, min(i, n - 1))
     return sorted_vals[i]
 
-  def _model_storage(self, bucket, model_id, model_version):
-    base = get_base(model_id, model_version).strip("/") + "/"
+  def _use_chunks(self):
+    return self.insp.cloud and not self.insp.heavy_index
+
+  def _collect_objects(self, bucket, model_id, model_version):
+    pref = get_pref(model_id, model_version)
     total_bytes = 0
-    for obj in self.insp.iter_object_meta(bucket, base):
+    chunks = []
+    first_chunk = None
+    for obj in self.insp.iter_object_meta(bucket, pref):
       total_bytes += int(obj.get("Size") or 0)
+      k = obj.get("Key") or ""
+      if "/chunk_" in k and k.endswith(".parquet"):
+        sz = int(obj.get("Size") or 0)
+        chunks.append((k, sz))
+        if first_chunk is None:
+          first_chunk = k
     total_gb = round(total_bytes / (1024**3), 6)
-    return total_bytes, total_gb
+    return total_bytes, total_gb, chunks, first_chunk
+
+  def _count_rows_from_chunks(self, bucket, chunks):
+    total = 0
+    for k, sz in chunks:
+      n = self.insp.parquet_num_rows(bucket, k, size=sz)
+      if n is not None:
+        total += int(n)
+    return total
+
+  def _process_model(self, bucket, mid, mv, use_chunks):
+    total_bytes, total_gb, chunks, first_chunk = self._collect_objects(bucket, mid, mv)
+
+    if use_chunks:
+      mol_count = self._count_rows_from_chunks(bucket, chunks)
+      idx = None
+    else:
+      idx = self.insp.load_index(bucket, mid, mv)
+      mol_count = len(idx)
+
+    meta_out = fetch_schema_from_github(mid)
+
+    cols = None
+    ncols = None
+    if self.include_columns and first_chunk:
+      cols = self.insp.parquet_columns(bucket, first_chunk)
+      ncols = len(cols) if cols else None
+
+    row = {
+      "bucket": bucket,
+      "model_id": mid,
+      "model_version": mv,
+      "model_key": f"{bucket}:{mid}:{mv}",
+      "model": f"{mid}/{mv}",
+      "molecules": mol_count,
+      "total_bytes": total_bytes,
+      "total_gb": total_gb,
+      "n_columns": ncols,
+      "metadata": meta_out,
+    }
+    if self.include_column_names:
+      row["columns"] = cols
+
+    return row, idx
 
   def compute(self):
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     buckets = self.insp.buckets()
+    use_chunks = self._use_chunks()
+
+    tasks = []
+    for b in buckets:
+      for mid, mv in self.insp.iter_models(b):
+        tasks.append((b, mid, mv))
 
     models = []
     models_per_molecule = Counter()
     models_total_by_bucket = defaultdict(int)
 
-    for b in buckets:
-      for mid, mv in self.insp.iter_models(b):
-        idx = self.insp.load_index(b, mid, mv)
-        for smi in idx.keys():
-          models_per_molecule[smi] += 1
+    if use_chunks and len(tasks) > 1:
+      results = [None] * len(tasks)
+      with ThreadPoolExecutor(max_workers=min(self.max_workers, len(tasks))) as pool:
+        futures = {}
+        for i, (b, mid, mv) in enumerate(tasks):
+          fut = pool.submit(self._process_model, b, mid, mv, True)
+          futures[fut] = i
+        for fut in as_completed(futures):
+          results[futures[fut]] = fut.result()
 
-        meta_out = fetch_schema_from_github(mid)
-
-        cols = None
-        ncols = None
-        total_bytes, total_gb = self._model_storage(b, mid, mv)
-        if self.include_columns:
-          ck = self.insp.find_any_chunk_key(b, mid, mv)
-          cols = self.insp.duckdb_columns(b, ck) if ck else None
-          ncols = len(cols) if cols else None
-
-        row = {
-          "bucket": b,
-          "model_id": mid,
-          "model_version": mv,
-          "model_key": f"{b}:{mid}:{mv}",
-          "model": f"{mid}/{mv}",
-          "molecules": len(idx),
-          "total_bytes": total_bytes,
-          "total_gb": total_gb,
-          "n_columns": ncols,
-          "metadata": meta_out,
-        }
-        if self.include_column_names:
-          row["columns"] = cols
-
+      for row, _ in results:
+        models.append(row)
+        models_total_by_bucket[row["bucket"]] += 1
+    else:
+      for b, mid, mv in tasks:
+        row, idx = self._process_model(b, mid, mv, use_chunks)
+        if idx is not None:
+          for smi in idx.keys():
+            models_per_molecule[smi] += 1
         models.append(row)
         models_total_by_bucket[b] += 1
 
-    counts = sorted(models_per_molecule.values())
+    counts = sorted(models_per_molecule.values()) if models_per_molecule else []
     hist = Counter(counts)
     hist_out = [{"models": k, "molecules": v} for k, v in sorted(hist.items(), key=lambda x: x[0])]
+
+    molecules_total = sum(m["molecules"] for m in models)
 
     return {
       "schema_version": self.schema_version,
@@ -881,7 +935,7 @@ class IsauraStat:
       "models_total_by_bucket": dict(models_total_by_bucket),
       "models": models,
       "models_per_molecule": {
-        "molecules_total_unique": len(models_per_molecule),
+        "molecules_total_unique": len(models_per_molecule) if models_per_molecule else molecules_total,
         "min": min(counts) if counts else None,
         "max": max(counts) if counts else None,
         "p50": self._percentile(counts, 50),

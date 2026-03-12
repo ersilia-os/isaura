@@ -120,7 +120,8 @@ def test_9_stats_writes_model_sizes(monkeypatch, tmp_path):
 
   class FakeInspect:
     def __init__(self, *args, **kwargs):
-      pass
+      self.cloud = kwargs.get("cloud", False)
+      self.heavy_index = kwargs.get("heavy_index", False)
 
     def buckets(self):
       return ["isaura-test"]
@@ -133,14 +134,11 @@ def test_9_stats_writes_model_sizes(monkeypatch, tmp_path):
 
     def iter_object_meta(self, bucket, prefix=""):
       return iter([
-        {"Key": f"{prefix}data/chunk_1.parquet", "Size": 1073741824},
-        {"Key": f"{prefix}index.json", "Size": 512},
+        {"Key": f"{prefix}/tranches/data/chunk_1.parquet", "Size": 1073741824},
+        {"Key": f"{prefix}/tranches/index.json", "Size": 512},
       ])
 
-    def find_any_chunk_key(self, bucket, model_id, model_version):
-      return "eos3b5e/v1/data/chunk_1.parquet"
-
-    def duckdb_columns(self, bucket, parquet_key):
+    def parquet_columns(self, bucket, parquet_key):
       return ["input", "mol_weight"]
 
   monkeypatch.setattr("isaura.manage.IsauraInspect", FakeInspect)
