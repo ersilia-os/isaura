@@ -4,7 +4,7 @@ import pytest
 
 pq = pytest.importorskip("pyarrow.parquet")
 
-from isaura.base import TrancheState
+from isaura.base import TrancheState, _BaseTransfer
 from isaura.manage import IsauraReader
 
 
@@ -42,7 +42,7 @@ def test_tranche_flush_handles_wide_rows_without_full_frame(tmp_path):
   tranche = TrancheState(store, "bucket", "model/v1/tranches", str(tmp_path), 4)
   rows = []
   for i in range(6):
-    row = {"input": f"s{i}"}
+    row: dict[str, object] = {"input": f"s{i}"}
     for j in range(128):
       row[f"f{j}"] = float(i + j)
     rows.append(row)
@@ -53,12 +53,38 @@ def test_tranche_flush_handles_wide_rows_without_full_frame(tmp_path):
 
   key = os.path.join(str(tmp_path), "bucket", "model/v1/tranches/data/chunk_1.parquet")
   out = pq.read_table(key).to_pandas()
-  assert len(out) == 4
+  assert len(out) == 3
   assert list(out.columns) == cols
 
   key2 = os.path.join(str(tmp_path), "bucket", "model/v1/tranches/data/chunk_2.parquet")
   out2 = pq.read_table(key2).to_pandas()
-  assert len(out2) == 2
+  assert len(out2) == 3
+  assert list(out2.columns) == cols
+
+
+def test_tranche_flush_df_handles_wide_rows_with_immutable_chunks(tmp_path):
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(store, "bucket", "model/v1/tranches", str(tmp_path), 4)
+  rows = []
+  for i in range(6):
+    row: dict[str, object] = {"input": f"s{i}"}
+    for j in range(128):
+      row[f"f{j}"] = float(i + j)
+    rows.append(row)
+  df = pd.DataFrame(rows)
+  cols = list(df.columns)
+
+  tranche.flush_df(df.iloc[:3], cols)
+  tranche.flush_df(df.iloc[3:], cols)
+
+  key1 = os.path.join(str(tmp_path), "bucket", "model/v1/tranches/data/chunk_1.parquet")
+  key2 = os.path.join(str(tmp_path), "bucket", "model/v1/tranches/data/chunk_2.parquet")
+  out1 = pq.read_table(key1).to_pandas()
+  out2 = pq.read_table(key2).to_pandas()
+
+  assert len(out1) == 3
+  assert len(out2) == 3
+  assert list(out1.columns) == cols
   assert list(out2.columns) == cols
 
 
@@ -103,3 +129,118 @@ def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
   assert called["query_batched"] == 1
   assert list(pd.read_csv(out)["input"]) == ["a", "b"]
   assert list(chunks[0]["input"]) == ["a", "b"]
+
+
+def test_reader_read_streaming_mode_skips_duckdb(monkeypatch):
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.STREAM_PARQUET_THRESHOLD", 1)
+  monkeypatch.setattr("isaura.manage.query", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")))
+
+  def fake_stream(*args, **kwargs):
+    yield pd.DataFrame([{"input": "a", "x": 1.5}, {"input": "b", "x": 2.5}])
+
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
+
+  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
+  df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
+  out = reader.read(df=df)
+
+  assert list(out["input"]) == ["a", "b"]
+
+
+def test_reader_read_batched_streaming_mode_skips_duckdb(monkeypatch, tmp_path):
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.STREAM_PARQUET_THRESHOLD", 1)
+  monkeypatch.setattr(
+    "isaura.manage.query_batched",
+    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")),
+  )
+
+  def fake_stream(*args, **kwargs):
+    yield pd.DataFrame([{"input": "a", "x": 1.5}])
+    yield pd.DataFrame([{"input": "b", "x": 2.5}])
+
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
+
+  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
+  out = tmp_path / "out.csv"
+  df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
+  chunks = list(reader.read_batched(output_csv=str(out), df=df))
+
+  assert list(pd.read_csv(out)["input"]) == ["a", "b"]
+  assert [list(chunk["input"]) for chunk in chunks] == [["a"], ["b"]]
+
+
+def test_base_transfer_select_rows_batched_streaming_mode_skips_duckdb(monkeypatch):
+  class FakeStore:
+    endpoint = "http://127.0.0.1:9000"
+    access = "a"
+    secret = "s"
+
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def download_file(self, *args, **kwargs):
+      raise AssertionError("download_file should not run in this unit test")
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+  monkeypatch.setattr("isaura.base.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.base.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.base.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.base.STREAM_PARQUET_THRESHOLD", 1)
+  monkeypatch.setattr(
+    "isaura.base.query_batched",
+    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")),
+  )
+
+  def fake_stream(*args, **kwargs):
+    yield pd.DataFrame([{"input": "a", "x": 1.5}])
+
+  monkeypatch.setattr("isaura.base.stream_parquet_filtered", fake_stream)
+
+  transfer = _BaseTransfer("m", "v1", "bucket")
+  chunks = list(transfer.select_rows_batched(["a"]))
+
+  assert len(chunks) == 1
+  assert list(chunks[0]["input"]) == ["a"]

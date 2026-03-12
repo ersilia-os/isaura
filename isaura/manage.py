@@ -7,6 +7,7 @@ from isaura.helpers import (
   ACCESS_FILE,
   BLOOM_FILENAME,
   CHECKPOINT_EVERY,
+  STREAM_PARQUET_THRESHOLD,
   DEFAULT_BUCKET_NAME as PUB,
   DEFAULT_PRIVATE_BUCKET_NAME as PRI,
   INPUT_C,
@@ -27,11 +28,13 @@ from isaura.helpers import (
   get_idx_key,
   get_pref,
   group_inputs,
+  hive_prefix,
   make_temp,
   query,
   query_batched,
   split_csv,
   spinner,
+  stream_parquet_filtered,
   tranche_coordinates,
   track_write_progress,
   write_access_file,
@@ -363,10 +366,19 @@ class IsauraReader:
     if not wanted:
       return pd.DataFrame()
     try:
-      files = get_files_glob(self.bucket, self.base)
-      out = spinner(
-        "Fetching queries. Please wait!", query, self.duck.con, header, wanted, files, tmpdir=self.tmpdir
-      )
+      if len(wanted) >= STREAM_PARQUET_THRESHOLD:
+        prefix = hive_prefix(self.base) + "/"
+        logger.info(f"[read] streaming mode n={len(wanted)} bucket={self.bucket}")
+        chunks = list(stream_parquet_filtered(
+          self.store, self.bucket, prefix, wanted, header=header
+        ))
+        out = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        del chunks
+      else:
+        files = get_files_glob(self.bucket, self.base)
+        out = spinner(
+          "Fetching queries. Please wait!", query, self.duck.con, header, wanted, files, tmpdir=self.tmpdir
+        )
       elapsed = time.time() - t0
       logger.success(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
     except Exception as e:
@@ -389,13 +401,21 @@ class IsauraReader:
     t0, wanted, header = self._prepare_read(df=df)
     if not wanted:
       return
-    files = get_files_glob(self.bucket, self.base)
     first_chunk = True
     total_rows = 0
     try:
-      for chunk in query_batched(
-        self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir
-      ):
+      if len(wanted) >= STREAM_PARQUET_THRESHOLD:
+        prefix = hive_prefix(self.base) + "/"
+        logger.info(f"[read_batched] streaming mode n={len(wanted)} bucket={self.bucket}")
+        source = stream_parquet_filtered(
+          self.store, self.bucket, prefix, wanted, header=header, batch_size=batch_size
+        )
+      else:
+        files = get_files_glob(self.bucket, self.base)
+        source = query_batched(
+          self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir
+        )
+      for chunk in source:
         if output_csv:
           chunk.to_csv(output_csv, mode="a", header=first_chunk, index=False)
           first_chunk = False
@@ -414,16 +434,19 @@ class IsauraReader:
 
 class IsauraCopy(_BaseTransfer):
   def copy(self):
+    logger.info(f"[copy] starting model={self.model_id} v={self.model_version} bucket={self.bucket}")
     meta_local, meta = self._load_metadata()
     return self._copy(meta_local, meta)
 
 
 class IsauraMover(_BaseTransfer):
   def move(self):
+    t0 = time.time()
+    logger.info(f"[move] starting model={self.model_id} v={self.model_version} bucket={self.bucket}")
     meta_local, meta = self._load_metadata()
     self._copy(meta_local, meta)
     n = self._delete()
-    logger.info(f"move wiped objects={n}")
+    logger.success(f"[move] done wiped={n} elapsed={time.time()-t0:.1f}s")
 
 
 class IsauraRemover(_BaseTransfer):

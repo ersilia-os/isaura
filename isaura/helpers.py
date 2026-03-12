@@ -1,4 +1,5 @@
-import os, pandas as pd, numpy as np, json, math, os, psutil, requests, subprocess, sys, tempfile, time, yaml
+import os, pandas as pd, numpy as np, json, math, os, psutil, pyarrow as pa, requests, subprocess, sys, tempfile, time, yaml
+import pyarrow.compute as pc
 from io import StringIO
 from collections import defaultdict
 from loguru import logger
@@ -73,6 +74,7 @@ if not os.path.exists(isaura_temp):
 
 STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
+IMMUTABLE_CHUNK_COLS_THRESHOLD = int(os.getenv("IMMUTABLE_CHUNK_COLS_THRESHOLD", "128"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
 INPUT_C = ["input", "smiles"]
@@ -261,6 +263,73 @@ def query_batched(conn, header, wanted, file_glob, batch_size=10_000, columns="*
         yield batch.to_pandas()
     finally:
       conn.unregister("wanted_inputs_batched")
+
+
+STREAM_PARQUET_THRESHOLD = int(os.getenv("STREAM_PARQUET_THRESHOLD", "200000"))
+
+
+def stream_parquet_filtered(store, bucket, prefix, wanted, header="input", batch_size=10_000):
+  import pyarrow.parquet as pq
+  wanted_set = set(wanted) if not isinstance(wanted, set) else wanted
+  remaining = len(wanted_set)
+  tmpdir = make_temp("isaura_stream_")
+  keys = []
+  for obj in store.list_keys(bucket, prefix):
+    k = obj["Key"]
+    if k.endswith(".parquet") and "/chunk_" in k:
+      keys.append(k)
+  keys.sort()
+
+  logger.info(f"[stream] {len(keys)} parquet files, {remaining} wanted inputs")
+
+  for ki, key in enumerate(keys):
+    if remaining <= 0:
+      break
+    local = os.path.join(tmpdir, f"s_{ki}.parquet")
+    try:
+      store.download_file(bucket, key, local)
+    except Exception as e:
+      logger.warning(f"[stream] skip {key}: {e}")
+      continue
+    try:
+      pf = pq.ParquetFile(local)
+      for rg_idx in range(pf.metadata.num_row_groups):
+        table = pf.read_row_group(rg_idx)
+        col = table.column(header)
+        mask = pc.is_in(col, pa.array(list(wanted_set)))
+        filtered = table.filter(mask)
+        if filtered.num_rows == 0:
+          del table, col, mask, filtered
+          continue
+        del table, col, mask
+        for start in range(0, filtered.num_rows, batch_size):
+          chunk = filtered.slice(start, batch_size).to_pandas()
+          matched = set(chunk[header].astype(str).str.strip())
+          remaining -= len(matched & wanted_set)
+          wanted_set -= matched
+          yield chunk
+          del chunk
+        del filtered
+      del pf
+    except Exception as e:
+      logger.warning(f"[stream] error reading {key}: {e}")
+    finally:
+      try:
+        os.remove(local)
+      except Exception:
+        pass
+
+    if (ki + 1) % 10 == 0:
+      logger.info(
+        f"[stream] files={ki+1}/{len(keys)} remaining={remaining} rss={rss_mb():.0f}MB"
+      )
+
+  try:
+    os.rmdir(tmpdir)
+  except Exception:
+    pass
+
+  logger.info(f"[stream] done files={len(keys)} unmatched={remaining}")
 
 
 def group_inputs(wanted, index, bloom=None, force=False):
