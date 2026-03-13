@@ -5,7 +5,8 @@ import pytest
 pq = pytest.importorskip("pyarrow.parquet")
 
 from isaura.base import TrancheState, _BaseTransfer
-from isaura.manage import IsauraReader
+from isaura.helpers import chunk_row_limit, stream_parquet_filtered_ordered
+from isaura.manage import IsauraReader, IsauraWriter
 
 
 class LocalStore:
@@ -107,6 +108,7 @@ def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
   monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
   monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.list_parquet_keys", lambda *args, **kwargs: ["s3://bucket/fake/chunk_1.parquet"])
 
   called = {"query_batched": 0}
 
@@ -244,3 +246,158 @@ def test_base_transfer_select_rows_batched_streaming_mode_skips_duckdb(monkeypat
 
   assert len(chunks) == 1
   assert list(chunks[0]["input"]) == ["a"]
+
+
+def test_chunk_row_limit_uses_output_dimension_threshold():
+  assert chunk_row_limit(150) == 100000
+  assert chunk_row_limit(99) == 2000000
+  assert chunk_row_limit(None) == 2000000
+
+
+def test_reader_wide_model_uses_ordered_streaming(monkeypatch):
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
+  monkeypatch.setattr(
+    "isaura.manage.query_batched",
+    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")),
+  )
+
+  def fake_stream(*args, **kwargs):
+    yield pd.DataFrame([{"input": "a", "x": 1.5}])
+    yield pd.DataFrame([{"input": "b", "x": 2.5}])
+
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered_ordered", fake_stream)
+
+  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
+  df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
+  chunks = list(reader.read_batched(df=df))
+
+  assert [list(chunk["input"]) for chunk in chunks] == [["a"], ["b"]]
+
+
+def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def ensure_bucket(self, bucket):
+      return None
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      self._added = 0
+
+    def seen(self, v):
+      return False
+
+    def register(self, v, rc=None):
+      self._added += 1
+
+    def persist(self):
+      return None
+
+  class FakeChunkState:
+    def __init__(self, *args, **kwargs):
+      self.max_rows = args[-1]
+
+    def flush_df(self, df, schema_cols):
+      return None
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.TrancheState", FakeChunkState)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
+
+  writer = IsauraWriter(input_csv="unused.csv", model_id="m", model_version="v1", bucket="bucket")
+  assert writer.max_rows == 100000
+
+
+def test_writer_buffers_raw_rows_until_flush(monkeypatch):
+  flushed = {}
+
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def ensure_bucket(self, bucket):
+      return None
+
+    def upload_file(self, *args, **kwargs):
+      return None
+
+    def download_file(self, *args, **kwargs):
+      raise FileNotFoundError
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      self._added = 0
+
+    def seen(self, v):
+      return False
+
+    def register(self, v, rc=None):
+      self._added += 1
+
+    def persist(self):
+      return None
+
+  class FakeChunkState:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def flush(self, rows, schema_cols):
+      flushed["rows"] = list(rows)
+      flushed["schema_cols"] = list(schema_cols)
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.TrancheState", FakeChunkState)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 10})
+
+  writer = IsauraWriter(input_csv="unused.csv", model_id="m", model_version="v1", bucket="bucket")
+  writer.max_rows = 2
+  writer.write(df=pd.DataFrame([{"input": "a", "x": 1}, {"input": "b", "x": 2}]), show_progress=False)
+
+  assert writer.buffers == []
+  assert [row["input"] for row in flushed["rows"]] == ["a", "b"]
+  assert flushed["schema_cols"] == ["input", "x"]
+
+
+def test_stream_parquet_filtered_ordered_handles_single_missing(monkeypatch):
+  def fake_stream(*args, **kwargs):
+    yield pd.DataFrame([{"input": "b", "x": 2.0}, {"input": "a", "x": 1.0}])
+    yield pd.DataFrame([{"input": "d", "x": 4.0}])
+
+  monkeypatch.setattr("isaura.helpers.stream_parquet_filtered", fake_stream)
+
+  chunks = list(
+    stream_parquet_filtered_ordered(
+      store=None,
+      bucket="bucket",
+      prefix="prefix",
+      wanted=["a", "missing", "b", "d"],
+      header="input",
+      batch_size=10,
+    )
+  )
+
+  out = pd.concat(chunks, ignore_index=True)
+  assert list(out["input"]) == ["a", "missing", "b", "d"]
+  assert pd.isna(out.loc[1, "x"])

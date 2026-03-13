@@ -1,8 +1,6 @@
 import datetime, os, sys
-
 import rich_click as click
 import rich_click.rich_click as rc
-
 from isaura.manage import (
   IsauraMover,
   IsauraCopy,
@@ -28,8 +26,6 @@ from isaura.helpers import (
 
 click.rich_click.USE_RICH_MARKUP = True
 click.rich_click.SHOW_ARGUMENTS = True
-
-
 rc.USE_RICH_MARKUP = True
 rc.SHOW_ARGUMENTS = True
 rc.COLOR_SYSTEM = "truecolor"
@@ -56,7 +52,6 @@ def cli():
 
 
 show_figlet()
-
 opt_model = click.option("--model", "-m", required=True, help="Ersilia model id (eosxxxx)")
 opt_model_opt = click.option("--model", "-m", required=False, default=None, help="Ersilia model id (eosxxxx)")
 opt_version = click.option("--version", "-v", default="v1", show_default=True, help="Model version")
@@ -67,11 +62,7 @@ opt_project_req = click.option("--project-name", "-pn", required=True, help="Pro
 opt_input_file = click.option("--input-file", "-i", required=True, help="Path to input CSV")
 opt_ins_input_file = click.option("--input-file", "-i", required=False, help="Path to input CSV")
 opt_output_file = click.option(
-  "--output-file",
-  "-o",
-  required=False,
-  default=None,
-  help="Path to output file (csv/h5)",
+  "--output-file", "-o", required=False, default=None, help="Path to output file (csv/h5)"
 )
 opt_access = click.option(
   "--access",
@@ -91,11 +82,7 @@ opt_approx = click.option(
   help="Specifies whether to use Approximate Nearest Neighbor search for result retrieval or not.",
 )
 opt_cloud = click.option(
-  "--cloud",
-  "-c",
-  is_flag=True,
-  default=False,
-  help="Specifies to use isaura in cloud mode or not.",
+  "--cloud", "-c", is_flag=True, default=False, help="Specifies to use isaura in cloud mode or not."
 )
 opt_start = click.option(
   "--start",
@@ -104,7 +91,6 @@ opt_start = click.option(
   default=False,
   help="Specifies to start isuara main engines such as minio, milvus, nns server.",
 )
-
 opt_isaura_dir = click.option(
   "--isaura-dir",
   "-d",
@@ -113,12 +99,8 @@ opt_isaura_dir = click.option(
   show_default=True,
   help="Path to an isaura folder (used mainly to resolve output defaults).",
 )
-
 opt_stats_outdir = click.option(
-  "--output-dir",
-  "-o",
-  required=True,
-  help="Folder where the stats JSON will be written.",
+  "--output-dir", "-o", required=True, help="Folder where the stats JSON will be written."
 )
 
 
@@ -131,13 +113,8 @@ def write(input_file, project_name, access, model, version):
   if project_name is None:
     logger.error("Please specify the project name in order to write the data!")
     sys.exit(1)
-
   with IsauraWriter(
-    input_csv=input_file,
-    model_id=model,
-    model_version=version,
-    bucket=project_name,
-    access=access,
+    input_csv=input_file, model_id=model, model_version=version, bucket=project_name, access=access
   ) as w:
     w.write()
 
@@ -218,7 +195,7 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
     df = insp.inspect_inputs(input_file, output_file)
   else:
     df = insp.list_available(output_file)
-  logger.info(f"wrote {len(df)} rows{(' -> ' + output_file) if output_file else ''}")
+  logger.info(f"wrote {len(df)} rows{(' -> ' + output_file if output_file else '')}")
 
 
 @cli.command("catalog")
@@ -229,11 +206,7 @@ def cmd_inspect_models(project_name, cloud):
   if not rows:
     console.print(f"[yellow]No models found in {project_name}[/]")
     return
-  table = make_table(
-    f"Model catalog in {project_name}",
-    inspect_table,
-    rows,
-  )
+  table = make_table(f"Model catalog in {project_name}", inspect_table, rows)
   console.print(table)
 
 
@@ -242,13 +215,7 @@ def cmd_inspect_models(project_name, cloud):
 def cmd_stats(project_name, access, cloud, output_dir, isaura_dir):
   ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
   out_path = os.path.join(output_dir, f"isaura_stats_{ts}.json")
-
-  st = IsauraStat(
-    project_name=project_name,
-    access=access,
-    cloud=cloud,
-    endpoint=None,
-  )
+  st = IsauraStat(project_name=project_name, access=access, cloud=cloud, endpoint=None)
   written = st.write_json(out_path)
   logger.info(f"isaura stats wrote: {written}")
 
