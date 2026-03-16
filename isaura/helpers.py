@@ -6,12 +6,16 @@ from loguru import logger
 from typing import TypeVar
 from rich.progress import (
   Progress,
+  ProgressColumn,
   SpinnerColumn,
   TextColumn,
   BarColumn,
+  MofNCompleteColumn,
+  TaskProgressColumn,
   TimeRemainingColumn,
   TimeElapsedColumn,
 )
+from rich.progress_bar import ProgressBar
 from rich.text import Text
 from rich.table import Table
 from rich.logging import RichHandler
@@ -28,7 +32,7 @@ try:
 except Exception:
   pass
 logger.remove()
-console = Console()
+console = Console(force_terminal=True)
 logger.level("DEBUG", color="<cyan><bold>")
 logger.level("INFO", color="<blue><bold>")
 logger.level("WARNING", color="<white><bold><bg yellow>")
@@ -67,7 +71,47 @@ STORE_DIRECTORY = os.getenv("STORE_DIRECTORY", isaura_temp)
 MAX_ROWS_PER_FILE = int(os.getenv("MAX_ROWS_PER_FILE", "100000"))
 IMMUTABLE_CHUNK_COLS_THRESHOLD = int(os.getenv("IMMUTABLE_CHUNK_COLS_THRESHOLD", "128"))
 WIDE_OUTPUT_DIM_THRESHOLD = int(os.getenv("WIDE_OUTPUT_DIM_THRESHOLD", "100"))
+DEFAULT_WRITE_BATCH_ROWS = int(os.getenv("DEFAULT_WRITE_BATCH_ROWS", "100000"))
+WIDE_WRITE_BATCH_ROWS = int(os.getenv("WIDE_WRITE_BATCH_ROWS", "50000"))
+WRITE_INPUT_CHUNK_ROWS = int(os.getenv("WRITE_INPUT_CHUNK_ROWS", "50000"))
+STREAM_DENSE_FILE_RATIO = float(os.getenv("STREAM_DENSE_FILE_RATIO", "0.25"))
+STREAM_DENSE_BATCH_ROWS = int(os.getenv("STREAM_DENSE_BATCH_ROWS", "16384"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
+
+# --- Parquet write tuning ---------------------------------------------------
+# Row group size: controls how many rows go into each row group inside a
+# Parquet file.  Larger row groups improve compression and read throughput
+# because there is less per-group metadata overhead, but they use more RAM
+# during writes.  For wide-column models the *data* per row group is already
+# large even with fewer rows, so we keep it smaller to bound memory.
+PARQUET_ROW_GROUP_SIZE = int(os.getenv("PARQUET_ROW_GROUP_SIZE", "500000"))
+WIDE_PARQUET_ROW_GROUP_SIZE = int(os.getenv("WIDE_PARQUET_ROW_GROUP_SIZE", "50000"))
+
+# Compression: zstd gives better ratios than snappy for float-heavy wide data
+# with only modestly higher CPU cost.  Level 1 is almost as fast as snappy.
+PARQUET_COMPRESSION = os.getenv("PARQUET_COMPRESSION", "zstd")
+PARQUET_COMPRESSION_LEVEL = int(os.getenv("PARQUET_COMPRESSION_LEVEL", "1"))
+
+# Data page size: for wide-column data, larger pages reduce page-header
+# overhead per column chunk.  The default PyArrow data_page_size is 1 MB;
+# we bump it to 2 MB for wide models.
+PARQUET_DATA_PAGE_SIZE = int(os.getenv("PARQUET_DATA_PAGE_SIZE", "1048576"))       # 1 MB default
+WIDE_PARQUET_DATA_PAGE_SIZE = int(os.getenv("WIDE_PARQUET_DATA_PAGE_SIZE", "2097152"))  # 2 MB wide
+
+# Dictionary encoding: for wide float/double columns, dictionary encoding is
+# counter-productive (high cardinality makes the dictionary huge).  We
+# disable it for wide models.  For normal models it stays enabled.
+WIDE_PARQUET_USE_DICTIONARY = os.getenv("WIDE_PARQUET_USE_DICTIONARY", "false").lower() in ("1", "true", "yes")
+
+# Write statistics: column statistics allow predicate pushdown.  We always
+# write them for the key column; for wide models we skip per-column stats on
+# output columns to reduce file overhead.
+WIDE_PARQUET_WRITE_STATISTICS = os.getenv("WIDE_PARQUET_WRITE_STATISTICS", "false").lower() in ("1", "true", "yes")
+
+# --- MinIO transfer tuning --------------------------------------------------
+MINIO_MULTIPART_THRESHOLD = int(os.getenv("MINIO_MULTIPART_THRESHOLD", str(8 * 1024 * 1024)))   # 8 MB
+MINIO_MULTIPART_CHUNKSIZE = int(os.getenv("MINIO_MULTIPART_CHUNKSIZE", str(8 * 1024 * 1024)))   # 8 MB
+MINIO_MAX_CONCURRENCY = int(os.getenv("MINIO_MAX_CONCURRENCY", "10"))
 BLOOM_FILENAME = os.getenv("BLOOM_FILENAME", "bloom.pkl")
 INPUT_C = ["input", "smiles"]
 DEFAULT_BUCKET_NAME = os.getenv("DEFAULT_BUCKET_NAME", "isaura-public")
@@ -235,6 +279,42 @@ def chunk_row_limit(output_dimension):
   return MAX_ROWS
 
 
+def chunk_write_batch_rows(output_dimension):
+  if output_dimension is not None and int(output_dimension) >= WIDE_OUTPUT_DIM_THRESHOLD:
+    return WIDE_WRITE_BATCH_ROWS
+  return DEFAULT_WRITE_BATCH_ROWS
+
+
+def parquet_writer_kwargs(output_dimension):
+  """Return kwargs split into ``(constructor_kw, write_table_kw)``.
+
+  ``constructor_kw`` is passed to ``pq.ParquetWriter(path, schema, **kw)``.
+  ``write_table_kw`` is passed to ``writer.write_table(table, **kw)``.
+
+  Splitting is necessary because ``row_group_size`` is a ``write_table``
+  parameter, not a constructor parameter, while ``compression``,
+  ``use_dictionary`` etc. are constructor parameters.
+  """
+  wide = output_dimension is not None and int(output_dimension) >= WIDE_OUTPUT_DIM_THRESHOLD
+  ctor_kw = {
+    "compression": PARQUET_COMPRESSION,
+    "compression_level": PARQUET_COMPRESSION_LEVEL,
+  }
+  wt_kw = {}
+  if wide:
+    wt_kw["row_group_size"] = WIDE_PARQUET_ROW_GROUP_SIZE
+    ctor_kw["use_dictionary"] = WIDE_PARQUET_USE_DICTIONARY
+    ctor_kw["write_statistics"] = WIDE_PARQUET_WRITE_STATISTICS
+    # write_batch_size controls internal Arrow -> Parquet batching and
+    # affects data page boundaries.  Larger values reduce page-header
+    # overhead for wide float columns.
+    ctor_kw["write_batch_size"] = WIDE_PARQUET_DATA_PAGE_SIZE
+  else:
+    wt_kw["row_group_size"] = PARQUET_ROW_GROUP_SIZE
+    ctor_kw["write_batch_size"] = PARQUET_DATA_PAGE_SIZE
+  return ctor_kw, wt_kw
+
+
 def fetch_schema_from_github(model_id):
   try:
     r = get(model_id, METADATA_JSON)
@@ -304,13 +384,22 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp", preserve_
 
 
 def query_batched(
-  conn, header, wanted, file_glob, batch_size=10000, columns="*", tmpdir="/tmp", preserve_order=False
+  conn,
+  header,
+  wanted,
+  file_glob,
+  batch_size=10000,
+  columns="*",
+  tmpdir="/tmp",
+  preserve_order=False,
 ):
   if not wanted:
     logger.debug("[query_batched] empty wanted list — nothing to query")
     return
+
   mem_lim = mem_gb_lim()
-  threads = cpu_cnt()
+  threads = cpu_cnt(ratio=0.8)
+
   try:
     conn.execute(f"SET memory_limit='{mem_lim}GB'")
     conn.execute(f"SET temp_directory='{tmpdir}'")
@@ -318,7 +407,9 @@ def query_batched(
     conn.execute(f"SET threads TO {threads}")
   except Exception:
     pass
+
   wanted_list = list(wanted)
+
   if isinstance(file_glob, list):
     escaped = ", ".join((f"'{u}'" for u in file_glob))
     src_expr = f"read_parquet([{escaped}])"
@@ -326,41 +417,76 @@ def query_batched(
   else:
     src_expr = f"read_parquet('{file_glob}')"
     src_desc = f"glob={file_glob}"
+
   logger.info(
-    f"[query_batched] inputs={len(wanted_list)} arrow_batch_size={batch_size} mem_limit={mem_lim}GB threads={threads} source={src_desc}"
+    f"[query_batched] inputs={len(wanted_list)} "
+    f"arrow_batch_size={batch_size} mem_limit={mem_lim}GB "
+    f"threads={threads} source={src_desc}"
   )
+
   if preserve_order:
-    sql = f"\n          WITH p AS (\n            SELECT {columns}\n            FROM {src_expr}\n            WHERE {header} IN (SELECT {header} FROM __wanted_inputs)\n          )\n          SELECT p.*\n          FROM p\n          JOIN __wanted_inputs w\n            ON p.{header} = w.{header}\n          ORDER BY w.__o\n      "
-    wdf = pd.DataFrame({header: wanted_list, "__o": np.arange(len(wanted_list), dtype=np.int64)})
+    sql = f"""
+            WITH p AS (
+                SELECT {columns}
+                FROM {src_expr}
+                WHERE {header} IN (SELECT {header} FROM __wanted_inputs)
+            )
+            SELECT p.*
+            FROM p
+            JOIN __wanted_inputs w
+                ON p.{header} = w.{header}
+            ORDER BY w.__o
+        """
+    wdf = pd.DataFrame({
+      header: wanted_list,
+      "__o": np.arange(len(wanted_list), dtype=np.int64),
+    })
   else:
-    sql = f"\n          SELECT {columns}\n          FROM {src_expr}\n          WHERE {header} IN (SELECT {header} FROM __wanted_inputs)\n      "
+    sql = f"""
+            SELECT {columns}
+            FROM {src_expr}
+            WHERE {header} IN (SELECT {header} FROM __wanted_inputs)
+        """
     wdf = pd.DataFrame({header: wanted_list})
+
   conn.register("__wanted_inputs", wdf)
+
   total_rows = 0
   n_arrow_batches = 0
   sql_t0 = time.perf_counter()
+
   try:
     rb_reader = conn.execute(sql).fetch_record_batch(batch_size)
+
     for batch in rb_reader:
       n_arrow_batches += 1
       df = batch.to_pandas(split_blocks=True, self_destruct=True)
       total_rows += len(df)
+
       logger.debug(
-        f"[query_batched] arrow_batch #{n_arrow_batches} rows={len(df)} total_rows={total_rows} rss={rss_mb():.0f}MB"
+        f"[query_batched] arrow_batch #{n_arrow_batches} "
+        f"rows={len(df)} total_rows={total_rows} rss={rss_mb():.0f}MB"
       )
+
       yield df
   finally:
     conn.unregister("__wanted_inputs")
+
   sql_dt = time.perf_counter() - sql_t0
+
   logger.info(
-    f"[query_batched] finished total_rows={total_rows} arrow_batches={n_arrow_batches} elapsed={sql_dt:.2f}s rss={rss_mb():.0f}MB"
+    f"[query_batched] finished total_rows={total_rows} "
+    f"arrow_batches={n_arrow_batches} elapsed={sql_dt:.2f}s "
+    f"rss={rss_mb():.0f}MB"
   )
 
 
 STREAM_PARQUET_THRESHOLD = int(os.getenv("STREAM_PARQUET_THRESHOLD", "200000"))
 
 
-def stream_parquet_filtered(store, bucket, prefix, wanted, header="input", batch_size=10000):
+def stream_parquet_filtered(
+  store, bucket, prefix, wanted, header="input", batch_size=10000, dense_file_ratio=STREAM_DENSE_FILE_RATIO, progress=None
+):
   import pyarrow.parquet as pq
 
   wanted_set = set(wanted) if not isinstance(wanted, set) else wanted
@@ -376,13 +502,24 @@ def stream_parquet_filtered(store, bucket, prefix, wanted, header="input", batch
   logger.info(
     f"[stream] starting: {len(keys)} parquet files, {remaining} wanted inputs, batch_size={batch_size} bucket={bucket} prefix={prefix}"
   )
+  if progress is not None:
+    progress.update(stage="starting", files_done=0, files_total=len(keys), found_rows=0, emitted_rows=0, unresolved=remaining)
   total_rg_scanned = 0
   total_rg_hit = 0
   total_rows_yielded = 0
   n_chunks_yielded = 0
+  dense_files = 0
+  initial_wanted = remaining
   for ki, key in enumerate(keys):
     if remaining <= 0:
       break
+    # Rebuild the Arrow lookup array when the wanted set has shrunk by >50%
+    # to speed up subsequent is_in() calls.
+    if remaining < len(wanted_arr) * 0.5:
+      wanted_arr = pa.array(list(wanted_set))
+      logger.debug(f"[stream] rebuilt wanted_arr len={remaining} (was {initial_wanted})")
+    if progress is not None:
+      progress.update(stage="scanning file", files_done=ki, files_total=len(keys), unresolved=remaining)
     local = os.path.join(tmpdir, f"s_{ki}.parquet")
     dl_t0 = time.perf_counter()
     try:
@@ -390,47 +527,100 @@ def stream_parquet_filtered(store, bucket, prefix, wanted, header="input", batch
     except Exception as e:
       logger.warning(f"[stream] skip {key}: {e}")
       continue
-    dl_dt = time.perf_counter() - dl_t0
-    file_size = os.path.getsize(local)
     try:
       pf = pq.ParquetFile(local)
       n_rg = pf.metadata.num_row_groups
-      logger.debug(
-        f"[stream] file {ki + 1}/{len(keys)} key={key} size={file_size / (1024 * 1024):.1f}MB row_groups={n_rg} download={dl_dt:.2f}s"
-      )
+      n_rows = pf.metadata.num_rows
       file_hits = 0
-      for rg_idx in range(n_rg):
-        if remaining <= 0:
-          break
-        total_rg_scanned += 1
-        key_col = pf.read_row_group(rg_idx, columns=[header]).column(header)
-        mask = pc.is_in(key_col, wanted_arr)
-        if pc.any(mask).as_py() is not True:
+      use_dense_path = bool(dense_file_ratio) and n_rows > 0 and remaining >= max(1, int(n_rows * dense_file_ratio))
+      if use_dense_path:
+        dense_files += 1
+        dense_batch_rows = max(batch_size, STREAM_DENSE_BATCH_ROWS)
+        if progress is not None:
+          progress.update(stage=f"dense scan {ki + 1}/{len(keys)}", unresolved=remaining)
+        for batch_idx, batch in enumerate(pf.iter_batches(batch_size=dense_batch_rows), start=1):
+          if remaining <= 0:
+            break
+          table = pa.Table.from_batches([batch])
+          mask = pc.is_in(table.column(header), wanted_arr)
+          if pc.any(mask).as_py() is not True:
+            if progress is not None:
+              progress.update(stage=f"dense scan {ki + 1}/{len(keys)}", unresolved=remaining)
+            continue
+          filtered = table.filter(mask)
+          if filtered.num_rows == 0:
+            continue
+          file_hits += filtered.num_rows
+          if progress is not None:
+            progress.update(
+              stage=f"dense hit {ki + 1}/{len(keys)}",
+              found_rows=total_rows_yielded + filtered.num_rows,
+              unresolved=remaining,
+            )
+          for start in range(0, filtered.num_rows, batch_size):
+            chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+            matched = set(chunk[header].astype(str).str.strip())
+            remaining -= len(matched & wanted_set)
+            wanted_set -= matched
+            n_chunks_yielded += 1
+            total_rows_yielded += len(chunk)
+            if progress is not None:
+              progress.update(
+                stage=f"yielding matches {ki + 1}/{len(keys)}",
+                files_done=ki + 1,
+                files_total=len(keys),
+                found_rows=total_rows_yielded,
+                emitted_rows=total_rows_yielded,
+                unresolved=remaining,
+              )
+            yield chunk
+            del chunk
+      else:
+        for rg_idx in range(n_rg):
+          if remaining <= 0:
+            break
+          total_rg_scanned += 1
+          key_col = pf.read_row_group(rg_idx, columns=[header]).column(header)
+          mask = pc.is_in(key_col, wanted_arr)
+          if pc.any(mask).as_py() is not True:
+            del key_col, mask
+            if progress is not None:
+              progress.update(stage=f"scanning groups {ki + 1}/{len(keys)}", unresolved=remaining)
+            continue
+          total_rg_hit += 1
+          filtered = pf.read_row_group(rg_idx).filter(mask)
           del key_col, mask
-          logger.debug(f"[stream] file {ki + 1} rg {rg_idx}/{n_rg} — no matches, skipped")
-          continue
-        total_rg_hit += 1
-        filtered = pf.read_row_group(rg_idx).filter(mask)
-        del key_col, mask
-        if filtered.num_rows == 0:
+          if filtered.num_rows == 0:
+            del filtered
+            continue
+          file_hits += filtered.num_rows
+          if progress is not None:
+            progress.update(
+              stage=f"row-group hit {ki + 1}/{len(keys)}",
+              found_rows=total_rows_yielded + filtered.num_rows,
+              unresolved=remaining,
+            )
+          for start in range(0, filtered.num_rows, batch_size):
+            chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+            matched = set(chunk[header].astype(str).str.strip())
+            remaining -= len(matched & wanted_set)
+            wanted_set -= matched
+            n_chunks_yielded += 1
+            total_rows_yielded += len(chunk)
+            if progress is not None:
+              progress.update(
+                stage=f"yielding matches {ki + 1}/{len(keys)}",
+                files_done=ki + 1,
+                files_total=len(keys),
+                found_rows=total_rows_yielded,
+                emitted_rows=total_rows_yielded,
+                unresolved=remaining,
+              )
+            yield chunk
+            del chunk
           del filtered
-          continue
-        file_hits += filtered.num_rows
-        logger.debug(
-          f"[stream] file {ki + 1} rg {rg_idx}/{n_rg} — matched {filtered.num_rows} rows, cols={filtered.num_columns}"
-        )
-        for start in range(0, filtered.num_rows, batch_size):
-          chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
-          matched = set(chunk[header].astype(str).str.strip())
-          remaining -= len(matched & wanted_set)
-          wanted_set -= matched
-          n_chunks_yielded += 1
-          total_rows_yielded += len(chunk)
-          yield chunk
-          del chunk
-        del filtered
-      if file_hits > 0:
-        logger.debug(f"[stream] file {ki + 1}/{len(keys)} yielded {file_hits} rows, remaining={remaining}")
+      if progress is not None:
+        progress.update(stage="advancing", files_done=ki + 1, files_total=len(keys), unresolved=remaining)
       del pf
     except Exception as e:
       logger.warning(f"[stream] error reading {key}: {e}")
@@ -439,20 +629,13 @@ def stream_parquet_filtered(store, bucket, prefix, wanted, header="input", batch
         os.remove(local)
       except Exception:
         pass
-    if (ki + 1) % 10 == 0:
-      logger.info(
-        f"[stream] progress files={ki + 1}/{len(keys)} remaining={remaining} rows_yielded={total_rows_yielded} rg_scanned={total_rg_scanned} rg_hit={total_rg_hit} rss={rss_mb():.0f}MB"
-      )
   try:
     os.rmdir(tmpdir)
   except Exception:
     pass
-  logger.info(
-    f"[stream] done files={len(keys)} rg_scanned={total_rg_scanned} rg_hit={total_rg_hit} chunks_yielded={n_chunks_yielded} rows_yielded={total_rows_yielded} unmatched={remaining} rss={rss_mb():.0f}MB"
-  )
 
 
-def stream_parquet_filtered_ordered(store, bucket, prefix, wanted, header="input", batch_size=10000):
+def stream_parquet_filtered_ordered(store, bucket, prefix, wanted, header="input", batch_size=10000, progress=None):
   wanted_list = [str(v).strip() for v in wanted if str(v).strip()]
   if not wanted_list:
     logger.info("[stream-ordered] empty wanted list")
@@ -499,7 +682,7 @@ def stream_parquet_filtered_ordered(store, bucket, prefix, wanted, header="input
       yield make_frame(rows)
 
   for chunk in stream_parquet_filtered(
-    store, bucket, prefix, set(unresolved), header=header, batch_size=batch_size
+    store, bucket, prefix, set(unresolved), header=header, batch_size=batch_size, progress=progress
   ):
     if chunk is None or chunk.empty:
       continue
@@ -511,9 +694,6 @@ def stream_parquet_filtered_ordered(store, bucket, prefix, wanted, header="input
         resolved[key] = row
         unresolved.discard(key)
     for ready in flush_ready():
-      logger.debug(
-        f"[stream-ordered] yield rows={len(ready)} emitted={emitted}/{len(wanted_list)} unresolved={len(unresolved)}"
-      )
       yield ready
     if not unresolved:
       break
@@ -790,6 +970,133 @@ class StreamingCsvSink:
     if df is None or df.empty:
       return
     self.write_table(pa.Table.from_pandas(df, preserve_index=False))
+
+
+class _PulseBarColumn(ProgressColumn):
+  def __init__(
+    self,
+    bar_width=40,
+    style="rgb(36,26,58)",
+    complete_style="bold rgb(56,189,248)",
+    finished_style="bold rgb(34,197,94)",
+    pulse_style="bold rgb(244,114,182)",
+  ):
+    super().__init__()
+    self.bar_width = int(bar_width)
+    self.style = style
+    self.complete_style = complete_style
+    self.finished_style = finished_style
+    self.pulse_style = pulse_style
+
+  def render(self, task):
+    return ProgressBar(
+      total=task.total,
+      completed=task.completed,
+      width=max(1, self.bar_width),
+      pulse=not task.finished,
+      animation_time=task.get_time(),
+      style=self.style,
+      complete_style=self.complete_style,
+      finished_style=self.finished_style,
+      pulse_style=self.pulse_style,
+    )
+
+
+class ReadProgress:
+  def __init__(self, total_inputs=None, console=None):
+    self.total_inputs = total_inputs
+    self.console = console or Console(force_terminal=True, stderr=True)
+    self.progress = None
+    self.task_id = None
+    self.files_done = 0
+    self.files_total = 0
+    self.found_rows = 0
+    self.emitted_rows = 0
+    self.unresolved = total_inputs or 0
+    self._tick = 0
+    self._phrases = ["scanning", "matching", "streaming", "finalizing"]
+
+  def __enter__(self):
+    self.progress = Progress(
+      SpinnerColumn(spinner_name="aesthetic"),
+      TextColumn("[bold magenta]{task.fields[phase]}[/]"),
+      _PulseBarColumn(
+        bar_width=28,
+        style="rgb(40,28,58)",
+        complete_style="bold rgb(56,189,248)",
+        finished_style="bold rgb(34,197,94)",
+        pulse_style="bold rgb(244,114,182)",
+      ),
+      TaskProgressColumn(text_format="[bold bright_cyan]{task.percentage:>3.0f}%[/]"),
+      MofNCompleteColumn(),
+      TextColumn("[cyan]files[/] {task.fields[files_done]}/{task.fields[files_total]}"),
+      TextColumn("[green]emitted[/] {task.fields[emitted_rows]}"),
+      TextColumn("[yellow]pending[/] {task.fields[unresolved]}"),
+      TextColumn("[magenta]rss[/] {task.fields[rss]}MB"),
+      TimeElapsedColumn(),
+      TimeRemainingColumn(),
+      console=self.console,
+      transient=True,
+      redirect_stdout=False,
+      redirect_stderr=False,
+      refresh_per_second=10,
+      expand=True,
+    )
+    self.progress.__enter__()
+    total = self.total_inputs if self.total_inputs is not None else 100
+    self.task_id = self.progress.add_task(
+      self._render("starting"),
+      total=total,
+      completed=0,
+      phase=self._render_phase("starting"),
+      files_done=0,
+      files_total=0,
+      emitted_rows=0,
+      unresolved=self.unresolved,
+      rss=f"{rss_mb():.0f}",
+    )
+    return self
+
+  def __exit__(self, et, ev, tb):
+    if self.progress is not None:
+      self.progress.__exit__(et, ev, tb)
+
+  def _render(self, stage):
+    phrase = self._phrases[self._tick % len(self._phrases)]
+    return f"{phrase} {stage}"
+
+  def _render_phase(self, stage):
+    return self._render(stage).replace("_", " ")
+
+  def update(self, stage=None, files_done=None, files_total=None, found_rows=None, emitted_rows=None, unresolved=None):
+    if files_done is not None:
+      self.files_done = files_done
+    if files_total is not None:
+      self.files_total = files_total
+    if found_rows is not None:
+      self.found_rows = found_rows
+    if emitted_rows is not None:
+      self.emitted_rows = emitted_rows
+    if unresolved is not None:
+      self.unresolved = unresolved
+    self._tick += 1
+    if self.progress is not None and self.task_id is not None:
+      completed = self.found_rows
+      total = self.total_inputs if self.total_inputs is not None else max(100, completed or 0)
+      if completed > total:
+        total = completed
+      self.progress.update(
+        self.task_id,
+        description=self._render(stage or "working"),
+        total=total,
+        completed=completed,
+        phase=self._render_phase(stage or "working"),
+        files_done=self.files_done,
+        files_total=self.files_total,
+        emitted_rows=self.emitted_rows,
+        unresolved=self.unresolved,
+        rss=f"{rss_mb():.0f}",
+      )
 
 
 class Logger:

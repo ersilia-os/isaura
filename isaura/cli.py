@@ -73,6 +73,11 @@ opt_access = click.option(
   help="Which buckets to search when project-name not provided",
 )
 opt_yes_flag = click.option("--yes", "-y", is_flag=True, help="Confirm deletion")
+opt_force_flag = click.option(
+  "--force",
+  is_flag=True,
+  help="Allow writes to default isaura-public or isaura-private buckets",
+)
 opt_dump_outdir = click.option("--output-dir", "-o", required=False, help="Local output directory")
 opt_approx = click.option(
   "--approximate",
@@ -105,11 +110,13 @@ opt_stats_outdir = click.option(
 
 
 @cli.command("write")
-@apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version)
-def write(input_file, project_name, access, model, version):
+@apply_opts(opt_input_file, opt_project, opt_access, opt_model, opt_version, opt_force_flag)
+def write(input_file, project_name, access, model, version, force):
   if project_name in (DEFAULT_PRIVATE_BUCKET_NAME, DEFAULT_BUCKET_NAME):
-    logger.error("Please specify a different project name. Access denied to write to default project names!")
-    sys.exit(1)
+    if not force:
+      logger.error("Access denied to write to default project names. Re-run with --force to allow it.")
+      sys.exit(1)
+    logger.warning(f"Force-enabled write directly to protected bucket: {project_name}")
   if project_name is None:
     logger.error("Please specify the project name in order to write the data!")
     sys.exit(1)

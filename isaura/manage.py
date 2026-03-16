@@ -2,6 +2,7 @@ import csv, datetime, json, os, shutil, sys, time, uuid, pyarrow.parquet as pq, 
 from collections import defaultdict, Counter
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio, _S3RangeFile
 from isaura.helpers import (
   ACCESS_FILE,
@@ -17,7 +18,9 @@ from isaura.helpers import (
   MINIO_CLOUD_SK as mcsk,
   MINIO_PRIV_CLOUD_AK as mcpak,
   MINIO_PRIV_CLOUD_SK as mcpsk,
+  ReadProgress,
   StreamingCsvSink,
+  WRITE_INPUT_CHUNK_ROWS,
   chunk_row_limit,
   logger,
   output_dimension_from_metadata,
@@ -33,6 +36,7 @@ from isaura.helpers import (
   hive_prefix,
   list_parquet_keys,
   make_temp,
+  query,
   query_batched,
   split_csv,
   stream_parquet_filtered,
@@ -120,7 +124,14 @@ class IsauraWriter:
       self.tmpdir,
       bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
     )
-    self.chunk_state = TrancheState(self.store, self.bucket, self.base_prefix, self.tmpdir, self.max_rows)
+    self.chunk_state = TrancheState(
+      self.store,
+      self.bucket,
+      self.base_prefix,
+      self.tmpdir,
+      self.max_rows,
+      output_dimension=self.output_dimension,
+    )
     self.buffers = []
     self.buf_rows = 0
     self.schema_cols = None
@@ -168,44 +179,73 @@ class IsauraWriter:
   def write(self, df=None, show_progress: bool = True):
     total = dupes = 0
     new = []
-    rows_iter, total_rows = (None, None)
     if df is not None:
-      rows_list = df.to_dict("records")
-      rows_iter = rows_list
-      total_rows = len(rows_list)
+      total_rows = len(df)
+      chunk_iter = (df.iloc[start : start + WRITE_INPUT_CHUNK_ROWS] for start in range(0, len(df), WRITE_INPUT_CHUNK_ROWS))
     else:
-      f = open(self.input_csv, newline="", encoding="utf-8")
-      reader = csv.DictReader(f)
-      rows_iter = reader
       total_rows = None
+      chunk_iter = pd.read_csv(self.input_csv, chunksize=WRITE_INPUT_CHUNK_ROWS)
+    progress = None
+    task_id = None
     try:
       if show_progress:
-        rows_iter = track_write_progress(
-          rows_iter, total=total_rows, description="Writing rows", console=logger.console
-        )
-      for row in rows_iter:
-        self._set_schema(row)
-        smi = (row.get("input") or row.get("smiles") or "").strip()
-        if not smi:
-          continue
-        if not self.bi.seen(smi):
-          new.append(smi)
-          self.buffers.append(dict(row))
-          self.buf_rows += 1
-          self.bi.register(smi, rc=(1, 1))
-          total += 1
-          self._flush_if_needed()
-          if self.bi._added >= int(CHECKPOINT_EVERY):
-            self.bi.persist()
+        if total_rows is None:
+          progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("{task.completed} rows"),
+            TimeElapsedColumn(),
+            console=logger.console,
+            transient=True,
+          )
         else:
-          dupes += 1
+          progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=logger.console,
+            transient=True,
+          )
+        progress.__enter__()
+        task_id = progress.add_task("Writing rows", total=total_rows)
+      for chunk in chunk_iter:
+        if chunk is None or chunk.empty:
           continue
+        if self.schema_cols is None:
+          self.schema_cols = list(chunk.columns)
+          logger.info(f"writer schema: {self.schema_cols[:10]}")
+        if "input" in chunk.columns:
+          inputs = chunk["input"].astype(str).str.strip()
+        elif "smiles" in chunk.columns:
+          inputs = chunk["smiles"].astype(str).str.strip()
+        else:
+          inputs = pd.Series([""] * len(chunk), index=chunk.index, dtype="object")
+        non_blank = inputs != ""
+        if hasattr(self.bi, "sbf"):
+          sbf = self.bi.sbf
+          not_seen = non_blank & ~inputs.map(lambda v: v in sbf)
+        else:
+          not_seen = non_blank & ~inputs.map(self.bi.seen)
+        new_df = chunk.loc[not_seen]
+        added = len(new_df)
+        total += added
+        dupes += len(chunk) - added
+        if added:
+          added_inputs = inputs.loc[not_seen].tolist()
+          new.extend(added_inputs)
+          self.buffers.extend(new_df.to_dict("records"))
+          self.buf_rows += added
+          for smi in added_inputs:
+            self.bi.register(smi, rc=(1, 1))
+          self._flush_if_needed()
+        if progress is not None and task_id is not None:
+          progress.advance(task_id, len(chunk))
     finally:
-      if df is None and "f" in locals():
-        try:
-          f.close()
-        except Exception:
-          pass
+      if progress is not None:
+        progress.__exit__(None, None, None)
     if self.buffers:
       self.chunk_state.flush(self.buffers, self.schema_cols)
       self.buffers = []
@@ -331,6 +371,37 @@ class IsauraReader:
     logger.info(f"[read:prepare] ready inputs={len(wanted)} header={header} prep_time={prep_dt:.2f}s")
     return (t0, wanted, header)
 
+  def _make_read_source(self, wanted, header, batch_size=10000, ordered=True):
+    n = len(wanted)
+    # For very large request sets (>= STREAM_PARQUET_THRESHOLD) on non-wide
+    # models, fall back to the streaming download path which avoids holding
+    # all data in DuckDB memory.  For wide models, only stream when the
+    # request is *extremely* large; otherwise DuckDB with httpfs predicate
+    # pushdown over S3 is much faster than downloading full files.
+    wide_stream_threshold = STREAM_PARQUET_THRESHOLD * 5  # 1M inputs for wide
+    if self.wide_model and n >= wide_stream_threshold:
+      prefix = hive_prefix(self.base) + "/"
+      logger.info(
+        f"[read] wide-model streaming mode (very large request) n={n} batch_size={batch_size} "
+        f"bucket={self.bucket} prefix={prefix} output_dim={self.output_dimension}"
+      )
+      return prefix
+    if not self.wide_model and n >= STREAM_PARQUET_THRESHOLD:
+      prefix = hive_prefix(self.base) + "/"
+      logger.info(f"[read] streaming mode n={n} batch_size={batch_size} bucket={self.bucket} prefix={prefix}")
+      return stream_parquet_filtered(self.store, self.bucket, prefix, wanted, header=header, batch_size=batch_size)
+    # DuckDB path -- works for both wide and normal models.
+    # DuckDB uses httpfs to read only required byte ranges from S3, which is
+    # dramatically faster for wide data than downloading entire Parquet files.
+    files = list_parquet_keys(self.store, self.bucket, self.base)
+    logger.info(
+      f"[read] duckdb mode n={n} batch_size={batch_size} bucket={self.bucket} "
+      f"files={(len(files) if isinstance(files, list) else files)} wide={self.wide_model}"
+    )
+    return query_batched(
+      self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=ordered
+    )
+
   def _load_index(self):
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
     downloaded = False
@@ -364,50 +435,35 @@ class IsauraReader:
       logger.info("[read] no inputs to query — returning empty frame")
       return pd.DataFrame()
     try:
-      if self.wide_model:
-        prefix = hive_prefix(self.base) + "/"
-        logger.info(
-          f"[read] wide-model ordered streaming mode n={len(wanted)} bucket={self.bucket} prefix={prefix} output_dim={self.output_dimension}"
-        )
-        source = stream_parquet_filtered_ordered(self.store, self.bucket, prefix, wanted, header=header)
-      elif len(wanted) >= STREAM_PARQUET_THRESHOLD:
-        prefix = hive_prefix(self.base) + "/"
-        logger.info(f"[read] streaming mode n={len(wanted)} bucket={self.bucket} prefix={prefix}")
-        source = stream_parquet_filtered(self.store, self.bucket, prefix, wanted, header=header)
-      else:
-        files = list_parquet_keys(self.store, self.bucket, self.base)
-        logger.info(
-          f"[read] duckdb mode n={len(wanted)} bucket={self.bucket} files={(len(files) if isinstance(files, list) else files)}"
-        )
-        source = query_batched(self.duck.con, header, wanted, files, tmpdir=self.tmpdir, preserve_order=True)
       total_rows = 0
       n_chunks = 0
-      if output_csv:
-        logger.info(f"[read] streaming csv output to {output_csv}")
-        collect = []
-        with StreamingCsvSink(output_csv) as sink:
+      with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
+        source_or_prefix = self._make_read_source(wanted, header, ordered=True)
+        if isinstance(source_or_prefix, str):
+          source = stream_parquet_filtered_ordered(
+            self.store, self.bucket, source_or_prefix, wanted, header=header, progress=progress
+          )
+        else:
+          source = source_or_prefix
+        if output_csv:
+          logger.info(f"[read] streaming csv output to {output_csv}")
+          with StreamingCsvSink(output_csv) as sink:
+            for chunk in source:
+              n_chunks += 1
+              sink.write_df(chunk)
+              total_rows += len(chunk)
+              progress.update(stage="writing csv", emitted_rows=total_rows, unresolved=max(0, len(wanted) - total_rows))
+          out = pd.DataFrame()
+          logger.info(f"[read] wrote csv chunks={n_chunks} rows={total_rows} path={output_csv}")
+        else:
+          parts = []
           for chunk in source:
             n_chunks += 1
-            sink.write_df(chunk)
-            collect.append(chunk)
+            parts.append(chunk)
             total_rows += len(chunk)
-            logger.debug(
-              f"[read] chunk #{n_chunks} rows={len(chunk)} total_rows={total_rows} cols={len(chunk.columns)} rss={rss_mb():.0f}MB"
-            )
-        out = pd.concat(collect, ignore_index=True) if collect else pd.DataFrame()
-        del collect
-        logger.info(f"[read] wrote csv chunks={n_chunks} rows={total_rows} path={output_csv}")
-      else:
-        parts = []
-        for chunk in source:
-          n_chunks += 1
-          parts.append(chunk)
-          total_rows += len(chunk)
-          logger.debug(
-            f"[read] chunk #{n_chunks} rows={len(chunk)} total_rows={total_rows} cols={len(chunk.columns)} rss={rss_mb():.0f}MB"
-          )
-        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-        del parts
+            progress.update(stage="buffering rows", emitted_rows=total_rows, unresolved=max(0, len(wanted) - total_rows))
+          out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+          del parts
       elapsed = time.time() - t0
       logger.success(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
     except Exception as e:
@@ -429,43 +485,25 @@ class IsauraReader:
     n_chunks = 0
     sink = None
     try:
-      if self.wide_model:
-        prefix = hive_prefix(self.base) + "/"
-        logger.info(
-          f"[read_batched] wide-model ordered streaming mode n={len(wanted)} batch_size={batch_size} bucket={self.bucket} prefix={prefix} output_dim={self.output_dimension}"
-        )
-        source = stream_parquet_filtered_ordered(
-          self.store, self.bucket, prefix, wanted, header=header, batch_size=batch_size
-        )
-      elif len(wanted) >= STREAM_PARQUET_THRESHOLD:
-        prefix = hive_prefix(self.base) + "/"
-        logger.info(
-          f"[read_batched] streaming mode n={len(wanted)} batch_size={batch_size} bucket={self.bucket} prefix={prefix}"
-        )
-        source = stream_parquet_filtered(
-          self.store, self.bucket, prefix, wanted, header=header, batch_size=batch_size
-        )
-      else:
-        files = list_parquet_keys(self.store, self.bucket, self.base)
-        logger.info(
-          f"[read_batched] duckdb mode n={len(wanted)} batch_size={batch_size} bucket={self.bucket} files={(len(files) if isinstance(files, list) else files)}"
-        )
-        source = query_batched(
-          self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=True
-        )
-      if output_csv:
-        logger.info(f"[read_batched] streaming csv output to {output_csv}")
-        sink = StreamingCsvSink(output_csv)
-        sink.__enter__()
-      for chunk in source:
-        n_chunks += 1
-        if sink is not None:
-          sink.write_df(chunk)
-        total_rows += len(chunk)
-        logger.debug(
-          f"[read_batched] chunk #{n_chunks} rows={len(chunk)} total_rows={total_rows} cols={len(chunk.columns)} rss={rss_mb():.0f}MB"
-        )
-        yield chunk
+      with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
+        source_or_prefix = self._make_read_source(wanted, header, batch_size=batch_size, ordered=True)
+        if isinstance(source_or_prefix, str):
+          source = stream_parquet_filtered_ordered(
+            self.store, self.bucket, source_or_prefix, wanted, header=header, batch_size=batch_size, progress=progress
+          )
+        else:
+          source = source_or_prefix
+        if output_csv:
+          logger.info(f"[read_batched] streaming csv output to {output_csv}")
+          sink = StreamingCsvSink(output_csv)
+          sink.__enter__()
+        for chunk in source:
+          n_chunks += 1
+          if sink is not None:
+            sink.write_df(chunk)
+          total_rows += len(chunk)
+          progress.update(stage="emitting rows", emitted_rows=total_rows, unresolved=max(0, len(wanted) - total_rows))
+          yield chunk
     except Exception as e:
       logger.error(f"[read_batched] query failed: {e}")
       sys.exit(1)

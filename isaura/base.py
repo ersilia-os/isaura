@@ -14,9 +14,14 @@ from isaura.helpers import (
   STREAM_PARQUET_THRESHOLD,
   DEFAULT_BUCKET_NAME as pub_bucket,
   DEFAULT_PRIVATE_BUCKET_NAME as priv_bucket,
+  MINIO_MULTIPART_THRESHOLD,
+  MINIO_MULTIPART_CHUNKSIZE,
+  MINIO_MAX_CONCURRENCY,
   logger,
   rss_mb,
   chunk_row_limit,
+  chunk_write_batch_rows,
+  parquet_writer_kwargs,
   fetch_schema_from_github,
   get_acc_key,
   get_base,
@@ -123,9 +128,9 @@ class MinioStore:
     endpoint=None,
     access=None,
     secret=None,
-    multipart_threshold=5 * 1024 * 1024,
-    multipart_chunksize=5 * 1024 * 1024,
-    max_concurrency=2,
+    multipart_threshold=None,
+    multipart_chunksize=None,
+    max_concurrency=None,
     use_threads=True,
   ):
     self.endpoint = endpoint or MINIO_ENDPOINT
@@ -140,9 +145,9 @@ class MinioStore:
       config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
     self.transfer_config = TransferConfig(
-      multipart_threshold=multipart_threshold,
-      multipart_chunksize=multipart_chunksize,
-      max_concurrency=max_concurrency,
+      multipart_threshold=multipart_threshold or MINIO_MULTIPART_THRESHOLD,
+      multipart_chunksize=multipart_chunksize or MINIO_MULTIPART_CHUNKSIZE,
+      max_concurrency=max_concurrency or MINIO_MAX_CONCURRENCY,
       use_threads=use_threads,
     )
     if not self.ping(self.client):
@@ -328,13 +333,14 @@ class BloomIndex:
 
 
 class ChunkState:
-  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows):
+  def __init__(self, store, bucket, base_prefix, tmpdir, max_rows, output_dimension=None):
     self.store = store
     self.bucket = bucket
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
-    self.write_batch_rows = 2048
+    self.write_batch_rows = chunk_write_batch_rows(output_dimension)
+    self.pq_ctor_kw, self.pq_wt_kw = parquet_writer_kwargs(output_dimension)
     self.state = {}
 
   def _rows_to_frame(self, rows, schema_cols):
@@ -411,15 +417,16 @@ class ChunkState:
   def _write_chunk(self, rows, schema_cols, idx, mode="new", existing_local=None):
     os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
+    ctor_kw, wt_kw = self.pq_ctor_kw, self.pq_wt_kw
     if mode == "append" and existing_local:
       tmp = local + ".merged"
       old_pf = pq.ParquetFile(existing_local)
       schema = old_pf.schema_arrow
-      with pq.ParquetWriter(tmp, schema) as writer:
+      with pq.ParquetWriter(tmp, schema, **ctor_kw) as writer:
         for batch in old_pf.iter_batches(batch_size=self.write_batch_rows):
           writer.write_batch(batch)
         for table in self._iter_tables(rows, schema_cols):
-          writer.write_table(table.cast(schema))
+          writer.write_table(table.cast(schema), **wt_kw)
       os.replace(tmp, local)
     else:
       tmp = local + ".tmp"
@@ -427,8 +434,8 @@ class ChunkState:
       try:
         for table in self._iter_tables(rows, schema_cols):
           if writer is None:
-            writer = pq.ParquetWriter(tmp, table.schema)
-          writer.write_table(table)
+            writer = pq.ParquetWriter(tmp, table.schema, **ctor_kw)
+          writer.write_table(table, **wt_kw)
       finally:
         if writer is not None:
           writer.close()
@@ -444,15 +451,16 @@ class ChunkState:
   def _write_chunk_df(self, df, schema_cols, idx, mode="new", existing_local=None):
     os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
+    ctor_kw, wt_kw = self.pq_ctor_kw, self.pq_wt_kw
     if mode == "append" and existing_local:
       tmp = local + ".merged"
       old_pf = pq.ParquetFile(existing_local)
       schema = old_pf.schema_arrow
-      with pq.ParquetWriter(tmp, schema) as writer:
+      with pq.ParquetWriter(tmp, schema, **ctor_kw) as writer:
         for batch in old_pf.iter_batches(batch_size=self.write_batch_rows):
           writer.write_batch(batch)
         for table in self._iter_tables_df(df, schema_cols):
-          writer.write_table(table.cast(schema))
+          writer.write_table(table.cast(schema), **wt_kw)
       os.replace(tmp, local)
     else:
       tmp = local + ".tmp"
@@ -460,8 +468,8 @@ class ChunkState:
       try:
         for table in self._iter_tables_df(df, schema_cols):
           if writer is None:
-            writer = pq.ParquetWriter(tmp, table.schema)
-          writer.write_table(table)
+            writer = pq.ParquetWriter(tmp, table.schema, **ctor_kw)
+          writer.write_table(table, **wt_kw)
       finally:
         if writer is not None:
           writer.close()
@@ -570,7 +578,7 @@ TrancheState = ChunkState
 
 
 class _SinkWriter:
-  def __init__(self, store, bucket, model_id, model_version, tmpdir, max_rows=None):
+  def __init__(self, store, bucket, model_id, model_version, tmpdir, max_rows=None, output_dimension=None):
     self.store = store
     self.bucket = bucket
     self.model_id = model_id
@@ -580,20 +588,29 @@ class _SinkWriter:
     self.max_rows = int(max_rows or MAX_ROWS)
     self.store.ensure_bucket(self.bucket)
     self.bi = BloomIndex(self.store, self.bucket, self.base, tmpdir)
-    self.chunk_state = ChunkState(self.store, self.bucket, self.base, tmpdir, self.max_rows)
+    self.chunk_state = ChunkState(
+      self.store, self.bucket, self.base, tmpdir, self.max_rows, output_dimension=output_dimension
+    )
     self.buffers = []
     self.buf_rows = 0
     self.schema_cols = None
+    self.last_added_inputs = []
 
   def add_rows(self, df):
     try:
       if df is None or df.empty:
         logger.debug("[sink] empty batch")
+        self.last_added_inputs = []
         return 0
       n_in = len(df)
       if self.schema_cols is None:
         self.schema_cols = list(df.columns)
-      inputs = df["input"].astype(str).str.strip()
+      if "input" in df.columns:
+        inputs = df["input"].astype(str).str.strip()
+      elif "smiles" in df.columns:
+        inputs = df["smiles"].astype(str).str.strip()
+      else:
+        inputs = pd.Series([""] * len(df), index=df.index, dtype="object")
       non_blank = inputs != ""
       sbf = self.bi.sbf
       not_seen = non_blank & ~inputs.map(lambda v: v in sbf)
@@ -601,9 +618,11 @@ class _SinkWriter:
       skipped_seen = int(non_blank.sum() - not_seen.sum())
       new_df = df.loc[not_seen]
       added = len(new_df)
+      self.last_added_inputs = []
       if added == 0:
         logger.info(f"[sink] in={n_in} added=0 seen={skipped_seen} blank={skipped_blank}")
         return 0
+      self.last_added_inputs = inputs.loc[not_seen].tolist()
       for smi in inputs.loc[not_seen]:
         self.bi.register(smi, rc=(1, 1))
       self.buffers.append(new_df)
@@ -751,6 +770,7 @@ class _BaseTransfer:
       self.model_version,
       self.tmpdir,
       max_rows=self._chunk_row_limit(),
+      output_dimension=self._get_output_dimension(),
     )
     tp, tu = (0, 0)
     apprx_inputs = []
@@ -776,6 +796,7 @@ class _BaseTransfer:
       self.model_version,
       self.tmpdir,
       max_rows=self._chunk_row_limit(),
+      output_dimension=self._get_output_dimension(),
     )
     tp = 0
     apprx_inputs = []
@@ -840,6 +861,7 @@ class _BaseTransfer:
         self.model_version,
         self.tmpdir_sinkw,
         max_rows=self._chunk_row_limit(),
+        output_dimension=self._get_output_dimension(),
       )
       if has_priv
       else None
@@ -852,6 +874,7 @@ class _BaseTransfer:
         self.model_version,
         self.tmpdir_sinkw,
         max_rows=self._chunk_row_limit(),
+        output_dimension=self._get_output_dimension(),
       )
       if has_pub
       else None

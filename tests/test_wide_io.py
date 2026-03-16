@@ -254,7 +254,14 @@ def test_chunk_row_limit_uses_output_dimension_threshold():
   assert chunk_row_limit(None) == 2000000
 
 
-def test_reader_wide_model_uses_ordered_streaming(monkeypatch):
+def test_reader_wide_model_uses_duckdb_by_default(monkeypatch):
+  """Wide models now use DuckDB (httpfs predicate pushdown over S3) by default.
+
+  This is faster than the old streaming path that downloaded entire Parquet
+  files.  Streaming only kicks in for very large request sets (>= 5x the
+  normal STREAM_PARQUET_THRESHOLD).
+  """
+
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
@@ -274,21 +281,26 @@ def test_reader_wide_model_uses_ordered_streaming(monkeypatch):
   monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
   monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
+  monkeypatch.setattr("isaura.manage.list_parquet_keys", lambda *args, **kwargs: ["s3://bucket/fake/chunk_1.parquet"])
   monkeypatch.setattr(
-    "isaura.manage.query_batched",
-    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")),
+    "isaura.manage.stream_parquet_filtered_ordered",
+    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("streaming path should not run for small wide reads")),
   )
 
-  def fake_stream(*args, **kwargs):
+  called = {"query_batched": 0}
+
+  def fake_query_batched(*args, **kwargs):
+    called["query_batched"] += 1
     yield pd.DataFrame([{"input": "a", "x": 1.5}])
     yield pd.DataFrame([{"input": "b", "x": 2.5}])
 
-  monkeypatch.setattr("isaura.manage.stream_parquet_filtered_ordered", fake_stream)
+  monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
 
   reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
   df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
   chunks = list(reader.read_batched(df=df))
 
+  assert called["query_batched"] == 1
   assert [list(chunk["input"]) for chunk in chunks] == [["a"], ["b"]]
 
 
