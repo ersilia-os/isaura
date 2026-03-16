@@ -108,7 +108,9 @@ def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
   monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
   monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
-  monkeypatch.setattr("isaura.manage.list_parquet_keys", lambda *args, **kwargs: ["s3://bucket/fake/chunk_1.parquet"])
+  monkeypatch.setattr(
+    "isaura.manage.list_parquet_keys", lambda *args, **kwargs: ["s3://bucket/fake/chunk_1.parquet"]
+  )
 
   called = {"query_batched": 0}
 
@@ -121,7 +123,9 @@ def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
 
   monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
 
-  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
+  reader = IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+  )
   reader._load_index = lambda: (_ for _ in ()).throw(AssertionError("index should not load"))
 
   out = tmp_path / "out.csv"
@@ -153,14 +157,19 @@ def test_reader_read_streaming_mode_skips_duckdb(monkeypatch):
   monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
   monkeypatch.setattr("isaura.manage.STREAM_PARQUET_THRESHOLD", 1)
-  monkeypatch.setattr("isaura.manage.query", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")))
+  monkeypatch.setattr(
+    "isaura.manage.query",
+    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")),
+  )
 
-  def fake_stream(*args, **kwargs):
+  def fake_ordered_stream(*args, **kwargs):
     yield pd.DataFrame([{"input": "a", "x": 1.5}, {"input": "b", "x": 2.5}])
 
-  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered_ordered", fake_ordered_stream)
 
-  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
+  reader = IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+  )
   df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
   out = reader.read(df=df)
 
@@ -192,13 +201,15 @@ def test_reader_read_batched_streaming_mode_skips_duckdb(monkeypatch, tmp_path):
     lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("duckdb path should not run")),
   )
 
-  def fake_stream(*args, **kwargs):
+  def fake_ordered_stream(*args, **kwargs):
     yield pd.DataFrame([{"input": "a", "x": 1.5}])
     yield pd.DataFrame([{"input": "b", "x": 2.5}])
 
-  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered_ordered", fake_ordered_stream)
 
-  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
+  reader = IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+  )
   out = tmp_path / "out.csv"
   df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
   chunks = list(reader.read_batched(output_csv=str(out), df=df))
@@ -254,14 +265,7 @@ def test_chunk_row_limit_uses_output_dimension_threshold():
   assert chunk_row_limit(None) == 2000000
 
 
-def test_reader_wide_model_uses_duckdb_by_default(monkeypatch):
-  """Wide models now use DuckDB (httpfs predicate pushdown over S3) by default.
-
-  This is faster than the old streaming path that downloaded entire Parquet
-  files.  Streaming only kicks in for very large request sets (>= 5x the
-  normal STREAM_PARQUET_THRESHOLD).
-  """
-
+def test_reader_wide_model_uses_fast_stream_then_reorders(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
@@ -281,27 +285,24 @@ def test_reader_wide_model_uses_duckdb_by_default(monkeypatch):
   monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
   monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
-  monkeypatch.setattr("isaura.manage.list_parquet_keys", lambda *args, **kwargs: ["s3://bucket/fake/chunk_1.parquet"])
-  monkeypatch.setattr(
-    "isaura.manage.stream_parquet_filtered_ordered",
-    lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("streaming path should not run for small wide reads")),
+
+  called = {"stream": 0}
+
+  def fake_stream(*args, **kwargs):
+    called["stream"] += 1
+    yield pd.DataFrame([{"input": "b", "x": 2.5}, {"input": "a", "x": 1.5}])
+
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
+
+  reader = IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
   )
-
-  called = {"query_batched": 0}
-
-  def fake_query_batched(*args, **kwargs):
-    called["query_batched"] += 1
-    yield pd.DataFrame([{"input": "a", "x": 1.5}])
-    yield pd.DataFrame([{"input": "b", "x": 2.5}])
-
-  monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
-
-  reader = IsauraReader(model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False)
   df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
   chunks = list(reader.read_batched(df=df))
 
-  assert called["query_batched"] == 1
-  assert [list(chunk["input"]) for chunk in chunks] == [["a"], ["b"]]
+  assert called["stream"] == 1
+  all_rows = pd.concat(chunks, ignore_index=True)
+  assert list(all_rows["input"]) == ["a", "b"]
 
 
 def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
@@ -397,7 +398,7 @@ def test_stream_parquet_filtered_ordered_handles_single_missing(monkeypatch):
     yield pd.DataFrame([{"input": "b", "x": 2.0}, {"input": "a", "x": 1.0}])
     yield pd.DataFrame([{"input": "d", "x": 4.0}])
 
-  monkeypatch.setattr("isaura.helpers.stream_parquet_filtered", fake_stream)
+  monkeypatch.setattr("isaura.stream.stream_parquet_filtered", fake_stream)
 
   chunks = list(
     stream_parquet_filtered_ordered(
