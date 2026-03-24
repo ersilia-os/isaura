@@ -18,6 +18,7 @@ from isaura.helpers import (
   logger,
   console,
   inspect_table,
+  inspect_table_cloud,
   make_table,
   show_figlet,
   run_docker_compose,
@@ -213,7 +214,8 @@ def cmd_inspect_models(project_name, cloud):
   if not rows:
     console.print(f"[yellow]No models found in {project_name}[/]")
     return
-  table = make_table(f"Model catalog in {project_name}", inspect_table, rows)
+  cols = inspect_table_cloud if cloud else inspect_table
+  table = make_table(f"Model catalog in {project_name}", cols, rows)
   console.print(table)
 
 

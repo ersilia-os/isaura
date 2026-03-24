@@ -659,32 +659,64 @@ class IsauraPush:
     self.model_version = model_version
     self.bucket = bucket
 
+  def _iter_local_chunks(self, store, bucket, batch_rows=WRITE_INPUT_CHUNK_ROWS):
+    """Stream rows from local parquet chunks without loading the full index."""
+    base = get_base(self.model_id, self.model_version)
+    prefix = hive_prefix(base) + "/"
+    keys = sorted(
+      obj["Key"]
+      for obj in store.list_keys(bucket, prefix)
+      if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
+    )
+    if not keys:
+      return
+    tmpdir = make_temp("isaura_push_stream_")
+    try:
+      for ki, key in enumerate(keys):
+        local = os.path.join(tmpdir, f"push_{ki}.parquet")
+        try:
+          store.download_file(bucket, key, local)
+        except Exception as e:
+          logger.warning(f"[push-stream] skip {key}: {e}")
+          continue
+        try:
+          pf = pq.ParquetFile(local)
+          for batch in pf.iter_batches(batch_size=batch_rows):
+            df = batch.to_pandas(split_blocks=True, self_destruct=True)
+            if not df.empty:
+              yield df
+            del df
+          del pf
+        except Exception as e:
+          logger.warning(f"[push-stream] error reading {key}: {e}")
+        finally:
+          try:
+            os.remove(local)
+          except Exception:
+            pass
+    finally:
+      try:
+        shutil.rmtree(tmpdir)
+      except Exception:
+        pass
+
   def push(self):
-    insp = IsauraInspect(model_id=self.model_id, model_version=self.model_version, access="both", cloud=False)
-    df = insp.list_available()
-    if df.empty:
-      logger.error("No data found in any default bucket for a given model! Aborting push.")
-      sys.exit(1)
-    files = split_csv(df)
-    if not files:
-      logger.error("No data found in any default bucket! Aborting push.")
-      sys.exit(1)
-    file1 = files[0]
-    file2 = files[1] if len(files) > 1 else None
-    if not file2:
-      logger.warning("Private bucket has no data! Skipping push for it.")
-    for access, file, mck, mcs in [("public", file1, mcak, mcsk), ("private", file2, mcpak, mcpsk)]:
-      if not file:
+    local_store = MinioStore()
+    has_data = False
+    for access, src_bucket, mck, mcs in [
+      ("public", PUB, mcak, mcsk),
+      ("private", PRI, mcpak, mcpsk),
+    ]:
+      chunk_iter = self._iter_local_chunks(local_store, src_bucket)
+      first = next(chunk_iter, None)
+      if first is None:
+        chunk_iter.close()
+        logger.warning(f"{access} bucket has no data for {self.model_id}. Skipping.")
         continue
-      r = IsauraReader(
-        model_id=self.model_id,
-        model_version=self.model_version,
-        input_csv=file,
-        approximate=False,
-        bucket=f"isaura-{access}",
-      )
+      has_data = True
+      logger.info(f"[push] streaming {access} data to cloud for {self.model_id}")
       with IsauraWriter(
-        input_csv=file,
+        input_csv=None,
         model_id=self.model_id,
         model_version=self.model_version,
         bucket=f"isaura-{access}",
@@ -693,8 +725,12 @@ class IsauraPush:
         access_key=mck,
         secrete=mcs,
       ) as w:
-        for chunk in r.read_batched():
+        w.write(df=first, show_progress=False)
+        for chunk in chunk_iter:
           w.write(df=chunk, show_progress=False)
+    if not has_data:
+      logger.error("No data found in any default bucket for a given model! Aborting push.")
+      sys.exit(1)
 
 
 class IsauraInspect:
@@ -888,37 +924,81 @@ class IsauraInspect:
       return None
 
   def entries_from_chunks(self, bucket, model_id, model_version):
-    total = 0
-    n_chunks = 0
-    for k, sz in self.find_chunk_keys(bucket, model_id, model_version):
-      n_chunks += 1
-      n = self.parquet_num_rows(bucket, k, size=sz)
-      if n is not None:
-        total += int(n)
-    return (total, n_chunks)
+    chunks = list(self.find_chunk_keys(bucket, model_id, model_version))
+    if not chunks:
+      return (0, 0)
+    with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+      futs = {pool.submit(self.parquet_num_rows, bucket, k, sz): k for k, sz in chunks}
+      total = 0
+      for fut in as_completed(futs):
+        n = fut.result()
+        if n is not None:
+          total += int(n)
+    return (total, len(chunks))
 
   def inspect_models(self, bucket, prefix_filter=""):
+    if self.cloud and (not self.heavy_index):
+      return self._inspect_models_from_listing(bucket, prefix_filter)
     out = []
     for mid, mv in self.iter_models(bucket, prefix_filter=prefix_filter):
-      if self.cloud and (not self.heavy_index):
-        entries, chunks = self.entries_from_chunks(bucket, mid, mv)
-        out.append({
-          "bucket": bucket,
-          "model_id": mid,
-          "model_version": mv,
-          "model": f"{mid}/{mv}",
-          "entries": int(entries),
-          "chunks": int(chunks),
-        })
+      out.append({
+        "bucket": bucket, "model_id": mid, "model_version": mv,
+        "model": f"{mid}/{mv}", "entries": len(self.load_index(bucket, mid, mv)), "chunks": None,
+      })
+    return out
+
+  def _inspect_models_from_listing(self, bucket, prefix_filter=""):
+    """Single LIST call over the bucket, then one footer read per model for row estimate."""
+    stats = defaultdict(lambda: {"chunks": 0, "bytes": 0, "largest_key": None, "largest_sz": 0})
+    for obj in self.iter_object_meta(bucket, prefix_filter):
+      k = obj.get("Key", "")
+      if "/chunk_" not in k or not k.endswith(".parquet"):
+        continue
+      parts = k.split("/")
+      if len(parts) >= 2:
+        mid, mv = parts[0], parts[1]
+        sz = int(obj.get("Size") or 0)
+        s = stats[(mid, mv)]
+        s["chunks"] += 1
+        s["bytes"] += sz
+        if sz > s["largest_sz"]:
+          s["largest_key"] = k
+          s["largest_sz"] = sz
+
+    # one footer read per model to get bytes-per-row ratio
+    def _estimate(s):
+      key, ksz, total = s["largest_key"], s["largest_sz"], s["bytes"]
+      if not key or ksz <= 0:
+        return "?"
+      rows = self.parquet_num_rows(bucket, key, size=ksz)
+      if not rows:
+        return "?"
+      return int(total * rows / ksz)
+
+    models = sorted(stats.items())
+    with ThreadPoolExecutor(max_workers=min(16, len(models))) as pool:
+      futs = {pool.submit(_estimate, s): (mid, mv) for (mid, mv), s in models}
+      estimates = {}
+      for fut in as_completed(futs):
+        estimates[futs[fut]] = fut.result()
+
+    out = []
+    for (mid, mv), s in models:
+      b = s["bytes"]
+      if b >= 1 << 30:
+        size = f"{b / (1 << 30):.1f} GB"
+      elif b >= 1 << 20:
+        size = f"{b / (1 << 20):.1f} MB"
+      elif b >= 1 << 10:
+        size = f"{b / (1 << 10):.1f} KB"
       else:
-        out.append({
-          "bucket": bucket,
-          "model_id": mid,
-          "model_version": mv,
-          "model": f"{mid}/{mv}",
-          "entries": len(self.load_index(bucket, mid, mv)),
-          "chunks": None,
-        })
+        size = f"{b} B"
+      est = estimates.get((mid, mv), "?")
+      rows = f"~{est:,}" if isinstance(est, int) else est
+      out.append({
+        "bucket": bucket, "model_id": mid, "model_version": mv,
+        "model": f"{mid}/{mv}", "entries": rows, "size": size, "chunks": s["chunks"],
+      })
     return out
 
   def find_any_chunk_key(self, bucket, model_id, model_version):
