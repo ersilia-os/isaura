@@ -15,6 +15,7 @@ from isaura.helpers import (
   ACCESS_FILE,
   BLOOM_FILENAME,
   CHECKPOINT_EVERY,
+  INDEX_FILE,
   STREAM_PARQUET_THRESHOLD,
   DEFAULT_BUCKET_NAME as PUB,
   DEFAULT_PRIVATE_BUCKET_NAME as PRI,
@@ -680,9 +681,33 @@ class IsauraPush:
       except Exception:
         pass
 
+  def _merge_bloom_index(self, local_store, src_bucket, cloud_store, dst_bucket, tmpdir):
+    """Load cloud bloom+index, merge local entries in, persist back to cloud."""
+    base = get_base(self.model_id, self.model_version)
+    # load cloud bloom+index (this downloads from cloud, or creates fresh if missing)
+    cloud_bi = BloomIndex(cloud_store, dst_bucket, base, os.path.join(tmpdir, "cloud"))
+    # load local bloom+index
+    local_bi = BloomIndex(local_store, src_bucket, base, os.path.join(tmpdir, "local"))
+    # merge local index entries into cloud
+    if local_bi.index:
+      for k, v in local_bi.index.items():
+        if cloud_bi.index is not None and k not in cloud_bi.index:
+          cloud_bi.index[k] = v
+    # merge local bloom entries into cloud bloom
+    if local_bi.index:
+      for k in local_bi.index:
+        cloud_bi.sbf.add(k)
+    cloud_bi._added = 1  # force persist
+    cloud_bi.persist()
+    logger.info(
+      f"[push] merged bloom+index to cloud: "
+      f"cloud_index={len(cloud_bi.index or {})} entries"
+    )
+
   def push(self):
     local_store = MinioStore()
     prefix = get_pref(self.model_id, self.model_version) + "/"
+    skip_suffixes = (BLOOM_FILENAME, INDEX_FILE)
     has_data = False
     for access, src_bucket, mck, mcs in [
       ("public", PUB, mcak, mcsk),
@@ -691,7 +716,10 @@ class IsauraPush:
       if not self._bucket_exists(local_store, src_bucket):
         logger.warning(f"[push] local bucket {src_bucket} does not exist. Skipping {access}.")
         continue
-      keys = [obj["Key"] for obj in local_store.list_keys(src_bucket, prefix)]
+      keys = [
+        obj["Key"] for obj in local_store.list_keys(src_bucket, prefix)
+        if not obj["Key"].endswith(skip_suffixes)
+      ]
       if not keys:
         logger.warning(f"[push] no data for {self.model_id} in {src_bucket}. Skipping {access}.")
         continue
@@ -723,6 +751,8 @@ class IsauraPush:
         for err in errors:
           logger.warning(err)
         logger.info(f"[push] {access} done: {done}/{len(keys)} objects uploaded to cloud")
+        with logger.console.status("Merging bloom filter and index...", spinner="dots"):
+          self._merge_bloom_index(local_store, src_bucket, cloud_store, dst_bucket, tmpdir)
       finally:
         try:
           shutil.rmtree(tmpdir)
