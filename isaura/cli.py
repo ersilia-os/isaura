@@ -210,7 +210,10 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
 @apply_opts(opt_project, opt_cloud)
 def cmd_inspect_models(project_name, cloud):
   insp = IsauraInspect(cloud=cloud)
-  rows = insp.inspect_models(project_name, prefix_filter="")
+  # warm up the client so the health-check log fires before the spinner
+  insp._clients(project_name)
+  with console.status("Fetching catalog...", spinner="dots"):
+    rows = insp.inspect_models(project_name, prefix_filter="")
   if not rows:
     console.print(f"[yellow]No models found in {project_name}[/]")
     return
