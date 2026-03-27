@@ -312,24 +312,40 @@ class BloomIndex:
     if self._added >= CHECKPOINT_EVERY:
       self.persist()
 
-  def persist(self):
+  def persist(self, retries=3):
     tb = f"{self.local_bloom}.tmp"
     with open(tb, "wb") as f:
       pickle.dump(self.sbf, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tb, self.local_bloom)
-    try:
-      self.store.upload_file(self.local_bloom, self.bucket, self.bloom_key)
-    except Exception as e:
-      logger.warning(f"bloom upload failed: {e}")
+    for attempt in range(1, retries + 1):
+      try:
+        self.store.upload_file(self.local_bloom, self.bucket, self.bloom_key)
+        break
+      except Exception as e:
+        if attempt < retries:
+          logger.warning(f"bloom upload attempt {attempt}/{retries} failed: {e}")
+          time.sleep(1)
+        else:
+          raise RuntimeError(
+            f"bloom upload failed after {retries} attempts — aborting to prevent duplicates: {e}"
+          ) from e
     if self.index is not None:
       ti = f"{self.local_index}.tmp"
       with open(ti, "w", encoding="utf-8") as f:
         json.dump(self.index, f, separators=(",", ":"), ensure_ascii=False)
       os.replace(ti, self.local_index)
-      try:
-        self.store.upload_file(self.local_index, self.bucket, self.index_key)
-      except Exception as e:
-        logger.warning(f"index upload failed: {e}")
+      for attempt in range(1, retries + 1):
+        try:
+          self.store.upload_file(self.local_index, self.bucket, self.index_key)
+          break
+        except Exception as e:
+          if attempt < retries:
+            logger.warning(f"index upload attempt {attempt}/{retries} failed: {e}")
+            time.sleep(1)
+          else:
+            raise RuntimeError(
+              f"index upload failed after {retries} attempts: {e}"
+            ) from e
     self._added = 0
 
 
