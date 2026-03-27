@@ -8,6 +8,7 @@ except Exception:
   pass
 
 ACCESS_FILE = "access.json"
+CATALOG_FILE = "catalog.json"
 INDEX_FILE = "index.json"
 MIN_NNS_RESULT_SIZE = 1000
 MAX_ROWS = 2000000
@@ -101,7 +102,7 @@ inspect_table = [
 ]
 inspect_table_cloud = [
   {"key": "model", "name": "model/version", "justify": "left", "style": "bold"},
-  {"key": "entries", "name": "rows (est.)", "justify": "right"},
+  {"key": "entries", "name": "rows", "justify": "right"},
   {"key": "size", "name": "size", "justify": "right"},
   {"key": "chunks", "name": "chunks", "justify": "right"},
 ]

@@ -10,6 +10,7 @@ from isaura.helpers import (
   CHECKPOINT_EVERY,
   BLOOM_FILENAME,
   ACCESS_FILE,
+  CATALOG_FILE,
   INDEX_FILE,
   STREAM_PARQUET_THRESHOLD,
   DEFAULT_BUCKET_NAME as pub_bucket,
@@ -664,6 +665,27 @@ class _SinkWriter:
         self.store.upload_file(metadata_local, self.bucket, f"{self.base}/{ACCESS_FILE}")
       except Exception:
         pass
+    entries = len(self.bi.index) if self.bi.index is not None else 0
+    chunks = len(self.chunk_state._list_chunks())
+    upload_catalog_json(self.store, self.bucket, self.base, entries, chunks, self.tmpdir)
+
+
+def upload_catalog_json(store, bucket, base_prefix, entries, chunks, tmpdir):
+  cat = {"entries": int(entries), "chunks": int(chunks)}
+  local = os.path.join(tmpdir, f"catalog_{uuid.uuid4().hex}.json")
+  try:
+    with open(local, "w", encoding="utf-8") as f:
+      json.dump(cat, f, separators=(",", ":"))
+    key = f"{base_prefix.strip('/')}/{CATALOG_FILE}"
+    store.upload_file(local, bucket, key)
+    logger.info(f"[catalog] {CATALOG_FILE} -> {bucket}/{key} entries={entries} chunks={chunks}")
+  except Exception as e:
+    logger.warning(f"catalog.json upload failed: {e}")
+  finally:
+    try:
+      os.remove(local)
+    except Exception:
+      pass
 
 
 class _BaseTransfer:

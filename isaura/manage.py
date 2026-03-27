@@ -10,10 +10,11 @@ from rich.progress import (
   TimeElapsedColumn,
   TimeRemainingColumn,
 )
-from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio, _S3RangeFile
+from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio, _S3RangeFile, upload_catalog_json
 from isaura.helpers import (
   ACCESS_FILE,
   BLOOM_FILENAME,
+  CATALOG_FILE,
   CHECKPOINT_EVERY,
   INDEX_FILE,
   STREAM_PARQUET_THRESHOLD,
@@ -265,6 +266,9 @@ class IsauraWriter:
     self.bi.persist()
     if new:
       self._upload_metadata(new)
+    entries = len(self.bi.index) if self.bi.index is not None else 0
+    chunks = len(self.chunk_state._list_chunks())
+    upload_catalog_json(self.store, self.bucket, self.base_prefix, entries, chunks, self.tmpdir)
     logger.info(f"write done: new={total} dupes={dupes}")
 
   def close(self):
@@ -682,32 +686,33 @@ class IsauraPush:
         pass
 
   def _merge_bloom_index(self, local_store, src_bucket, cloud_store, dst_bucket, tmpdir):
-    """Load cloud bloom+index, merge local entries in, persist back to cloud."""
+    """Load cloud bloom+index, merge local entries in, persist back to cloud. Returns (entries, chunks)."""
     base = get_base(self.model_id, self.model_version)
-    # load cloud bloom+index (this downloads from cloud, or creates fresh if missing)
     cloud_bi = BloomIndex(cloud_store, dst_bucket, base, os.path.join(tmpdir, "cloud"))
-    # load local bloom+index
     local_bi = BloomIndex(local_store, src_bucket, base, os.path.join(tmpdir, "local"))
-    # merge local index entries into cloud
     if local_bi.index:
       for k, v in local_bi.index.items():
         if cloud_bi.index is not None and k not in cloud_bi.index:
           cloud_bi.index[k] = v
-    # merge local bloom entries into cloud bloom
     if local_bi.index:
       for k in local_bi.index:
         cloud_bi.sbf.add(k)
-    cloud_bi._added = 1  # force persist
+    cloud_bi._added = 1
     cloud_bi.persist()
-    logger.info(
-      f"[push] merged bloom+index to cloud: "
-      f"cloud_index={len(cloud_bi.index or {})} entries"
+    merged_entries = len(cloud_bi.index or {})
+    # count cloud chunks from listing
+    pref = hive_prefix(base) + "/"
+    cloud_chunks = sum(
+      1 for obj in cloud_store.list_keys(dst_bucket, pref)
+      if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
     )
+    logger.info(f"[push] merged bloom+index: entries={merged_entries} chunks={cloud_chunks}")
+    return (merged_entries, cloud_chunks)
 
   def push(self):
     local_store = MinioStore()
     prefix = get_pref(self.model_id, self.model_version) + "/"
-    skip_suffixes = (BLOOM_FILENAME, INDEX_FILE)
+    skip_suffixes = (BLOOM_FILENAME, INDEX_FILE, CATALOG_FILE)
     has_data = False
     for access, src_bucket, mck, mcs in [
       ("public", PUB, mcak, mcsk),
@@ -752,7 +757,11 @@ class IsauraPush:
           logger.warning(err)
         logger.info(f"[push] {access} done: {done}/{len(keys)} objects uploaded to cloud")
         with logger.console.status("Merging bloom filter and index...", spinner="dots"):
-          self._merge_bloom_index(local_store, src_bucket, cloud_store, dst_bucket, tmpdir)
+          merged_entries, cloud_chunks = self._merge_bloom_index(
+            local_store, src_bucket, cloud_store, dst_bucket, tmpdir
+          )
+        base = get_base(self.model_id, self.model_version)
+        upload_catalog_json(cloud_store, dst_bucket, base, merged_entries, cloud_chunks, tmpdir)
       finally:
         try:
           shutil.rmtree(tmpdir)
@@ -891,11 +900,14 @@ class IsauraInspect:
     base = get_base(model_id, model_version)
     return self.get_json(bucket, f"{base}/{ACCESS_FILE}")
 
-  def _indices_union(self):
+  def _indices_union(self, force=False):
     union, owner = ({}, {})
     for b in self.buckets():
       for mid, mv in self.iter_models(b):
-        idx = self.load_index(b, mid, mv)
+        if force:
+          idx = self.get_json(b, get_idx_key(get_base(mid, mv)), max_bytes=10**18) or {}
+        else:
+          idx = self.load_index(b, mid, mv)
         for smi in idx.keys():
           if smi not in union:
             union[smi] = True
@@ -903,14 +915,14 @@ class IsauraInspect:
     return (union, owner)
 
   def list_available(self, output_csv=None):
-    _, owner = self._indices_union()
+    _, owner = self._indices_union(force=self.cloud)
     df = pd.DataFrame([{"input": smi, "bucket": b} for smi, b in owner.items()])
     if output_csv:
       df.to_csv(output_csv, index=False)
     return df
 
   def inspect_inputs(self, input_csv, output_csv=None):
-    _, owner = self._indices_union()
+    _, owner = self._indices_union(force=self.cloud)
     with open(input_csv, newline="", encoding="utf-8") as f:
       wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
     df = pd.DataFrame([{"input": s, "available": s in owner, "bucket": owner.get(s, "")} for s in wanted])
@@ -954,6 +966,12 @@ class IsauraInspect:
       return None
 
   def entries_from_chunks(self, bucket, model_id, model_version):
+    # try catalog.json first
+    base = get_base(model_id, model_version)
+    cat = self.get_json(bucket, f"{base}/{CATALOG_FILE}")
+    if cat and "entries" in cat:
+      return (int(cat["entries"]), int(cat.get("chunks", 0)))
+    # fallback: read parquet footers
     chunks = list(self.find_chunk_keys(bucket, model_id, model_version))
     if not chunks:
       return (0, 0)
@@ -978,42 +996,61 @@ class IsauraInspect:
     return out
 
   def _inspect_models_from_listing(self, bucket, prefix_filter=""):
-    """Single LIST call over the bucket, then one footer read per model for row estimate."""
-    stats = defaultdict(lambda: {"chunks": 0, "bytes": 0, "largest_key": None, "largest_sz": 0})
+    """Single LIST for discovery. catalog.json for fast counts, footer reads as fallback."""
+    stats = defaultdict(lambda: {"chunks": [], "bytes": 0, "has_catalog": False, "catalog_key": None})
     for obj in self.iter_object_meta(bucket, prefix_filter):
       k = obj.get("Key", "")
+      parts = k.split("/")
+      if len(parts) < 2:
+        continue
+      mid, mv = parts[0], parts[1]
+      if k.endswith(f"/{CATALOG_FILE}"):
+        stats[(mid, mv)]["has_catalog"] = True
+        stats[(mid, mv)]["catalog_key"] = k
+        continue
       if "/chunk_" not in k or not k.endswith(".parquet"):
         continue
-      parts = k.split("/")
-      if len(parts) >= 2:
-        mid, mv = parts[0], parts[1]
-        sz = int(obj.get("Size") or 0)
-        s = stats[(mid, mv)]
-        s["chunks"] += 1
-        s["bytes"] += sz
-        if sz > s["largest_sz"]:
-          s["largest_key"] = k
-          s["largest_sz"] = sz
+      sz = int(obj.get("Size") or 0)
+      s = stats[(mid, mv)]
+      s["chunks"].append((k, sz))
+      s["bytes"] += sz
 
-    # one footer read per model to get bytes-per-row ratio
-    def _estimate(s):
-      key, ksz, total = s["largest_key"], s["largest_sz"], s["bytes"]
-      if not key or ksz <= 0:
-        return "?"
-      rows = self.parquet_num_rows(bucket, key, size=ksz)
-      if not rows:
-        return "?"
-      return int(total * rows / ksz)
+    row_counts = {}
 
-    models = sorted(stats.items())
-    with ThreadPoolExecutor(max_workers=min(16, len(models))) as pool:
-      futs = {pool.submit(_estimate, s): (mid, mv) for (mid, mv), s in models}
-      estimates = {}
-      for fut in as_completed(futs):
-        estimates[futs[fut]] = fut.result()
+    # fast path: fetch catalog.json for models that have it
+    catalog_models = [(mid, mv, s["catalog_key"]) for (mid, mv), s in stats.items() if s["has_catalog"]]
+    if catalog_models:
+      def _fetch_cat(key):
+        return self.get_json(bucket, key)
+      with ThreadPoolExecutor(max_workers=min(16, len(catalog_models))) as pool:
+        futs = {pool.submit(_fetch_cat, ck): (mid, mv) for mid, mv, ck in catalog_models}
+        for fut in as_completed(futs):
+          cat = fut.result()
+          if cat and "entries" in cat:
+            row_counts[futs[fut]] = int(cat["entries"])
+
+    # slow fallback: footer reads for models without catalog.json
+    fallback_tasks = []
+    for (mid, mv), s in stats.items():
+      if (mid, mv) in row_counts:
+        continue
+      for k, sz in s["chunks"]:
+        fallback_tasks.append(((mid, mv), k, sz))
+    if fallback_tasks:
+      fallback_counts = defaultdict(int)
+      with ThreadPoolExecutor(max_workers=min(16, len(fallback_tasks))) as pool:
+        futs = {
+          pool.submit(self.parquet_num_rows, bucket, k, sz): (mid, mv)
+          for (mid, mv), k, sz in fallback_tasks
+        }
+        for fut in as_completed(futs):
+          n = fut.result()
+          if n is not None:
+            fallback_counts[futs[fut]] += int(n)
+      row_counts.update(fallback_counts)
 
     out = []
-    for (mid, mv), s in models:
+    for (mid, mv), s in sorted(stats.items()):
       b = s["bytes"]
       if b >= 1 << 30:
         size = f"[bold red]{b / (1 << 30):.1f} GB[/]"
@@ -1025,11 +1062,10 @@ class IsauraInspect:
         size = f"[dim]{b / (1 << 10):.1f} KB[/]"
       else:
         size = f"[dim]{b} B[/]"
-      est = estimates.get((mid, mv), "?")
-      rows = f"~{est:,}" if isinstance(est, int) else est
+      rows = row_counts.get((mid, mv), 0)
       out.append({
         "bucket": bucket, "model_id": mid, "model_version": mv,
-        "model": f"{mid}/{mv}", "entries": rows, "size": size, "chunks": s["chunks"],
+        "model": f"{mid}/{mv}", "entries": f"{rows:,}", "size": size, "chunks": len(s["chunks"]),
       })
     return out
 

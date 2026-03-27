@@ -361,6 +361,7 @@ def test_writer_buffers_raw_rows_until_flush(monkeypatch):
   class FakeBloom:
     def __init__(self, *args, **kwargs):
       self._added = 0
+      self.index = {}
 
     def seen(self, v):
       return False
@@ -374,6 +375,9 @@ def test_writer_buffers_raw_rows_until_flush(monkeypatch):
   class FakeChunkState:
     def __init__(self, *args, **kwargs):
       pass
+
+    def _list_chunks(self):
+      return []
 
     def flush(self, rows, schema_cols):
       flushed["rows"] = list(rows)

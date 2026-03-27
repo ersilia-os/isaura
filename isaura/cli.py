@@ -1,4 +1,4 @@
-import datetime, os, sys
+import contextlib, datetime, os, sys
 import rich_click as click
 import rich_click.rich_click as rc
 from isaura.manage import (
@@ -199,10 +199,17 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
   insp = IsauraInspect(
     model_id=model, model_version=version, project_name=project_name, access=access, cloud=cloud
   )
-  if input_file:
-    df = insp.inspect_inputs(input_file, output_file)
+  if cloud:
+    for b in insp.buckets():
+      insp._clients(b)
+    ctx = console.status("Inspecting...", spinner="dots")
   else:
-    df = insp.list_available(output_file)
+    ctx = contextlib.nullcontext()
+  with ctx:
+    if input_file:
+      df = insp.inspect_inputs(input_file, output_file)
+    else:
+      df = insp.list_available(output_file)
   logger.info(f"wrote {len(df)} rows{(' -> ' + output_file if output_file else '')}")
 
 
