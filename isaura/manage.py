@@ -1151,16 +1151,26 @@ class IsauraStat:
 
   def _count_rows_from_chunks(self, bucket, chunks):
     total = 0
-    for k, sz in chunks:
-      n = self.insp.parquet_num_rows(bucket, k, size=sz)
-      if n is not None:
-        total += int(n)
+    if not chunks:
+      return total
+    with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+      futs = {pool.submit(self.insp.parquet_num_rows, bucket, k, sz): k for k, sz in chunks}
+      for fut in as_completed(futs):
+        n = fut.result()
+        if n is not None:
+          total += int(n)
     return total
 
   def _process_model(self, bucket, mid, mv, use_chunks):
     total_bytes, total_gb, chunks, first_chunk = self._collect_objects(bucket, mid, mv)
     if use_chunks:
-      mol_count = self._count_rows_from_chunks(bucket, chunks)
+      # try catalog.json first
+      base = get_base(mid, mv)
+      cat = self.insp.get_json(bucket, f"{base}/{CATALOG_FILE}")
+      if cat and "entries" in cat:
+        mol_count = int(cat["entries"])
+      else:
+        mol_count = self._count_rows_from_chunks(bucket, chunks)
       idx = None
     else:
       idx = self.insp.load_index(bucket, mid, mv)
@@ -1187,10 +1197,105 @@ class IsauraStat:
       row["columns"] = cols
     return (row, idx)
 
+  def _compute_cloud(self, buckets):
+    """Fast cloud path: single LIST, catalog.json for counts, parallel GitHub + column fetches."""
+    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # single LIST per bucket — gather everything
+    model_data = defaultdict(lambda: {"bucket": None, "total_bytes": 0, "chunks": [], "first_chunk": None,
+                                       "catalog_key": None})
+    for b in buckets:
+      for obj in self.insp.iter_object_meta(b, ""):
+        k = obj.get("Key", "")
+        parts = k.split("/")
+        if len(parts) < 2:
+          continue
+        mid, mv = parts[0], parts[1]
+        key = (b, mid, mv)
+        d = model_data[key]
+        d["bucket"] = b
+        sz = int(obj.get("Size") or 0)
+        d["total_bytes"] += sz
+        if k.endswith(f"/{CATALOG_FILE}"):
+          d["catalog_key"] = k
+        elif "/chunk_" in k and k.endswith(".parquet"):
+          d["chunks"].append((k, sz))
+          if d["first_chunk"] is None:
+            d["first_chunk"] = k
+
+    tasks = sorted(model_data.keys())
+    if not tasks:
+      return self._empty_result(generated_at, buckets)
+
+    # parallel: catalog.json + GitHub metadata + parquet columns
+    def _enrich(key):
+      b, mid, mv = key
+      d = model_data[key]
+      # row count from catalog.json or fallback
+      mol_count = 0
+      if d["catalog_key"]:
+        cat = self.insp.get_json(b, d["catalog_key"])
+        if cat and "entries" in cat:
+          mol_count = int(cat["entries"])
+      if not mol_count and d["chunks"]:
+        mol_count = self._count_rows_from_chunks(b, d["chunks"])
+      # GitHub metadata
+      meta_out = fetch_schema_from_github(mid)
+      # columns
+      cols, ncols = None, None
+      if self.include_columns and d["first_chunk"]:
+        cols = self.insp.parquet_columns(b, d["first_chunk"])
+        ncols = len(cols) if cols else None
+      total_bytes = d["total_bytes"]
+      row = {
+        "bucket": b, "model_id": mid, "model_version": mv,
+        "model_key": f"{b}:{mid}:{mv}", "model": f"{mid}/{mv}",
+        "molecules": mol_count, "total_bytes": total_bytes,
+        "total_gb": round(total_bytes / 1024**3, 6),
+        "n_columns": ncols, "metadata": meta_out,
+      }
+      if self.include_column_names:
+        row["columns"] = cols
+      return row
+
+    models = []
+    models_total_by_bucket = defaultdict(int)
+    with ThreadPoolExecutor(max_workers=min(self.max_workers, len(tasks))) as pool:
+      futs = {pool.submit(_enrich, k): k for k in tasks}
+      for fut in as_completed(futs):
+        row = fut.result()
+        models.append(row)
+        models_total_by_bucket[row["bucket"]] += 1
+    models.sort(key=lambda r: (r["bucket"], r["model_id"], r["model_version"]))
+    molecules_total = sum(m["molecules"] for m in models)
+    return {
+      "schema_version": self.schema_version, "producer": self.producer,
+      "generated_at_utc": generated_at, "buckets": buckets,
+      "models_total": len(models), "models_total_by_bucket": dict(models_total_by_bucket),
+      "models": models,
+      "models_per_molecule": {
+        "molecules_total_unique": molecules_total,
+        "min": None, "max": None, "p50": None, "p95": None, "histogram": [],
+      },
+    }
+
+  def _empty_result(self, generated_at, buckets):
+    return {
+      "schema_version": self.schema_version, "producer": self.producer,
+      "generated_at_utc": generated_at, "buckets": buckets,
+      "models_total": 0, "models_total_by_bucket": {},
+      "models": [],
+      "models_per_molecule": {
+        "molecules_total_unique": 0,
+        "min": None, "max": None, "p50": None, "p95": None, "histogram": [],
+      },
+    }
+
   def compute(self):
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     buckets = self.insp.buckets()
     use_chunks = self._use_chunks()
+    if use_chunks:
+      return self._compute_cloud(buckets)
     tasks = []
     for b in buckets:
       for mid, mv in self.insp.iter_models(b):
@@ -1198,26 +1303,13 @@ class IsauraStat:
     models = []
     models_per_molecule = Counter()
     models_total_by_bucket = defaultdict(int)
-    if use_chunks and len(tasks) > 1:
-      results = [None] * len(tasks)
-      with ThreadPoolExecutor(max_workers=min(self.max_workers, len(tasks))) as pool:
-        futures = {}
-        for i, (b, mid, mv) in enumerate(tasks):
-          fut = pool.submit(self._process_model, b, mid, mv, True)
-          futures[fut] = i
-        for fut in as_completed(futures):
-          results[futures[fut]] = fut.result()
-      for row, _ in results:
-        models.append(row)
-        models_total_by_bucket[row["bucket"]] += 1
-    else:
-      for b, mid, mv in tasks:
-        row, idx = self._process_model(b, mid, mv, use_chunks)
-        if idx is not None:
-          for smi in idx.keys():
-            models_per_molecule[smi] += 1
-        models.append(row)
-        models_total_by_bucket[b] += 1
+    for b, mid, mv in tasks:
+      row, idx = self._process_model(b, mid, mv, False)
+      if idx is not None:
+        for smi in idx.keys():
+          models_per_molecule[smi] += 1
+      models.append(row)
+      models_total_by_bucket[b] += 1
     counts = sorted(models_per_molecule.values()) if models_per_molecule else []
     hist = Counter(counts)
     hist_out = [{"models": k, "molecules": v} for k, v in sorted(hist.items(), key=lambda x: x[0])]
