@@ -1,3 +1,4 @@
+import gc
 import os
 import pandas as pd
 import pytest
@@ -7,6 +8,7 @@ pq = pytest.importorskip("pyarrow.parquet")
 from isaura.base import TrancheState, _BaseTransfer
 from isaura.helpers import chunk_row_limit, stream_parquet_filtered_ordered
 from isaura.manage import IsauraReader, IsauraWriter
+from isaura.stream import stream_parquet_filtered
 
 
 class LocalStore:
@@ -418,3 +420,147 @@ def test_stream_parquet_filtered_ordered_handles_single_missing(monkeypatch):
   out = pd.concat(chunks, ignore_index=True)
   assert list(out["input"]) == ["a", "missing", "b", "d"]
   assert pd.isna(out.loc[1, "x"])
+
+
+def test_stream_parquet_filtered_ordered_closes_inner_stream_on_early_completion(monkeypatch):
+  closed = {"value": False}
+
+  def fake_stream(*args, **kwargs):
+    try:
+      yield pd.DataFrame([{"input": "a", "x": 1.0}])
+      yield pd.DataFrame([{"input": "b", "x": 2.0}])
+    finally:
+      closed["value"] = True
+
+  monkeypatch.setattr("isaura.stream.stream_parquet_filtered", fake_stream)
+
+  chunks = list(
+    stream_parquet_filtered_ordered(
+      store=None,
+      bucket="bucket",
+      prefix="prefix",
+      wanted=["a"],
+      header="input",
+      batch_size=10,
+    )
+  )
+
+  assert list(pd.concat(chunks, ignore_index=True)["input"]) == ["a"]
+  assert closed["value"] is True
+
+
+def test_reader_tempdir_is_cleaned_when_instance_is_collected(monkeypatch, tmp_path):
+  created = []
+
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  def fake_make_temp(prefix):
+    path = tmp_path / f"{prefix}{len(created)}"
+    path.mkdir()
+    created.append(path)
+    return str(path)
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {})
+  monkeypatch.setattr("isaura.manage.make_temp", fake_make_temp)
+
+  def build_reader():
+    reader = IsauraReader(
+      model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+    )
+    assert os.path.isdir(reader.tmpdir)
+    return reader.tmpdir
+
+  tempdir = build_reader()
+  gc.collect()
+
+  assert not os.path.exists(tempdir)
+
+
+def test_base_transfer_close_removes_owned_tempdirs(monkeypatch, tmp_path):
+  created = []
+
+  class FakeStore:
+    endpoint = "http://127.0.0.1:9000"
+    access = "a"
+    secret = "s"
+
+    def __init__(self, *args, **kwargs):
+      pass
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+  def fake_make_temp(prefix):
+    path = tmp_path / f"{prefix}{len(created)}"
+    path.mkdir()
+    created.append(path)
+    return str(path)
+
+  monkeypatch.setattr("isaura.base.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.base.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.base.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.base.make_temp", fake_make_temp)
+
+  transfer = _BaseTransfer("m", "v1", "bucket")
+  owned = [transfer.tmpdir, transfer.tmpdir_sinkw]
+
+  assert all(os.path.isdir(path) for path in owned)
+
+  transfer.close()
+
+  assert all(not os.path.exists(path) for path in owned)
+
+
+def test_stream_parquet_filtered_cleans_tmpdir_when_closed_early(monkeypatch, tmp_path):
+  source = tmp_path / "chunk_1.parquet"
+  pd.DataFrame([{"input": "a", "x": 1.0}]).to_parquet(source, index=False)
+
+  created = []
+
+  class FakeStore:
+    def list_keys(self, bucket, prefix):
+      yield {"Key": f"{prefix}/chunk_1.parquet"}
+
+    def download_file(self, bucket, key, local):
+      with open(source, "rb") as src, open(local, "wb") as dst:
+        dst.write(src.read())
+
+  def fake_make_temp(prefix):
+    path = tmp_path / f"{prefix}{len(created)}"
+    path.mkdir()
+    created.append(path)
+    return str(path)
+
+  monkeypatch.setattr("isaura.stream.make_temp", fake_make_temp)
+
+  gen = stream_parquet_filtered(FakeStore(), "bucket", "prefix", ["a"], header="input", batch_size=1)
+  chunk = next(gen)
+  tempdir = created[0]
+
+  assert list(chunk["input"]) == ["a"]
+  assert tempdir.exists()
+
+  gen.close()
+
+  assert not tempdir.exists()

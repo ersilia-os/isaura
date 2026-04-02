@@ -1,8 +1,12 @@
+import atexit
 import math
 import os
 import psutil
+import shutil
 import tempfile
+import threading
 import time
+import weakref
 
 from isaura.const import (
   ACCESS_FILE, INDEX_FILE, STORE_DIRECTORY,
@@ -11,6 +15,8 @@ from isaura.const import (
 from isaura.logging import logger
 
 proc = psutil.Process(os.getpid())
+_TEMP_DIRS = set()
+_TEMP_DIRS_LOCK = threading.Lock()
 
 
 def rss_mb():
@@ -33,8 +39,46 @@ def cpu_cnt(ratio=0.6):
   return max(1, int(math.floor((os.cpu_count() or 1) * ratio)))
 
 
+def cleanup_temp_dir(path):
+  if not path:
+    return
+  try:
+    shutil.rmtree(path, ignore_errors=True)
+  finally:
+    with _TEMP_DIRS_LOCK:
+      _TEMP_DIRS.discard(path)
+
+
+def bind_temp_dirs(owner, *paths):
+  finalizers = [weakref.finalize(owner, cleanup_temp_dir, path) for path in paths if path]
+  owner._temp_dir_finalizers = finalizers
+  return finalizers
+
+
+def release_temp_dirs(owner):
+  finalizers = list(getattr(owner, "_temp_dir_finalizers", []) or [])
+  owner._temp_dir_finalizers = []
+  for finalizer in finalizers:
+    try:
+      finalizer()
+    except Exception:
+      pass
+
+
+@atexit.register
+def _cleanup_registered_temp_dirs():
+  with _TEMP_DIRS_LOCK:
+    paths = list(_TEMP_DIRS)
+  for path in paths:
+    cleanup_temp_dir(path)
+
+
 def make_temp(pref):
-  return tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
+  os.makedirs(STORE_DIRECTORY, exist_ok=True)
+  path = tempfile.mkdtemp(prefix=pref, dir=STORE_DIRECTORY)
+  with _TEMP_DIRS_LOCK:
+    _TEMP_DIRS.add(path)
+  return path
 
 
 def get_base(mdi, ver):

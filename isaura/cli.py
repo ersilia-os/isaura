@@ -130,19 +130,19 @@ def write(input_file, project_name, access, model, version, force):
 @cli.command("read")
 @apply_opts(opt_input_file, opt_project, opt_model, opt_version, opt_output_file, opt_approx)
 def read(input_file, project_name, model, version, output_file, approximate):
-  r = IsauraReader(
+  with IsauraReader(
     model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
-  )
-  for _ in r.read_batched(output_csv=output_file):
-    pass
+  ) as r:
+    for _ in r.read_batched(output_csv=output_file):
+      pass
 
 
 @cli.command("pull")
 @apply_opts(opt_input_file, opt_project, opt_model, opt_version)
 def pull(input_file, project_name, model, version):
   pn = project_name or DEFAULT_BUCKET_NAME
-  pl = IsauraPull(model_id=model, model_version=version, bucket=pn, input_csv=input_file)
-  pl.pull()
+  with IsauraPull(model_id=model, model_version=version, bucket=pn, input_csv=input_file) as pl:
+    pl.pull()
 
 
 @cli.command("push")
@@ -155,20 +155,20 @@ def push(project_name, model, version):
 @cli.command("copy")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_dump_outdir)
 def cp(model, version, project_name, output_dir):
-  c = IsauraCopy(model_id=model, model_version=version, bucket=project_name, output_dir=output_dir)
-  if output_dir is None:
-    priv, pub = c.copy()
-    logger.info(f"Copied private_new={priv} public_new={pub} from {project_name}")
-  else:
-    c.copy()
+  with IsauraCopy(model_id=model, model_version=version, bucket=project_name, output_dir=output_dir) as c:
+    if output_dir is None:
+      priv, pub = c.copy()
+      logger.info(f"Copied private_new={priv} public_new={pub} from {project_name}")
+    else:
+      c.copy()
 
 
 @cli.command("move")
 @apply_opts(opt_model, opt_version, opt_project_req)
 def mv(model, version, project_name):
-  m = IsauraMover(model_id=model, model_version=version, bucket=project_name)
-  m.move()
-  logger.info(f"Move done for {model}/{version} from {project_name}")
+  with IsauraMover(model_id=model, model_version=version, bucket=project_name) as m:
+    m.move()
+    logger.info(f"Move done for {model}/{version} from {project_name}")
 
 
 @cli.command("engine")
@@ -184,12 +184,13 @@ def rm(model, version, project_name, yes):
     logger.info("Add --yes to confirm deletion")
     sys.exit(1)
   if model:
-    r = IsauraRemover(model_id=model, model_version=version, bucket=project_name)
+    with IsauraRemover(model_id=model, model_version=version, bucket=project_name) as r:
+      r.remove()
     logger.info(f"Remove done for {model}/{version} in {project_name}")
   else:
-    r = IsauraRemover(project_name=project_name)
+    with IsauraRemover(project_name=project_name) as r:
+      r.remove()
     logger.info(f"Remove done for all data in {project_name}")
-  r.remove()
 
 
 @cli.command("inspect")

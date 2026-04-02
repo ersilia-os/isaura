@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 
 from isaura.const import STREAM_DENSE_BATCH_ROWS, STREAM_DENSE_FILE_RATIO
 from isaura.logging import logger
-from isaura.utils import make_temp, rss_mb
+from isaura.utils import cleanup_temp_dir, make_temp, rss_mb
 
 
 def _yield_filtered_chunks(filtered, header, batch_size, wanted_set, progress_cb):
@@ -38,139 +38,136 @@ def stream_parquet_filtered(
   remaining = len(wanted_set)
   wanted_arr = pa.array(list(wanted_set))
   tmpdir = make_temp("isaura_stream_")
-
-  keys = sorted(
-    (
-      obj["Key"]
-      for obj in store.list_keys(bucket, prefix)
-      if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
-    )
-  )
-
-  logger.info(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
-  if progress is not None:
-    progress.update(
-      stage="starting",
-      files_done=0,
-      files_total=len(keys),
-      found_rows=0,
-      emitted_rows=0,
-      unresolved=remaining,
-    )
-
+  keys = []
   total_rows_yielded = 0
   n_chunks_yielded = 0
-
-  for ki, key in enumerate(keys):
-    if remaining <= 0:
-      break
-    if remaining < len(wanted_arr) * 0.5:
-      wanted_arr = pa.array(list(wanted_set))
-    if progress is not None:
-      progress.update(stage="scanning file", files_done=ki, files_total=len(keys), unresolved=remaining)
-
-    local = os.path.join(tmpdir, f"s_{ki}.parquet")
-    try:
-      store.download_file(bucket, key, local)
-    except Exception as e:
-      logger.warning(f"[stream] skip {key}: {e}")
-      continue
-
-    try:
-      pf = pq.ParquetFile(local)
-      n_rg = pf.metadata.num_row_groups
-      n_rows = pf.metadata.num_rows
-      use_dense = (
-        bool(dense_file_ratio) and n_rows > 0 and remaining >= max(1, int(n_rows * dense_file_ratio))
-      )
-
-      if use_dense:
-        dense_batch_rows = max(batch_size, STREAM_DENSE_BATCH_ROWS)
-        for batch in pf.iter_batches(batch_size=dense_batch_rows):
-          if remaining <= 0:
-            break
-          table = pa.Table.from_batches([batch])
-          mask = pc.is_in(table.column(header), wanted_arr)
-          if pc.any(mask).as_py() is not True:
-            continue
-          filtered = table.filter(mask)
-          if filtered.num_rows == 0:
-            continue
-          for start in range(0, filtered.num_rows, batch_size):
-            chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
-            matched = set(chunk[header].astype(str).str.strip())
-            remaining -= len(matched & wanted_set)
-            wanted_set -= matched
-            n_chunks_yielded += 1
-            total_rows_yielded += len(chunk)
-            if progress is not None:
-              progress.update(
-                stage=f"yielding matches {ki + 1}/{len(keys)}",
-                files_done=ki + 1,
-                files_total=len(keys),
-                found_rows=total_rows_yielded,
-                emitted_rows=total_rows_yielded,
-                unresolved=remaining,
-              )
-            yield chunk
-            del chunk
-      else:
-        for rg_idx in range(n_rg):
-          if remaining <= 0:
-            break
-          key_col = pf.read_row_group(rg_idx, columns=[header]).column(header)
-          mask = pc.is_in(key_col, wanted_arr)
-          if pc.any(mask).as_py() is not True:
-            del key_col, mask
-            continue
-          filtered = pf.read_row_group(rg_idx).filter(mask)
-          del key_col, mask
-          if filtered.num_rows == 0:
-            del filtered
-            continue
-          for start in range(0, filtered.num_rows, batch_size):
-            chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
-            matched = set(chunk[header].astype(str).str.strip())
-            remaining -= len(matched & wanted_set)
-            wanted_set -= matched
-            n_chunks_yielded += 1
-            total_rows_yielded += len(chunk)
-            if progress is not None:
-              progress.update(
-                stage=f"yielding matches {ki + 1}/{len(keys)}",
-                files_done=ki + 1,
-                files_total=len(keys),
-                found_rows=total_rows_yielded,
-                emitted_rows=total_rows_yielded,
-                unresolved=remaining,
-              )
-            yield chunk
-            del chunk
-          del filtered
-
-      logger.info(
-        f"[stream] file {ki + 1}/{len(keys)} done key={key.split('/')[-1]} "
-        f"yielded={total_rows_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
-      )
-      if progress is not None:
-        progress.update(stage="advancing", files_done=ki + 1, files_total=len(keys), unresolved=remaining)
-      del pf
-    except Exception as e:
-      logger.warning(f"[stream] error reading {key}: {e}")
-    finally:
-      try:
-        os.remove(local)
-      except Exception:
-        pass
-
-  logger.info(
-    f"[stream] finished: files={len(keys)} yielded={total_rows_yielded} "
-    f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
-  )
   try:
-    os.rmdir(tmpdir)
-  except Exception:
-    pass
+    keys = sorted(
+      (
+        obj["Key"]
+        for obj in store.list_keys(bucket, prefix)
+        if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
+      )
+    )
+
+    logger.info(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
+    if progress is not None:
+      progress.update(
+        stage="starting",
+        files_done=0,
+        files_total=len(keys),
+        found_rows=0,
+        emitted_rows=0,
+        unresolved=remaining,
+      )
+
+    for ki, key in enumerate(keys):
+      if remaining <= 0:
+        break
+      if remaining < len(wanted_arr) * 0.5:
+        wanted_arr = pa.array(list(wanted_set))
+      if progress is not None:
+        progress.update(stage="scanning file", files_done=ki, files_total=len(keys), unresolved=remaining)
+
+      local = os.path.join(tmpdir, f"s_{ki}.parquet")
+      try:
+        store.download_file(bucket, key, local)
+      except Exception as e:
+        logger.warning(f"[stream] skip {key}: {e}")
+        continue
+
+      try:
+        pf = pq.ParquetFile(local)
+        n_rg = pf.metadata.num_row_groups
+        n_rows = pf.metadata.num_rows
+        use_dense = (
+          bool(dense_file_ratio) and n_rows > 0 and remaining >= max(1, int(n_rows * dense_file_ratio))
+        )
+
+        if use_dense:
+          dense_batch_rows = max(batch_size, STREAM_DENSE_BATCH_ROWS)
+          for batch in pf.iter_batches(batch_size=dense_batch_rows):
+            if remaining <= 0:
+              break
+            table = pa.Table.from_batches([batch])
+            mask = pc.is_in(table.column(header), wanted_arr)
+            if pc.any(mask).as_py() is not True:
+              continue
+            filtered = table.filter(mask)
+            if filtered.num_rows == 0:
+              continue
+            for start in range(0, filtered.num_rows, batch_size):
+              chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+              matched = set(chunk[header].astype(str).str.strip())
+              remaining -= len(matched & wanted_set)
+              wanted_set -= matched
+              n_chunks_yielded += 1
+              total_rows_yielded += len(chunk)
+              if progress is not None:
+                progress.update(
+                  stage=f"yielding matches {ki + 1}/{len(keys)}",
+                  files_done=ki + 1,
+                  files_total=len(keys),
+                  found_rows=total_rows_yielded,
+                  emitted_rows=total_rows_yielded,
+                  unresolved=remaining,
+                )
+              yield chunk
+              del chunk
+        else:
+          for rg_idx in range(n_rg):
+            if remaining <= 0:
+              break
+            key_col = pf.read_row_group(rg_idx, columns=[header]).column(header)
+            mask = pc.is_in(key_col, wanted_arr)
+            if pc.any(mask).as_py() is not True:
+              del key_col, mask
+              continue
+            filtered = pf.read_row_group(rg_idx).filter(mask)
+            del key_col, mask
+            if filtered.num_rows == 0:
+              del filtered
+              continue
+            for start in range(0, filtered.num_rows, batch_size):
+              chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+              matched = set(chunk[header].astype(str).str.strip())
+              remaining -= len(matched & wanted_set)
+              wanted_set -= matched
+              n_chunks_yielded += 1
+              total_rows_yielded += len(chunk)
+              if progress is not None:
+                progress.update(
+                  stage=f"yielding matches {ki + 1}/{len(keys)}",
+                  files_done=ki + 1,
+                  files_total=len(keys),
+                  found_rows=total_rows_yielded,
+                  emitted_rows=total_rows_yielded,
+                  unresolved=remaining,
+                )
+              yield chunk
+              del chunk
+            del filtered
+
+        logger.info(
+          f"[stream] file {ki + 1}/{len(keys)} done key={key.split('/')[-1]} "
+          f"yielded={total_rows_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
+        )
+        if progress is not None:
+          progress.update(stage="advancing", files_done=ki + 1, files_total=len(keys), unresolved=remaining)
+        del pf
+      except Exception as e:
+        logger.warning(f"[stream] error reading {key}: {e}")
+      finally:
+        try:
+          os.remove(local)
+        except Exception:
+          pass
+  finally:
+    logger.info(
+      f"[stream] finished: files={len(keys)} yielded={total_rows_yielded} "
+      f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
+    )
+    cleanup_temp_dir(tmpdir)
 
 
 def stream_parquet_filtered_ordered(
@@ -227,7 +224,7 @@ def stream_parquet_filtered_ordered(
     if rows:
       yield make_frame(rows)
 
-  for chunk in stream_parquet_filtered(
+  source = stream_parquet_filtered(
     store,
     bucket,
     prefix,
@@ -235,20 +232,26 @@ def stream_parquet_filtered_ordered(
     header=header,
     batch_size=batch_size,
     progress=progress,
-  ):
-    if chunk is None or chunk.empty:
-      continue
-    if schema_cols is None:
-      schema_cols = list(chunk.columns)
-    for row in chunk.to_dict("records"):
-      key = str(row.get(header) or "").strip()
-      if key and key not in resolved:
-        resolved[key] = row
-        unresolved.discard(key)
-    for ready in flush_ready():
-      yield ready
-    if not unresolved:
-      break
+  )
+  try:
+    for chunk in source:
+      if chunk is None or chunk.empty:
+        continue
+      if schema_cols is None:
+        schema_cols = list(chunk.columns)
+      for row in chunk.to_dict("records"):
+        key = str(row.get(header) or "").strip()
+        if key and key not in resolved:
+          resolved[key] = row
+          unresolved.discard(key)
+      for ready in flush_ready():
+        yield ready
+      if not unresolved:
+        break
+  finally:
+    close = getattr(source, "close", None)
+    if close is not None:
+      close()
 
   unresolved_before_fill = len(unresolved)
   unresolved.clear()

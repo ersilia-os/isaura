@@ -36,6 +36,8 @@ from isaura.helpers import (
   post_apprx,
   query,
   query_batched,
+  bind_temp_dirs,
+  release_temp_dirs,
   stream_parquet_filtered,
   cpu_cnt,
 )
@@ -716,6 +718,7 @@ class _BaseTransfer:
     self.store = MinioStore()
     self.tmpdir = make_temp("isaura_xfer_")
     self.tmpdir_sinkw = make_temp("isaura_sinkw_")
+    bind_temp_dirs(self, self.tmpdir, self.tmpdir_sinkw)
     self.duck = DuckDBMinio(endpoint=self.store.endpoint, access=self.store.access, secret=self.store.secret)
     self.bi = BloomIndex(
       self.store,
@@ -726,6 +729,15 @@ class _BaseTransfer:
     )
     self._model_meta = None
     self._output_dimension = None
+
+  def close(self):
+    release_temp_dirs(self)
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, et, ev, tb):
+    self.close()
 
   def _get_model_meta(self):
     if self._model_meta is None:
@@ -780,21 +792,28 @@ class _BaseTransfer:
     logger.info(
       f"[select_rows_batched] starting n={n} input_col={input_col} batch_size={batch_size} bucket={self.bucket}"
     )
-    if n is not None and n >= STREAM_PARQUET_THRESHOLD:
-      prefix = hive_prefix(self.tranches) + "/"
-      logger.info(f"[select_rows_batched] streaming mode n={n} bucket={self.bucket} prefix={prefix}")
-      yield from stream_parquet_filtered(
-        self.store, self.bucket, prefix, wanted, header=input_col, batch_size=batch_size
-      )
-    else:
-      files = list_parquet_keys(self.store, self.bucket, self.tranches)
-      logger.info(
-        f"[select_rows_batched] duckdb mode n={n} bucket={self.bucket} files={(len(files) if isinstance(files, list) else files)}"
-      )
-      for chunk in query_batched(
-        self.duck.con, input_col, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir
-      ):
+    source = None
+    try:
+      if n is not None and n >= STREAM_PARQUET_THRESHOLD:
+        prefix = hive_prefix(self.tranches) + "/"
+        logger.info(f"[select_rows_batched] streaming mode n={n} bucket={self.bucket} prefix={prefix}")
+        source = stream_parquet_filtered(
+          self.store, self.bucket, prefix, wanted, header=input_col, batch_size=batch_size
+        )
+      else:
+        files = list_parquet_keys(self.store, self.bucket, self.tranches)
+        logger.info(
+          f"[select_rows_batched] duckdb mode n={n} bucket={self.bucket} files={(len(files) if isinstance(files, list) else files)}"
+        )
+        source = query_batched(
+          self.duck.con, input_col, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir
+        )
+      for chunk in source:
         yield chunk
+    finally:
+      close = getattr(source, "close", None)
+      if close is not None:
+        close()
 
   def _delete(self):
     return self.store.delete_prefix(self.bucket, self.tranches)

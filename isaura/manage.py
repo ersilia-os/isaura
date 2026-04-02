@@ -30,6 +30,8 @@ from isaura.helpers import (
   ReadProgress,
   StreamingCsvSink,
   WRITE_INPUT_CHUNK_ROWS,
+  bind_temp_dirs,
+  release_temp_dirs,
   chunk_row_limit,
   logger,
   output_dimension_from_metadata,
@@ -71,6 +73,7 @@ class IsauraChecker(AbstractContextManager):
     self.base_prefix = get_base(model_id, model_version)
     self.store = store or MinioStore()
     self.local_dir = make_temp("isaura_checker_")
+    bind_temp_dirs(self, self.local_dir)
     self.checkpoint_every = checkpoint_every
     self.bi = BloomIndex(
       self.store, self.bucket, self.base_prefix, self.local_dir, bloom_filename=bloom_filename
@@ -91,9 +94,12 @@ class IsauraChecker(AbstractContextManager):
       self._added = 0
 
   def close(self):
-    if self._added:
-      self.bi.persist()
-      self._added = 0
+    try:
+      if self._added:
+        self.bi.persist()
+        self._added = 0
+    finally:
+      release_temp_dirs(self)
 
   def __enter__(self):
     return self
@@ -127,6 +133,7 @@ class IsauraWriter:
     self.store = MinioStore(endpoint=endpoint, access=access_key, secret=secrete)
     self.store.ensure_bucket(self.bucket)
     self.tmpdir = make_temp("isaura_writter_")
+    bind_temp_dirs(self, self.tmpdir)
     self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
     self.bi = BloomIndex(
       self.store,
@@ -272,10 +279,7 @@ class IsauraWriter:
     logger.info(f"write done: new={total} dupes={dupes}")
 
   def close(self):
-    try:
-      shutil.rmtree(self.tmpdir)
-    except Exception:
-      pass
+    release_temp_dirs(self)
 
   def __enter__(self):
     return self
@@ -307,6 +311,7 @@ class IsauraReader:
     self.collection = get_coll(self.model_id, self.model_version)
     self.index_key = get_idx_key(self.base)
     self.tmpdir = make_temp("isaura_reader_")
+    bind_temp_dirs(self, self.tmpdir)
     self.store = MinioStore(endpoint=self.endpoint, access=access_key, secret=secrete)
     self.duck = DuckDBMinio(endpoint=self.endpoint, access=access_key, secret=secrete)
     self.bi = BloomIndex(
@@ -327,6 +332,15 @@ class IsauraReader:
     logger.info(
       f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv} output_dim={self.output_dimension} wide={self.wide_model}"
     )
+
+  def close(self):
+    release_temp_dirs(self)
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, et, ev, tb):
+    self.close()
 
   def _wanted(self, df=None):
     wanted, header_set = ([], set())
@@ -535,6 +549,7 @@ class IsauraReader:
     total_rows = 0
     n_chunks = 0
     sink = None
+    source = None
     try:
       mode, payload = self._make_read_source(wanted, header, batch_size=batch_size, ordered=True)
       with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
@@ -589,6 +604,9 @@ class IsauraReader:
       if sink is not None:
         sink.__exit__(None, None, None)
         logger.info(f"[read_batched] csv closed rows={total_rows} path={output_csv}")
+      close = getattr(source, "close", None)
+      if close is not None:
+        close()
     elapsed = time.time() - t0
     rate = total_rows / elapsed if elapsed > 0 and total_rows else 0.0
     logger.success(
@@ -644,7 +662,7 @@ class IsauraPull(_BaseTransfer):
     logger.info(
       f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}"
     )
-    r = IsauraReader(
+    with IsauraReader(
       model_id=self.model_id,
       model_version=self.model_version,
       input_csv=self.input_csv,
@@ -653,8 +671,8 @@ class IsauraPull(_BaseTransfer):
       endpoint=MINIO_ENDPOINT_CLOUD,
       access_key=mcak,
       secrete=mcsk,
-    )
-    out = self._pull_batched(r.read_batched())
+    ) as r:
+      out = self._pull_batched(r.read_batched())
     logger.info(f"pulled objects={out}")
 
 
