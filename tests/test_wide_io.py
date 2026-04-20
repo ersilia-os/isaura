@@ -91,6 +91,38 @@ def test_tranche_flush_df_handles_wide_rows_with_immutable_chunks(tmp_path):
   assert list(out2.columns) == cols
 
 
+def test_tranche_flush_supports_heterogeneous_column_types(tmp_path):
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(store, "bucket", "model/v1/tranches", str(tmp_path), 10)
+  rows = [
+    {
+      "input": "a",
+      "mixed": 1.25,
+      "payload": {"x": 1},
+      "blob": b"abc",
+      "flag": True,
+    },
+    {
+      "input": "b",
+      "mixed": "C1=CC=CC=C1",
+      "payload": ["u", "v"],
+      "blob": float("nan"),
+      "flag": None,
+    },
+  ]
+  cols = ["input", "mixed", "payload", "blob", "flag"]
+
+  tranche.flush(rows, cols)
+
+  key = os.path.join(str(tmp_path), "bucket", "model/v1/tranches/data/chunk_1.parquet")
+  out = pq.read_table(key).to_pandas()
+  assert list(out["input"]) == ["a", "b"]
+  assert list(out["mixed"]) == ["1.25", "C1=CC=CC=C1"]
+  assert list(out["payload"]) == ['{"x": 1}', '["u", "v"]']
+  assert list(out["blob"]) == [b"abc", None]
+  assert list(out["flag"]) == [True, None]
+
+
 def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
   class FakeStore:
     def __init__(self, *args, **kwargs):

@@ -369,9 +369,43 @@ class ChunkState:
         df[col] = None
     return df[schema_cols]
 
+  def _normalize_scalar(self, value):
+    if value is None:
+      return None
+    try:
+      if pd.isna(value):
+        return None
+    except Exception:
+      pass
+    return value
+
+  def _stringify_scalar(self, value):
+    if value is None:
+      return None
+    if isinstance(value, bytes):
+      return value.decode("utf-8", errors="replace")
+    if isinstance(value, (list, dict)):
+      return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (tuple, set)):
+      return json.dumps(list(value), ensure_ascii=False)
+    return str(value)
+
+  def _build_array(self, values):
+    normalized = [self._normalize_scalar(v) for v in values]
+    try:
+      return pa.array(normalized, from_pandas=True)
+    except Exception:
+      return pa.array([self._stringify_scalar(v) for v in normalized], type=pa.string())
+
+  def _frame_to_table(self, df, schema_cols):
+    df = self._ensure_cols(df, schema_cols)
+    arrays = [self._build_array(df[col].tolist()) for col in schema_cols]
+    return pa.Table.from_arrays(arrays, names=schema_cols)
+
   def _rows_to_table(self, rows, schema_cols):
     cols = {col: [row.get(col) if isinstance(row, dict) else None for row in rows] for col in schema_cols}
-    return pa.table(cols)
+    arrays = [self._build_array(cols[col]) for col in schema_cols]
+    return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _ensure_cols(self, df, schema_cols):
     for col in schema_cols:
@@ -387,7 +421,7 @@ class ChunkState:
     df = self._ensure_cols(df, schema_cols)
     for start in range(0, len(df), self.write_batch_rows):
       frame = df.iloc[start : start + self.write_batch_rows]
-      yield pa.Table.from_pandas(frame, preserve_index=False)
+      yield self._frame_to_table(frame, schema_cols)
 
   def _rows_in_remote(self, key):
     local = os.path.join(self.tmpdir, f"inspect_{uuid.uuid4().hex}.parquet")
