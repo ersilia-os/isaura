@@ -9,6 +9,22 @@ from isaura.utils import cpu_cnt, mem_gb_lim, rss_mb
 
 
 def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp", preserve_order=False):
+  """Run a batched DuckDB query and return all results as a single DataFrame.
+
+  Convenience wrapper around query_batched that concatenates all batches.
+
+  Args:
+      conn: DuckDB connection pre-configured with S3 credentials.
+      header: Column name to filter on (e.g. "input").
+      wanted: List of values to look up.
+      file_glob: S3 URI glob or list of S3 URIs pointing to Parquet files.
+      columns: SQL column expression (default "*" for all columns).
+      tmpdir: Directory for DuckDB to spill temporary data to disk.
+      preserve_order: If True, results are returned in the same order as wanted.
+
+  Returns:
+      DataFrame of all matching rows, or an empty DataFrame if none found.
+  """
   chunks = list(
     query_batched(conn, header, wanted, file_glob, columns=columns, tmpdir=tmpdir, preserve_order=preserve_order)
   )
@@ -18,6 +34,7 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp", preserve_
 
 
 def _configure_conn(conn, tmpdir):
+  """Set DuckDB memory limit, temp directory, and thread count based on available resources."""
   mem_lim = mem_gb_lim()
   threads = cpu_cnt(ratio=0.8)
   try:
@@ -31,6 +48,7 @@ def _configure_conn(conn, tmpdir):
 
 
 def _src_expr(file_glob):
+  """Build a DuckDB read_parquet() SQL expression from a glob string or list of URIs."""
   if isinstance(file_glob, list):
     escaped = ", ".join(f"'{u}'" for u in file_glob)
     return f"read_parquet([{escaped}])", f"{len(file_glob)} files"
@@ -41,6 +59,25 @@ def query_batched(
   conn, header, wanted, file_glob,
   batch_size=10000, columns="*", tmpdir="/tmp", preserve_order=False,
 ):
+  """Query Parquet files on S3 via DuckDB and yield results as DataFrames in batches.
+
+  Registers the wanted list as a temporary DuckDB table and runs a single SQL
+  query with an IN filter. Memory limit and thread count are set automatically
+  based on available system resources.
+
+  Args:
+      conn: DuckDB connection pre-configured with S3 credentials.
+      header: Column name to filter on (e.g. "input").
+      wanted: List of values to look up.
+      file_glob: S3 URI glob or list of S3 URIs pointing to Parquet files.
+      batch_size: Number of rows per yielded DataFrame.
+      columns: SQL column expression (default "*" for all columns).
+      tmpdir: Directory for DuckDB to spill temporary data to disk.
+      preserve_order: If True, results are returned in the same order as wanted.
+
+  Yields:
+      DataFrames of matching rows in batch_size chunks.
+  """
   if not wanted:
     return
 
@@ -98,6 +135,27 @@ def chunked_query_batched(
   slice_size=2000, batch_size=2000,
   columns="*", tmpdir="/tmp", preserve_order=False,
 ):
+  """Query wide Parquet files by slicing the wanted list into smaller chunks.
+
+  Used for models with 100+ output columns where loading all wanted inputs in
+  a single DuckDB query would exhaust memory. Each slice of slice_size inputs
+  is queried independently with reduced memory and thread limits, and results
+  are yielded incrementally.
+
+  Args:
+      conn: DuckDB connection pre-configured with S3 credentials.
+      header: Column name to filter on (e.g. "input").
+      wanted: List of values to look up.
+      file_glob: S3 URI glob or list of S3 URIs pointing to Parquet files.
+      slice_size: Number of wanted inputs per DuckDB query.
+      batch_size: Number of rows per yielded DataFrame within each slice.
+      columns: SQL column expression (default "*" for all columns).
+      tmpdir: Directory for DuckDB to spill temporary data to disk.
+      preserve_order: If True, results within each slice are returned in wanted order.
+
+  Yields:
+      DataFrames of matching rows in batch_size chunks.
+  """
   if not wanted:
     return
 

@@ -60,6 +60,22 @@ from isaura.query import chunked_query_batched
 
 
 class IsauraChecker(AbstractContextManager):
+  """Lightweight context manager for checking and registering molecule inputs.
+
+  Wraps a BloomIndex to provide a clean interface for deduplication checks
+  without setting up a full writer. Useful when you only need to know whether
+  inputs are already stored before running an expensive model, or to register
+  new inputs incrementally without writing any data.
+
+  Args:
+      bucket: MinIO bucket to operate on.
+      model_id: Ersilia model identifier.
+      model_version: Model version string.
+      store: Optional pre-built MinioStore. Creates one from env vars if absent.
+      bloom_filename: Object key suffix for the Bloom filter file.
+      checkpoint_every: Number of additions between automatic persist() calls.
+  """
+
   def __init__(
     self,
     bucket,
@@ -81,12 +97,15 @@ class IsauraChecker(AbstractContextManager):
     self._added = 0
 
   def seen(self, v):
+    """Return True if v has been previously stored (Bloom filter check)."""
     return self.bi.seen(v)
 
   def seen_many(self, vs):
+    """Check multiple values at once. Returns dict mapping each value to [bool_seen, bucket]."""
     return self.bi.seen_many(vs)
 
   def register(self, v, rc=None):
+    """Add v to the Bloom filter and trigger a checkpoint persist if needed."""
     self.bi.register(v, rc=rc)
     self._added += 1
     if self._added >= self.checkpoint_every:
@@ -94,6 +113,7 @@ class IsauraChecker(AbstractContextManager):
       self._added = 0
 
   def close(self):
+    """Persist any pending Bloom filter additions and release temporary directories."""
     try:
       if self._added:
         self.bi.persist()
@@ -109,6 +129,24 @@ class IsauraChecker(AbstractContextManager):
 
 
 class IsauraWriter:
+  """Reads a CSV of model outputs and stores them as chunked Parquet files on MinIO.
+
+  Deduplicates against the existing Bloom filter before writing, so re-running
+  on a dataset that is already partially stored will only add the new rows.
+  Writes are buffered in memory and flushed to MinIO in chunks of max_rows.
+  On completion, uploads updated access metadata and catalog.json.
+
+  Args:
+      input_csv: Path to the CSV file containing model outputs.
+      model_id: Ersilia model identifier.
+      model_version: Model version string.
+      access: Access level for the stored data ("public" or "private").
+      bucket: Target MinIO bucket. Defaults to the public bucket.
+      endpoint: MinIO endpoint URL. Defaults to local MinIO.
+      access_key: MinIO access key.
+      secrete: MinIO secret key.
+  """
+
   def __init__(
     self,
     input_csv,
@@ -158,6 +196,7 @@ class IsauraWriter:
     )
 
   def _load_metadata(self):
+    """Download and parse the existing access metadata file, or return None if absent."""
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
     try:
       self.store.download_file(self.bucket, self.access_key, local)
@@ -172,6 +211,7 @@ class IsauraWriter:
         pass
 
   def _upload_metadata(self, inputs):
+    """Merge newly written inputs into the access metadata file and upload to MinIO."""
     if not self.metadata_path or not self.bucket:
       return
     try:
@@ -183,11 +223,13 @@ class IsauraWriter:
       logger.warning(f"metadata upload failed: {e}")
 
   def _set_schema(self, row):
+    """Infer and store column schema from the first row seen."""
     if self.schema_cols is None:
       self.schema_cols = list(row.keys())
       logger.info(f"writer schema: {self.schema_cols[:10]}")
 
   def _flush_if_needed(self):
+    """Flush the in-memory buffer to MinIO if it has reached max_rows."""
     if self.buf_rows < self.max_rows or not self.buffers:
       return
     self.chunk_state.flush(self.buffers, self.schema_cols)
@@ -195,6 +237,17 @@ class IsauraWriter:
     self.buf_rows = 0
 
   def write(self, df=None, show_progress: bool = True):
+    """Write model outputs to MinIO, skipping rows already in the store.
+
+    Reads from self.input_csv by default. Pass a DataFrame via df to write
+    from memory instead. Deduplicates against the Bloom filter, buffers new
+    rows, flushes to Parquet chunks, and finalises the Bloom filter, access
+    metadata, and catalog.json when done.
+
+    Args:
+        df: Optional DataFrame to write instead of reading from input_csv.
+        show_progress: Whether to display a Rich progress bar.
+    """
     total = dupes = 0
     new = []
     if df is not None:
@@ -279,6 +332,7 @@ class IsauraWriter:
     logger.info(f"write done: new={total} dupes={dupes}")
 
   def close(self):
+    """Release temporary directories created during construction."""
     release_temp_dirs(self)
 
   def __enter__(self):
@@ -289,6 +343,29 @@ class IsauraWriter:
 
 
 class IsauraReader:
+  """Retrieves precalculated model outputs from MinIO for a list of molecule inputs.
+
+  Supports two lookup modes:
+  - **Exact**: checks the Bloom filter to confirm all inputs are stored, then
+    queries Parquet files via DuckDB or streaming.
+  - **Approximate**: replaces inputs with their nearest-neighbor equivalents
+    from the Milvus NNS service, then retrieves those stored outputs.
+
+  Automatically switches between DuckDB and incremental Parquet streaming
+  based on query size, and between normal and wide-table paths based on
+  output dimension.
+
+  Args:
+      model_id: Ersilia model identifier.
+      model_version: Model version string.
+      input_csv: Path to a CSV file with an "input" or "smiles" column.
+      approximate: If True, use nearest-neighbor search instead of exact lookup.
+      bucket: Source MinIO bucket. Defaults to the public bucket.
+      endpoint: MinIO endpoint URL.
+      access_key: MinIO access key.
+      secrete: MinIO secret key.
+  """
+
   def __init__(
     self,
     model_id,
@@ -343,6 +420,11 @@ class IsauraReader:
     self.close()
 
   def _wanted(self, df=None):
+    """Parse molecule inputs from input_csv or a DataFrame.
+
+    Returns:
+        Tuple of (list_of_input_strings, column_header_name).
+    """
     wanted, header_set = ([], set())
     rows = df.to_dict("records") if df is not None else None
     if rows is None:
@@ -370,6 +452,15 @@ class IsauraReader:
     return (wanted, header)
 
   def _prepare_read(self, df=None):
+    """Validate inputs and resolve them to queryable molecule strings.
+
+    In exact mode: checks the Bloom filter and exits if any inputs are missing.
+    In approximate mode: loads the NNS index and replaces inputs with their
+    nearest stored neighbors.
+
+    Returns:
+        Tuple of (start_time, resolved_wanted_list, header_column_name).
+    """
     index = None
     t0 = time.time()
     wanted, header = self._wanted(df=df)
@@ -402,6 +493,16 @@ class IsauraReader:
     return (t0, wanted, header)
 
   def _make_read_source(self, wanted, header, batch_size=10000, ordered=True):
+    """Choose a read strategy and return (mode, payload).
+
+    Three strategies based on query size and output width:
+    - "wide": Parquet streaming for models with 100+ output columns.
+    - "stream": Parquet streaming for large queries (>= STREAM_PARQUET_THRESHOLD).
+    - "duckdb": DuckDB batched query for smaller queries.
+
+    Returns:
+        Tuple of (mode_string, source_or_prefix).
+    """
     n = len(wanted)
     if self.wide_model:
       prefix = hive_prefix(self.base) + "/"
@@ -418,6 +519,7 @@ class IsauraReader:
     )
 
   def _load_index(self):
+    """Download and parse the JSON index for this model. Returns [] on failure."""
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
     downloaded = False
     try:
@@ -445,6 +547,19 @@ class IsauraReader:
         logger.error(f"Exception occurred when removing temp index file (local={local}): {e}")
 
   def _reorder(self, wanted, header, result_df):
+    """Reorder result_df rows to match the order of wanted inputs.
+
+    Rows missing from the result are included as None-filled placeholders
+    so the output always has exactly len(wanted) rows.
+
+    Args:
+        wanted: Original ordered list of input values.
+        header: Column name used to match rows.
+        result_df: Unordered DataFrame of retrieved rows.
+
+    Returns:
+        DataFrame aligned to the wanted order.
+    """
     import numpy as np
 
     keys = result_df[header].astype(str).str.strip()
@@ -472,11 +587,25 @@ class IsauraReader:
     return out
 
   def _reorder_batched(self, wanted, header, result_df, batch_size=10000):
+    """Reorder result_df to match wanted, then yield it in batch_size chunks."""
     ordered = self._reorder(wanted, header, result_df)
     for start in range(0, len(ordered), batch_size):
       yield ordered.iloc[start : start + batch_size].copy()
 
   def read(self, output_csv=None, df=None):
+    """Retrieve stored outputs and return them as a DataFrame (or write to CSV).
+
+    Validates inputs, picks the right read strategy, streams results, and
+    optionally writes them to output_csv. Returns an empty DataFrame if
+    output_csv is set (results are on disk) or if no inputs were found.
+
+    Args:
+        output_csv: Optional path to write results to. If set, returns empty DataFrame.
+        df: Optional DataFrame of inputs to use instead of input_csv.
+
+    Returns:
+        DataFrame of results, or empty DataFrame if written to output_csv.
+    """
     t0, wanted, header = self._prepare_read(df=df)
     if not wanted:
       logger.info("[read] no inputs — returning empty frame")
@@ -542,6 +671,19 @@ class IsauraReader:
     return out
 
   def read_batched(self, batch_size=10000, output_csv=None, df=None):
+    """Retrieve stored outputs as a generator of DataFrames, optionally writing to CSV.
+
+    Memory-efficient alternative to read() for large result sets. Yields one
+    DataFrame per batch. If output_csv is set, also streams results to disk.
+
+    Args:
+        batch_size: Number of rows per yielded DataFrame.
+        output_csv: Optional path to write all results to as they are streamed.
+        df: Optional DataFrame of inputs to use instead of input_csv.
+
+    Yields:
+        DataFrames of matching rows in batch_size chunks.
+    """
     t0, wanted, header = self._prepare_read(df=df)
     if not wanted:
       logger.info("[read_batched] no inputs — returning")
@@ -616,14 +758,25 @@ class IsauraReader:
 
 
 class IsauraCopy(_BaseTransfer):
+  """Copies a model's data from a staging bucket to the public and/or private buckets.
+
+  Routing is determined by the access metadata: each input is sent to
+  isaura-public or isaura-private based on its "access" field.
+  If output_dir is set, dumps all objects to the local filesystem instead.
+  """
+
   def copy(self):
+    """Run the copy operation. Loads access metadata and routes rows to the right buckets."""
     logger.info(f"[copy] starting model={self.model_id} v={self.model_version} bucket={self.bucket}")
     meta_local, meta = self._load_metadata()
     return self._copy(meta_local, meta)
 
 
 class IsauraMover(_BaseTransfer):
+  """Moves a model's data between buckets by copying then deleting the source."""
+
   def move(self):
+    """Copy data to the destination buckets, then delete all source objects."""
     t0 = time.time()
     logger.info(f"[move] starting model={self.model_id} v={self.model_version} bucket={self.bucket}")
     meta_local, meta = self._load_metadata()
@@ -633,6 +786,12 @@ class IsauraMover(_BaseTransfer):
 
 
 class IsauraRemover(_BaseTransfer):
+  """Deletes a model's data from a bucket, or all objects in a project bucket.
+
+  If project_name is set, deletes the entire project bucket without needing
+  a model_id or model_version. Otherwise delegates to _BaseTransfer._delete().
+  """
+
   def __init__(self, model_id=None, model_version=None, bucket=None, project_name=None):
     self._project_name = project_name
     if project_name:
@@ -641,6 +800,7 @@ class IsauraRemover(_BaseTransfer):
       super().__init__(model_id, model_version, bucket)
 
   def remove(self):
+    """Delete all objects for this model (or entire project bucket if project_name is set)."""
     if self._project_name:
       store = self._store
       n = store.delete_prefix(self._project_name, "")
@@ -651,6 +811,12 @@ class IsauraRemover(_BaseTransfer):
 
 
 class IsauraPull(_BaseTransfer):
+  """Downloads precalculated outputs from the cloud MinIO and stores them locally.
+
+  Uses IsauraReader pointed at the cloud endpoint to retrieve the data for
+  the requested inputs, then writes them to the local MinIO via _pull_batched.
+  """
+
   def __init__(self, model_id, model_version, bucket, input_csv, output_dir=None):
     super().__init__(model_id, model_version, bucket, output_dir)
     self.model_id = model_id
@@ -659,6 +825,7 @@ class IsauraPull(_BaseTransfer):
     self.input_csv = input_csv
 
   def pull(self):
+    """Read outputs from cloud MinIO for the given inputs and store them locally."""
     logger.info(
       f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}"
     )
@@ -677,12 +844,21 @@ class IsauraPull(_BaseTransfer):
 
 
 class IsauraPush:
+  """Uploads a model's local Parquet data to the cloud MinIO in parallel.
+
+  Uploads all chunk files from both the public and private local buckets to
+  their cloud counterparts (isaura-public and isaura-private). Bloom filter
+  and index files are merged rather than blindly overwritten, so cloud entries
+  already present are preserved.
+  """
+
   def __init__(self, model_id, model_version, bucket):
     self.model_id = model_id
     self.model_version = model_version
     self.bucket = bucket
 
   def _bucket_exists(self, store, bucket):
+    """Return True if the given bucket exists and is accessible."""
     try:
       store.client.head_bucket(Bucket=bucket)
       return True
@@ -690,6 +866,11 @@ class IsauraPush:
       return False
 
   def _relay_file(self, local_store, src_bucket, cloud_store, dst_bucket, key, tmpdir):
+    """Download a file from local MinIO and upload it to cloud MinIO.
+
+    Returns:
+        Tuple of (key, None) on success, or (None, error_string) on failure.
+    """
     local = os.path.join(tmpdir, uuid.uuid4().hex)
     try:
       local_store.download_file(src_bucket, key, local)
@@ -728,6 +909,7 @@ class IsauraPush:
     return (merged_entries, cloud_chunks)
 
   def push(self):
+    """Upload all local Parquet chunks to cloud MinIO and merge the Bloom filter and index."""
     local_store = MinioStore()
     prefix = get_pref(self.model_id, self.model_version) + "/"
     skip_suffixes = (BLOOM_FILENAME, INDEX_FILE, CATALOG_FILE)
@@ -791,6 +973,24 @@ class IsauraPush:
 
 
 class IsauraInspect:
+  """Inspects models, buckets, and inputs in MinIO without modifying any data.
+
+  Supports both local and cloud MinIO. Provides methods for listing models,
+  checking which inputs are available, counting rows, and reading Parquet
+  metadata (columns, row counts) via HTTP range requests to avoid full downloads.
+
+  Args:
+      model_id: If set, scopes all operations to this model.
+      model_version: If set, further scopes to this version.
+      cloud: If True, connects to cloud MinIO using cloud credentials.
+      project_name: If set, operates on a custom bucket instead of the defaults.
+      access: Which buckets to inspect — "public", "private", or "both".
+      endpoint: Custom MinIO endpoint. Ignored if cloud=True.
+      parquet_block_size: Block size for _S3RangeFile when reading Parquet metadata.
+      max_small_json_bytes: Size limit for JSON files fetched inline (larger files are skipped).
+      heavy_index: If True, loads the full JSON index even in cloud mode.
+  """
+
   def __init__(
     self,
     model_id=None,
@@ -813,6 +1013,7 @@ class IsauraInspect:
     self._rowcount_cache = {}
 
   def buckets(self):
+    """Return the list of bucket names to operate on based on access and project_name."""
     if self.project_name:
       return [self.project_name]
     if self.access == "public":
@@ -822,6 +1023,7 @@ class IsauraInspect:
     return [PUB, PRI]
 
   def _creds(self, bucket):
+    """Return MinioStore constructor kwargs for the given bucket (local or cloud credentials)."""
     if not self.cloud:
       return {"endpoint": self.endpoint}
     if bucket == PUB:
@@ -844,18 +1046,21 @@ class IsauraInspect:
     return self._client(bucket).get_paginator("list_objects_v2")
 
   def list_prefixes(self, bucket, prefix=""):
+    """Yield common prefixes (virtual directories) under prefix, one level deep."""
     p = self._paginator(bucket)
     for page in p.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
       for cp in page.get("CommonPrefixes", []):
         yield cp["Prefix"]
 
   def list_objects(self, bucket, prefix=""):
+    """Yield all object keys under prefix (paginated, recursive)."""
     p = self._paginator(bucket)
     for page in p.paginate(Bucket=bucket, Prefix=prefix):
       for obj in page.get("Contents", []):
         yield obj["Key"]
 
   def iter_object_meta(self, bucket, prefix=""):
+    """Yield metadata dicts (Key, Size, LastModified, ETag, StorageClass) for all objects under prefix."""
     p = self._paginator(bucket)
     for page in p.paginate(Bucket=bucket, Prefix=prefix):
       for obj in page.get("Contents", []):
@@ -868,6 +1073,7 @@ class IsauraInspect:
         }
 
   def get_json(self, bucket, key, max_bytes=None):
+    """Fetch and parse a JSON object from MinIO. Returns None if too large or on error."""
     client = self._client(bucket)
     lim = self.max_small_json_bytes if max_bytes is None else int(max_bytes)
     try:
@@ -888,6 +1094,7 @@ class IsauraInspect:
       return None
 
   def iter_models(self, bucket, prefix_filter=""):
+    """Yield (model_id, model_version) tuples for all models found in the bucket."""
     if self.model_id:
       m = self.model_id
       if self.model_version:
@@ -908,6 +1115,7 @@ class IsauraInspect:
           yield (mid, mv)
 
   def load_index(self, bucket, model_id, model_version):
+    """Load the JSON index for a model. Returns {} in cloud mode unless heavy_index=True."""
     base = get_base(model_id, model_version)
     key = get_idx_key(base)
     if self.heavy_index or not self.cloud:
@@ -915,6 +1123,7 @@ class IsauraInspect:
     return {}
 
   def load_metadata(self, bucket, model_id, model_version):
+    """Load the access metadata file for a model. Returns None if absent."""
     base = get_base(model_id, model_version)
     return self.get_json(bucket, f"{base}/{ACCESS_FILE}")
 
@@ -933,6 +1142,7 @@ class IsauraInspect:
     return (union, owner)
 
   def list_available(self, output_csv=None):
+    """Return a DataFrame of all stored inputs and their source bucket."""
     _, owner = self._indices_union(force=self.cloud)
     df = pd.DataFrame([{"input": smi, "bucket": b} for smi, b in owner.items()])
     if output_csv:
@@ -940,6 +1150,10 @@ class IsauraInspect:
     return df
 
   def inspect_inputs(self, input_csv, output_csv=None):
+    """Check which inputs from input_csv are available in the store.
+
+    Returns a DataFrame with columns: input, available (bool), bucket.
+    """
     _, owner = self._indices_union(force=self.cloud)
     with open(input_csv, newline="", encoding="utf-8") as f:
       wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
@@ -949,6 +1163,7 @@ class IsauraInspect:
     return df
 
   def find_chunk_keys(self, bucket, model_id, model_version):
+    """Yield (key, size_bytes) for every Parquet chunk file for this model."""
     pref = get_pref(model_id, model_version)
     for obj in self.iter_object_meta(bucket, pref):
       k = obj.get("Key") or ""
@@ -956,6 +1171,11 @@ class IsauraInspect:
         yield (k, int(obj.get("Size") or 0))
 
   def parquet_num_rows(self, bucket, parquet_key, size=None):
+    """Read the row count from a Parquet file's footer without downloading the full file.
+
+    Uses _S3RangeFile for range-based HTTP access. Returns None on failure.
+    Results are cached for the lifetime of this instance.
+    """
     if pq is None or not parquet_key:
       return None
     ck = (bucket, parquet_key)
@@ -984,6 +1204,11 @@ class IsauraInspect:
       return None
 
   def entries_from_chunks(self, bucket, model_id, model_version):
+    """Return (total_row_count, chunk_count) for a model.
+
+    Tries catalog.json first for a fast answer. Falls back to reading row
+    counts from each Parquet footer in parallel if catalog.json is absent.
+    """
     # try catalog.json first
     base = get_base(model_id, model_version)
     cat = self.get_json(bucket, f"{base}/{CATALOG_FILE}")
@@ -1003,6 +1228,11 @@ class IsauraInspect:
     return (total, len(chunks))
 
   def inspect_models(self, bucket, prefix_filter=""):
+    """Return a list of model info dicts for all models in the bucket.
+
+    In cloud mode without heavy_index, uses the fast listing path
+    (_inspect_models_from_listing). Otherwise loads the full JSON index.
+    """
     if self.cloud and (not self.heavy_index):
       return self._inspect_models_from_listing(bucket, prefix_filter)
     out = []
@@ -1088,6 +1318,7 @@ class IsauraInspect:
     return out
 
   def find_any_chunk_key(self, bucket, model_id, model_version):
+    """Return the key of the first Parquet chunk found for a model, or None."""
     pref = get_pref(model_id, model_version)
     for k in self.list_objects(bucket, pref):
       if "/chunk_" in k and k.endswith(".parquet"):
@@ -1095,6 +1326,7 @@ class IsauraInspect:
     return None
 
   def parquet_columns(self, bucket, parquet_key):
+    """Return the column names of a Parquet file by reading its footer via range request."""
     if not parquet_key or pq is None:
       return None
     client = self._client(bucket)
@@ -1119,6 +1351,25 @@ class IsauraInspect:
 
 
 class IsauraStat:
+  """Computes storage statistics across all models in one or more buckets.
+
+  Produces a JSON report with per-model molecule counts, storage sizes, column
+  counts, and GitHub metadata. In cloud mode uses a fast parallel path
+  (_compute_cloud) that makes a single LIST per bucket and fetches counts from
+  catalog.json. In local mode reads the full JSON index for exact counts.
+
+  Args:
+      project_name: If set, scopes stats to a custom bucket.
+      access: Which buckets to include — "public", "private", or "both".
+      cloud: If True, connects to cloud MinIO.
+      endpoint: Custom MinIO endpoint.
+      include_columns: If True, reads the number of output columns from each model's first chunk.
+      include_column_names: If True, also includes the full list of column names.
+      schema_version: Version tag included in the output JSON.
+      producer: Producer label included in the output JSON.
+      max_workers: Max parallel threads for fetching model data.
+  """
+
   _MAX_WORKERS = 8
 
   def __init__(
@@ -1141,6 +1392,7 @@ class IsauraStat:
     self.max_workers = int(max_workers) if max_workers is not None else self._MAX_WORKERS
 
   def _percentile(self, sorted_vals, p):
+    """Return the p-th percentile of a pre-sorted list, or None if empty."""
     if not sorted_vals:
       return None
     n = len(sorted_vals)
@@ -1149,9 +1401,11 @@ class IsauraStat:
     return sorted_vals[i]
 
   def _use_chunks(self):
+    """Return True if the fast cloud path (chunk-based counting) should be used."""
     return self.insp.cloud and (not self.insp.heavy_index)
 
   def _collect_objects(self, bucket, model_id, model_version):
+    """List all objects for a model and return (total_bytes, total_gb, chunks, first_chunk_key)."""
     pref = get_pref(model_id, model_version)
     total_bytes = 0
     chunks = []
@@ -1168,6 +1422,7 @@ class IsauraStat:
     return (total_bytes, total_gb, chunks, first_chunk)
 
   def _count_rows_from_chunks(self, bucket, chunks):
+    """Sum row counts across a list of (key, size) chunk tuples in parallel."""
     total = 0
     if not chunks:
       return total
@@ -1180,6 +1435,7 @@ class IsauraStat:
     return total
 
   def _process_model(self, bucket, mid, mv, use_chunks):
+    """Build a stats row dict for a single model. Used in local mode."""
     total_bytes, total_gb, chunks, first_chunk = self._collect_objects(bucket, mid, mv)
     if use_chunks:
       # try catalog.json first
@@ -1297,6 +1553,7 @@ class IsauraStat:
     }
 
   def _empty_result(self, generated_at, buckets):
+    """Return a zero-filled stats result dict for when no models are found."""
     return {
       "schema_version": self.schema_version, "producer": self.producer,
       "generated_at_utc": generated_at, "buckets": buckets,
@@ -1309,6 +1566,14 @@ class IsauraStat:
     }
 
   def compute(self):
+    """Compute and return the full stats report as a dict.
+
+    In cloud mode delegates to _compute_cloud (fast, parallel, catalog.json-based).
+    In local mode iterates models sequentially and reads the full JSON index.
+
+    Returns:
+        Dict with schema_version, generated_at_utc, models list, and aggregate stats.
+    """
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     buckets = self.insp.buckets()
     use_chunks = self._use_chunks()
@@ -1351,6 +1616,13 @@ class IsauraStat:
     }
 
   def write_json(self, output_path):
+    """Compute stats and write the result to output_path as formatted JSON.
+
+    Uses an atomic write (tmp file + rename) to avoid leaving a partial file.
+
+    Returns:
+        The output_path that was written.
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     tmp = output_path + ".tmp"
     data = self.compute()

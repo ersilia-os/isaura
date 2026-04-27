@@ -13,6 +13,14 @@ logger.level("SUCCESS", color="<black><bold><bg green>")
 
 
 class Logger:
+  """Thin wrapper around loguru that routes output through a Rich console handler.
+
+  Provides the standard log levels (debug, info, warning, error, critical,
+  success) and exposes the underlying Rich Console so other parts of the
+  codebase can render Rich widgets (progress bars, tables) to the same output.
+  Console output can be toggled on/off via set_verbosity().
+  """
+
   def __init__(self):
     self.logger = logger
     self._console = None
@@ -40,6 +48,7 @@ class Logger:
       self._console = None
 
   def set_verbosity(self, verbose):
+    """Enable or disable console log output."""
     if verbose:
       self._log_to_console()
     else:

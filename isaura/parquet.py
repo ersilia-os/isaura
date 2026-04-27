@@ -15,18 +15,33 @@ from isaura.utils import get_files_glob, hive_prefix
 
 
 def is_wide(output_dimension):
+  """Return True if the output dimension meets the threshold for wide-table mode."""
   return output_dimension is not None and int(output_dimension) >= WIDE_OUTPUT_DIM_THRESHOLD
 
 
 def chunk_row_limit(output_dimension):
+  """Return the max rows per Parquet chunk file, using a lower limit for wide models."""
   return MAX_ROWS_PER_FILE if is_wide(output_dimension) else MAX_ROWS
 
 
 def chunk_write_batch_rows(output_dimension):
+  """Return the number of rows to write per batch, using a smaller batch for wide models."""
   return WIDE_WRITE_BATCH_ROWS if is_wide(output_dimension) else DEFAULT_WRITE_BATCH_ROWS
 
 
 def parquet_writer_kwargs(output_dimension):
+  """Return (constructor_kwargs, write_table_kwargs) for PyArrow ParquetWriter.
+
+  Wide models (100+ output columns) use smaller row groups, disabled
+  dictionary encoding, and no statistics to keep file sizes manageable.
+  Narrow models use standard compression and row group settings.
+
+  Args:
+      output_dimension: Number of output columns, or None if unknown.
+
+  Returns:
+      Tuple of (ctor_kw dict, wt_kw dict) to pass to ParquetWriter.
+  """
   wide = is_wide(output_dimension)
   ctor_kw = {
     "compression": PARQUET_COMPRESSION,
@@ -45,6 +60,18 @@ def parquet_writer_kwargs(output_dimension):
 
 
 def list_parquet_keys(store, bucket, base):
+  """List all Parquet chunk keys for a model and return them as s3:// URIs.
+
+  Falls back to a glob URI if the boto3 listing fails.
+
+  Args:
+      store: MinioStore used for listing.
+      bucket: Source bucket.
+      base: Model tranches prefix (e.g. "eos1234/v1/tranches").
+
+  Returns:
+      List of s3:// URIs, or a glob URI string if listing fails.
+  """
   prefix = hive_prefix(base) + "/"
   t0 = time.perf_counter()
   try:

@@ -85,7 +85,7 @@ opt_approx = click.option(
   "-nn",
   is_flag=True,
   default=False,
-  help="Specifies whether to use Approximate Nearest Neighbor search for result retrieval or not.",
+  help="Use Approximate Nearest Neighbor search for result retrieval. [red bold]Under development — may return incomplete or unexpected results.[/]",
 )
 opt_cloud = click.option(
   "--cloud", "-c", is_flag=True, default=False, help="Specifies to use isaura in cloud mode or not."
@@ -130,6 +130,8 @@ def write(input_file, project_name, access, model, version, force):
 @cli.command("read")
 @apply_opts(opt_input_file, opt_project, opt_model, opt_version, opt_output_file, opt_approx)
 def read(input_file, project_name, model, version, output_file, approximate):
+  if approximate:
+    logger.warning("Approximate Nearest Neighbor search is under active development and may return incomplete or unexpected results.")
   with IsauraReader(
     model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
   ) as r:

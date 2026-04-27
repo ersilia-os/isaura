@@ -13,6 +13,16 @@ from isaura.utils import rss_mb
 
 
 class StreamingCsvSink:
+  """Context manager that writes DataFrames to a CSV file incrementally.
+
+  Writes the header only once (on the first write_table call) and appends
+  subsequent batches without re-writing it. Used to stream large result sets
+  to disk without holding everything in memory.
+
+  Args:
+      path: File path to write the CSV to.
+  """
+
   def __init__(self, path):
     self._path = path
     self._fp = None
@@ -31,6 +41,7 @@ class StreamingCsvSink:
       self._fp.close()
 
   def write_table(self, table):
+    """Append a PyArrow Table to the CSV, writing the header only on the first call."""
     if table is None or table.num_rows == 0:
       return
     opts = pa_csv.WriteOptions(include_header=not self._header_written)
@@ -39,15 +50,22 @@ class StreamingCsvSink:
     self._header_written = True
 
   def write_batch(self, batch):
+    """Append a PyArrow RecordBatch to the CSV."""
     self.write_table(pa.Table.from_batches([batch]))
 
   def write_df(self, df):
+    """Append a pandas DataFrame to the CSV."""
     if df is None or df.empty:
       return
     self.write_table(pa.Table.from_pandas(df, preserve_index=False))
 
 
 class _PulseBarColumn(ProgressColumn):
+  """Rich progress column that renders a pulsing bar while a task is in progress.
+
+  Switches to a solid filled bar when the task is complete.
+  """
+
   def __init__(
     self, bar_width=40,
     style="rgb(36,26,58)",
@@ -73,6 +91,17 @@ class _PulseBarColumn(ProgressColumn):
 
 
 class ReadProgress:
+  """Context manager that displays a live Rich progress bar during a read operation.
+
+  Shows files scanned, rows emitted, pending inputs, memory usage, and
+  elapsed/remaining time. Designed to be used with the `with` statement and
+  updated incrementally via update().
+
+  Args:
+      total_inputs: Total number of molecule inputs being queried (used to size the bar).
+      console: Rich Console to render to. Defaults to a new stderr console.
+  """
+
   def __init__(self, total_inputs=None, console=None):
     self.total_inputs = total_inputs
     self.console = console or Console(force_terminal=True, stderr=True)
@@ -127,6 +156,7 @@ class ReadProgress:
 
   def update(self, stage=None, files_done=None, files_total=None,
              found_rows=None, emitted_rows=None, unresolved=None):
+    """Update the progress bar with the latest scan state."""
     if files_done is not None:
       self.files_done = files_done
     if files_total is not None:
@@ -154,6 +184,17 @@ class ReadProgress:
 
 
 def track_write_progress(rows, total=None, description="Writing rows", console=None):
+  """Wrap an iterable of rows with a Rich progress bar and yield each row through.
+
+  Args:
+      rows: Iterable of rows to pass through.
+      total: Total row count for a determinate bar. Uses a spinner if None.
+      description: Label shown next to the progress bar.
+      console: Rich Console to render to.
+
+  Yields:
+      Each row from the input iterable unchanged.
+  """
   if total is None:
     progress = Progress(
       SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
@@ -175,6 +216,7 @@ def track_write_progress(rows, total=None, description="Writing rows", console=N
 
 
 def spinner(message, fn, *args, **kwargs):
+  """Run fn(*args, **kwargs) while displaying a Rich spinner with message. Returns the result."""
   c = Console()
   with c.status(message, spinner="dots"):
     result = fn(*args, **kwargs)
@@ -182,6 +224,16 @@ def spinner(message, fn, *args, **kwargs):
 
 
 def make_table(title, cols, rows):
+  """Build a Rich Table from a list of column specs and row dicts.
+
+  Args:
+      title: Table title string.
+      cols: List of dicts with "name", optional "justify", and optional "style" keys.
+      rows: List of dicts mapping column "key" values to cell content.
+
+  Returns:
+      A Rich Table ready to print.
+  """
   t = Table(title=title)
   for c in cols:
     t.add_column(c["name"], justify=c.get("justify", "left"), style=c.get("style", ""))

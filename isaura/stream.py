@@ -11,6 +11,21 @@ from isaura.utils import cleanup_temp_dir, make_temp, rss_mb
 
 
 def _yield_filtered_chunks(filtered, header, batch_size, wanted_set, progress_cb):
+  """Slice a filtered PyArrow Table into DataFrames and track resolved molecules.
+
+  Yields each slice as a DataFrame and removes matched molecules from
+  wanted_set so the caller knows which inputs are still outstanding.
+
+  Args:
+      filtered: PyArrow Table already filtered to matching rows.
+      header: Column name identifying each molecule (e.g. "input").
+      batch_size: Maximum rows per yielded DataFrame.
+      wanted_set: Mutable set of molecule strings still to be found. Modified in place.
+      progress_cb: Optional callable receiving the row count of each batch.
+
+  Yields:
+      Tuple of (DataFrame, n_newly_resolved).
+  """
   remaining_delta = 0
   for start in range(0, filtered.num_rows, batch_size):
     chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
@@ -34,6 +49,30 @@ def stream_parquet_filtered(
   dense_file_ratio=STREAM_DENSE_FILE_RATIO,
   progress=None,
 ):
+  """Stream matching rows from Parquet chunk files on MinIO without loading all files into memory.
+
+  Downloads one chunk file at a time, filters it for the wanted molecules,
+  and yields matching rows as DataFrames. Stops early once all wanted molecules
+  have been found. Two read strategies are used per file:
+
+  - **Dense mode**: when most rows in a file are expected to match (ratio >= dense_file_ratio),
+    reads the file in large batches and filters each batch in memory.
+  - **Row-group mode**: reads only the input column first to check for matches,
+    then fetches the full row group only if matches exist (saves I/O on sparse queries).
+
+  Args:
+      store: MinioStore used to download chunk files.
+      bucket: Source bucket.
+      prefix: Key prefix under which chunk files are listed.
+      wanted: List or set of molecule input strings to look up.
+      header: Column name identifying each molecule (default "input").
+      batch_size: Maximum rows per yielded DataFrame.
+      dense_file_ratio: Fraction of a file's rows that must be wanted to use dense mode.
+      progress: Optional ReadProgress instance for live progress updates.
+
+  Yields:
+      DataFrames of matching rows, in file order.
+  """
   wanted_set = set(wanted) if not isinstance(wanted, set) else wanted
   remaining = len(wanted_set)
   wanted_arr = pa.array(list(wanted_set))
@@ -179,6 +218,25 @@ def stream_parquet_filtered_ordered(
   batch_size=10000,
   progress=None,
 ):
+  """Stream matching rows from MinIO in the same order as the wanted input list.
+
+  Wraps stream_parquet_filtered and buffers resolved rows until they can be
+  emitted in the original wanted order. Molecules not found in the store are
+  emitted as None-filled placeholder rows so the output always has exactly
+  len(wanted) rows.
+
+  Args:
+      store: MinioStore used to download chunk files.
+      bucket: Source bucket.
+      prefix: Key prefix under which chunk files are listed.
+      wanted: Ordered list of molecule input strings.
+      header: Column name identifying each molecule (default "input").
+      batch_size: Maximum rows per yielded DataFrame.
+      progress: Optional ReadProgress instance for live progress updates.
+
+  Yields:
+      DataFrames of rows aligned to the wanted order, with None rows for misses.
+  """
   wanted_list = [str(v).strip() for v in wanted if str(v).strip()]
   if not wanted_list:
     return

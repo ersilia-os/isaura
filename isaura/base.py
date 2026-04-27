@@ -44,6 +44,20 @@ from isaura.helpers import (
 
 
 class _S3RangeFile:
+  """Seekable file-like object backed by S3/MinIO HTTP range requests.
+
+  Lets libraries like PyArrow read Parquet footer metadata from MinIO
+  without downloading the entire file. Fetches fixed-size blocks on
+  demand and caches them for the lifetime of the object.
+
+  Args:
+      client: boto3 S3 client.
+      bucket: Bucket name.
+      key: Object key.
+      size: Total object size in bytes.
+      block_size: Number of bytes per cached block (default 256 KB).
+  """
+
   def __init__(self, client, bucket, key, size, block_size=262144):
     self._client = client
     self._bucket = bucket
@@ -55,15 +69,27 @@ class _S3RangeFile:
     self.closed = False
 
   def readable(self):
+    """Return True — this stream supports reading."""
     return True
 
   def seekable(self):
+    """Return True — this stream supports seeking."""
     return True
 
   def tell(self):
+    """Return the current byte offset."""
     return self._pos
 
   def seek(self, offset, whence=0):
+    """Move the current position.
+
+    Args:
+        offset: Byte offset relative to whence.
+        whence: 0 = start, 1 = current position, 2 = end.
+
+    Returns:
+        The new absolute byte position.
+    """
     if whence == 0:
       new_pos = int(offset)
     elif whence == 1:
@@ -80,6 +106,7 @@ class _S3RangeFile:
     return self._pos
 
   def _get_block(self, block_idx):
+    """Fetch and cache a single block by index, using an S3 range request."""
     if block_idx in self._cache:
       return self._cache[block_idx]
     start = block_idx * self._block_size
@@ -98,6 +125,14 @@ class _S3RangeFile:
     return body
 
   def read(self, n=-1):
+    """Read up to n bytes from the current position.
+
+    Args:
+        n: Number of bytes to read. Reads to end-of-file if -1 or None.
+
+    Returns:
+        Bytes read. Returns b"" when at end-of-file or if closed.
+    """
     if self.closed:
       return b""
     if n is None or n < 0:
@@ -121,11 +156,28 @@ class _S3RangeFile:
     return bytes(out)
 
   def close(self):
+    """Release the block cache and mark the stream as closed."""
     self.closed = True
     self._cache.clear()
 
 
 class MinioStore:
+  """boto3 S3 client wrapper for a MinIO endpoint.
+
+  Checks that the MinIO server is reachable on construction and exits
+  if it is not. Provides upload, download, listing, and delete helpers
+  used throughout the rest of the codebase.
+
+  Args:
+      endpoint: MinIO HTTP endpoint URL. Defaults to MINIO_ENDPOINT env var.
+      access: Access key. Defaults to MINIO_LOCAL_AK env var.
+      secret: Secret key. Defaults to MINIO_LOCAL_SK env var.
+      multipart_threshold: File size (bytes) above which uploads are split into chunks.
+      multipart_chunksize: Size of each upload chunk in bytes.
+      max_concurrency: Number of chunks to upload in parallel.
+      use_threads: Whether to use threads for transfers.
+  """
+
   def __init__(
     self,
     endpoint=None,
@@ -157,6 +209,7 @@ class MinioStore:
       sys.exit(1)
 
   def ping(self, store):
+    """Return True if the MinIO health endpoint responds with 200, False otherwise."""
     try:
       url = f"{self.endpoint.rstrip('/')}/minio/health/ready"
       resp = requests.get(url, timeout=3)
@@ -173,6 +226,7 @@ class MinioStore:
     return False
 
   def ensure_bucket(self, bucket):
+    """Create the bucket if it does not already exist. Exits on failure."""
     try:
       self.client.head_bucket(Bucket=bucket)
     except Exception as e:
@@ -184,6 +238,7 @@ class MinioStore:
         sys.exit(1)
 
   def download_file(self, bucket, key, local):
+    """Download an object from MinIO to a local path. Raises on missing key."""
     try:
       self.client.download_file(bucket, key, local, Config=self.transfer_config)
     except Exception as e:
@@ -191,15 +246,18 @@ class MinioStore:
       raise
 
   def upload_file(self, local, bucket, key, extra_args=None):
+    """Upload a local file to MinIO at the given bucket and key."""
     self.client.upload_file(local, bucket, key, ExtraArgs=extra_args or {}, Config=self.transfer_config)
 
   def list_keys(self, bucket, prefix):
+    """Yield all S3 object metadata dicts under the given prefix (paginated)."""
     p = self.client.get_paginator("list_objects_v2")
     for page in p.paginate(Bucket=bucket, Prefix=prefix):
       for obj in page.get("Contents", []):
         yield obj
 
   def delete_prefix(self, bucket, prefix):
+    """Delete all objects under a prefix in batches of 1000. Returns the count deleted."""
     batch = []
     deleted = 0
     for obj in self.list_keys(bucket, prefix):
@@ -215,6 +273,23 @@ class MinioStore:
 
 
 class DuckDBMinio:
+  """Singleton DuckDB connection for querying Parquet files directly on MinIO.
+
+  DuckDB runs entirely in RAM (no database file) and uses its httpfs extension
+  to read Parquet over S3. On first construction the connection is configured
+  with the MinIO endpoint and credentials so that subsequent SQL queries can
+  reference s3:// paths without any extra setup.
+
+  Re-construction with identical settings is a no-op, so this can be safely
+  instantiated multiple times across the codebase.
+
+  Args:
+      endpoint: MinIO HTTP endpoint URL.
+      access: Access key.
+      secret: Secret key.
+      threads: Number of DuckDB query threads. Defaults to all available CPUs.
+  """
+
   _instance = None
 
   def __new__(cls, *a, **kw):
@@ -246,12 +321,36 @@ class DuckDBMinio:
     self._cfg = cfg
 
   def close(self):
+    """Close the DuckDB connection and release its memory."""
     if getattr(self, "con", None):
       self.con.close()
       self.con = None
 
 
 class BloomIndex:
+  """Bloom filter and JSON index for the Parquet store, persisted on MinIO.
+
+  The Bloom filter answers "have we already stored this molecule?" without
+  scanning any Parquet files, preventing duplicate writes cheaply. The JSON
+  index maps each molecule SMILES to its (row, chunk) coordinates so that
+  exact lookups can open just the one relevant chunk file instead of all of them.
+
+  Both files are downloaded from MinIO on construction (or created fresh if
+  absent) and re-uploaded on every call to persist(). An automatic checkpoint
+  upload is triggered every CHECKPOINT_EVERY additions.
+
+  Args:
+      store: MinioStore used for uploads and downloads.
+      bucket: Bucket where the Bloom filter and index files live.
+      base_prefix: Key prefix for this model (e.g. "eos1234/v1").
+      local_dir: Local directory used to cache the downloaded files.
+      bloom_filename: Object key suffix for the Bloom filter file.
+      error_rate: Acceptable false-positive rate for the Bloom filter (default ~0).
+      initial_capacity: Expected number of entries at creation time.
+      load_index: If False, skip loading the JSON index. Useful during bulk
+          writes where only duplicate-checking is needed, not coordinate lookup.
+  """
+
   def __init__(
     self,
     store,
@@ -296,17 +395,32 @@ class BloomIndex:
     self._added = 0
 
   def seen(self, v):
+    """Return True if v is in the Bloom filter (molecule was previously stored)."""
     return v in self.sbf
 
   def seen_many(self, vs):
+    """Check multiple values against the Bloom filter at once.
+
+    Returns:
+        Dict mapping each value to [bool_seen, bucket_name].
+    """
     sbf = self.sbf
     b = self.bucket
     return {v: [v in sbf, b] for v in vs}
 
   def rc(self, v):
+    """Return the (row, chunk) coordinates for v from the JSON index, or None if absent."""
     return self.index.get(v) if self.index is not None else None
 
   def register(self, v, rc=None):
+    """Add v to the Bloom filter and optionally record its (row, chunk) coordinates.
+
+    Triggers a checkpoint persist to MinIO every CHECKPOINT_EVERY additions.
+
+    Args:
+        v: Molecule SMILES string to register.
+        rc: Optional (row, chunk) tuple to store in the JSON index.
+    """
     self.sbf.add(v)
     if rc is not None and self.index is not None and (v not in self.index):
       self.index[v] = list(rc)
@@ -315,6 +429,18 @@ class BloomIndex:
       self.persist()
 
   def persist(self, retries=3):
+    """Save the Bloom filter and JSON index to MinIO with atomic local writes.
+
+    Each file is written to a `.tmp` sibling first, then renamed to avoid
+    leaving a corrupt file if the process is interrupted. Retries the upload
+    up to `retries` times before raising.
+
+    Args:
+        retries: Number of upload attempts before raising RuntimeError.
+
+    Raises:
+        RuntimeError: If the upload fails after all retries.
+    """
     tb = f"{self.local_bloom}.tmp"
     with open(tb, "wb") as f:
       pickle.dump(self.sbf, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -352,6 +478,26 @@ class BloomIndex:
 
 
 class ChunkState:
+  """Manages chunked Parquet writes to MinIO for a single model.
+
+  Rows are written into sequentially numbered chunk files
+  (chunk_1.parquet, chunk_2.parquet, ...) stored under a Hive-style prefix
+  on MinIO. The last chunk file stays "open" (accepting appends) until it
+  reaches max_rows, at which point a new chunk is started.
+
+  Each flush downloads the open chunk if it exists, appends the new rows,
+  and re-uploads it. Full chunks are uploaded once and never touched again.
+
+  Args:
+      store: MinioStore used for uploads and downloads.
+      bucket: Target bucket.
+      base_prefix: Key prefix for this model (e.g. "eos1234/v1").
+      tmpdir: Local directory for temporary files during writes.
+      max_rows: Maximum number of rows per chunk file.
+      output_dimension: Number of output columns. Used to tune Parquet
+          writer settings (compression, row group size) for wide tables.
+  """
+
   def __init__(self, store, bucket, base_prefix, tmpdir, max_rows, output_dimension=None):
     self.store = store
     self.bucket = bucket
@@ -363,6 +509,7 @@ class ChunkState:
     self.state = {}
 
   def _rows_to_frame(self, rows, schema_cols):
+    """Convert a list of row dicts to a DataFrame with exactly schema_cols columns."""
     df = pd.DataFrame.from_records(rows)
     for col in schema_cols:
       if col not in df.columns:
@@ -370,6 +517,7 @@ class ChunkState:
     return df[schema_cols]
 
   def _normalize_scalar(self, value):
+    """Return None for NaN/None values, otherwise return the value unchanged."""
     if value is None:
       return None
     try:
@@ -380,6 +528,7 @@ class ChunkState:
     return value
 
   def _stringify_scalar(self, value):
+    """Convert a value to a string, encoding bytes and serialising collections to JSON."""
     if value is None:
       return None
     if isinstance(value, bytes):
@@ -391,6 +540,11 @@ class ChunkState:
     return str(value)
 
   def _build_array(self, values):
+    """Build a PyArrow array from a list of Python values.
+
+    Tries native type inference first; falls back to string conversion for
+    heterogeneous or non-serialisable columns.
+    """
     normalized = [self._normalize_scalar(v) for v in values]
     try:
       return pa.array(normalized, from_pandas=True)
@@ -398,32 +552,38 @@ class ChunkState:
       return pa.array([self._stringify_scalar(v) for v in normalized], type=pa.string())
 
   def _frame_to_table(self, df, schema_cols):
+    """Convert a DataFrame slice to a PyArrow Table with schema_cols columns."""
     df = self._ensure_cols(df, schema_cols)
     arrays = [self._build_array(df[col].tolist()) for col in schema_cols]
     return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _rows_to_table(self, rows, schema_cols):
+    """Convert a list of row dicts to a PyArrow Table with schema_cols columns."""
     cols = {col: [row.get(col) if isinstance(row, dict) else None for row in rows] for col in schema_cols}
     arrays = [self._build_array(cols[col]) for col in schema_cols]
     return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _ensure_cols(self, df, schema_cols):
+    """Add any missing schema columns as None and return df restricted to schema_cols."""
     for col in schema_cols:
       if col not in df.columns:
         df[col] = None
     return df[schema_cols]
 
   def _iter_tables(self, rows, schema_cols):
+    """Yield PyArrow Tables from a row list in write_batch_rows-sized slices."""
     for start in range(0, len(rows), self.write_batch_rows):
       yield self._rows_to_table(rows[start : start + self.write_batch_rows], schema_cols)
 
   def _iter_tables_df(self, df, schema_cols):
+    """Yield PyArrow Tables from a DataFrame in write_batch_rows-sized slices."""
     df = self._ensure_cols(df, schema_cols)
     for start in range(0, len(df), self.write_batch_rows):
       frame = df.iloc[start : start + self.write_batch_rows]
       yield self._frame_to_table(frame, schema_cols)
 
   def _rows_in_remote(self, key):
+    """Download a remote Parquet file and return its row count. Returns 0 on failure."""
     local = os.path.join(self.tmpdir, f"inspect_{uuid.uuid4().hex}.parquet")
     try:
       self.store.download_file(self.bucket, key, local)
@@ -440,6 +600,12 @@ class ChunkState:
         pass
 
   def ensure(self):
+    """Initialise chunk state by inspecting existing chunks on MinIO.
+
+    Sets self.state["data"] with the next chunk index to write, whether
+    there is currently an open (not-yet-full) chunk, and its row count.
+    Must be called before any flush.
+    """
     keys, t = (self._list_chunks(), "data")
     if not keys:
       self.state[t] = {"next": 1, "open": None, "rows": 0}
@@ -451,6 +617,7 @@ class ChunkState:
     logger.info(f"chunk next: {idx + 1}")
 
   def _list_chunks(self):
+    """Return a sorted list of Parquet chunk keys for this model from MinIO."""
     pref = hive_prefix(self.base) + "/"
     keys = []
     for obj in self.store.list_keys(self.bucket, pref):
@@ -460,6 +627,7 @@ class ChunkState:
     return sorted(keys, key=self._chunk_idx)
 
   def _chunk_idx(self, key):
+    """Parse and return the integer index from a chunk filename (e.g. chunk_3.parquet → 3)."""
     base = os.path.basename(key)
     name, _ = os.path.splitext(base)
     try:
@@ -468,6 +636,18 @@ class ChunkState:
       return 1
 
   def _write_chunk(self, rows, schema_cols, idx, mode="new", existing_local=None):
+    """Write a list of row dicts to chunk_{idx}.parquet and upload to MinIO.
+
+    Args:
+        rows: Row dicts to write.
+        schema_cols: Column order for the Parquet schema.
+        idx: Chunk index (determines the filename).
+        mode: "new" to create a fresh file, "append" to merge into existing_local.
+        existing_local: Path to the already-downloaded open chunk (append mode only).
+
+    Returns:
+        The MinIO object key of the written chunk.
+    """
     os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     ctor_kw, wt_kw = self.pq_ctor_kw, self.pq_wt_kw
@@ -502,6 +682,20 @@ class ChunkState:
     return os_key
 
   def _write_chunk_df(self, df, schema_cols, idx, mode="new", existing_local=None):
+    """Write a DataFrame to chunk_{idx}.parquet and upload to MinIO.
+
+    Same as _write_chunk but accepts a DataFrame instead of a list of row dicts.
+
+    Args:
+        df: DataFrame to write.
+        schema_cols: Column order for the Parquet schema.
+        idx: Chunk index (determines the filename).
+        mode: "new" to create a fresh file, "append" to merge into existing_local.
+        existing_local: Path to the already-downloaded open chunk (append mode only).
+
+    Returns:
+        The MinIO object key of the written chunk.
+    """
     os_key = f"{hive_prefix(self.base)}/chunk_{idx}.parquet"
     local = existing_local or os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
     ctor_kw, wt_kw = self.pq_ctor_kw, self.pq_wt_kw
@@ -536,6 +730,16 @@ class ChunkState:
     return os_key
 
   def flush(self, rows, schema_cols):
+    """Write a list of row dicts to MinIO as one or more Parquet chunk files.
+
+    Appends to the currently open chunk if space remains, then opens new
+    chunks as needed until all rows are written. Each completed chunk is
+    uploaded to MinIO immediately.
+
+    Args:
+        rows: List of row dicts to write.
+        schema_cols: Ordered column names for the Parquet schema.
+    """
     if not rows:
       return self.ensure()
     self.ensure()
@@ -583,6 +787,14 @@ class ChunkState:
       start += take
 
   def flush_df(self, df, schema_cols):
+    """Write a DataFrame to MinIO as one or more Parquet chunk files.
+
+    Same as flush but accepts a DataFrame instead of a list of row dicts.
+
+    Args:
+        df: DataFrame to write.
+        schema_cols: Ordered column names for the Parquet schema.
+    """
     if df is None or df.empty:
       return self.ensure()
     self.ensure()
@@ -631,6 +843,23 @@ TrancheState = ChunkState
 
 
 class _SinkWriter:
+  """High-level writer that deduplicates and buffers rows before writing to MinIO.
+
+  Combines a BloomIndex (to skip already-stored molecules) with a ChunkState
+  (to manage chunked Parquet writes). Incoming DataFrames are checked against
+  the Bloom filter, new rows are buffered in memory, and the buffer is flushed
+  to MinIO once it reaches max_rows.
+
+  Args:
+      store: MinioStore used for uploads and downloads.
+      bucket: Target bucket.
+      model_id: Ersilia model identifier (e.g. "eos1234").
+      model_version: Model version string.
+      tmpdir: Local directory for temporary files.
+      max_rows: Buffer size before an automatic flush. Defaults to MAX_ROWS.
+      output_dimension: Number of output columns, used to tune Parquet settings.
+  """
+
   def __init__(self, store, bucket, model_id, model_version, tmpdir, max_rows=None, output_dimension=None):
     self.store = store
     self.bucket = bucket
@@ -650,6 +879,14 @@ class _SinkWriter:
     self.last_added_inputs = []
 
   def add_rows(self, df):
+    """Filter out duplicates and blank inputs, buffer new rows, and auto-flush if full.
+
+    Args:
+        df: DataFrame with an "input" or "smiles" column identifying each molecule.
+
+    Returns:
+        Number of new rows added (after deduplication).
+    """
     try:
       if df is None or df.empty:
         logger.debug("[sink] empty batch")
@@ -691,6 +928,7 @@ class _SinkWriter:
       return 0
 
   def _flush(self):
+    """Concatenate buffered DataFrames and write them to MinIO via ChunkState."""
     parts = self.buffers
     if not parts:
       return
@@ -703,6 +941,14 @@ class _SinkWriter:
     gc.collect()
 
   def finalize(self, metadata_local=None, schema_cols=None):
+    """Flush any remaining buffered rows, persist the Bloom filter and index, and upload catalog.json.
+
+    Should be called once after all add_rows() calls are complete.
+
+    Args:
+        metadata_local: Optional local path to an access metadata file to upload alongside the data.
+        schema_cols: Column schema to use if none was inferred during add_rows().
+    """
     schema_cols = schema_cols or self.schema_cols
     if self.buffers:
       merged = pd.concat(self.buffers, ignore_index=True)
@@ -723,6 +969,19 @@ class _SinkWriter:
 
 
 def upload_catalog_json(store, bucket, base_prefix, entries, chunks, tmpdir):
+  """Write a catalog.json with entry and chunk counts to MinIO.
+
+  catalog.json is a small summary file used by the catalog and stats commands
+  to report model sizes without scanning all Parquet files.
+
+  Args:
+      store: MinioStore used for the upload.
+      bucket: Target bucket.
+      base_prefix: Key prefix for this model.
+      entries: Total number of stored molecule entries.
+      chunks: Total number of Parquet chunk files.
+      tmpdir: Local directory to write the temporary JSON file.
+  """
   cat = {"entries": int(entries), "chunks": int(chunks)}
   local = os.path.join(tmpdir, f"catalog_{uuid.uuid4().hex}.json")
   try:
@@ -741,6 +1000,23 @@ def upload_catalog_json(store, bucket, base_prefix, entries, chunks, tmpdir):
 
 
 class _BaseTransfer:
+  """Base class for all isaura manager operations (read, write, copy, move, push, pull).
+
+  Sets up the shared infrastructure each operation needs: a MinioStore, a
+  DuckDB connection, a BloomIndex for the target model, and two temporary
+  directories (one for general use, one for the SinkWriter). Implements
+  context-manager protocol so resources are cleaned up with `with` blocks.
+
+  Subclasses in manage.py implement specific operations by calling the
+  helper methods here (select_rows, _pull, _copy, _dump, etc.).
+
+  Args:
+      model_id: Ersilia model identifier (e.g. "eos1234").
+      model_version: Model version string.
+      bucket: MinIO bucket to operate on.
+      output_dir: Local directory for dump operations (copy to local filesystem).
+  """
+
   def __init__(self, model_id, model_version, bucket, output_dir=None):
     self.model_id = model_id
     self.model_version = model_version
@@ -765,6 +1041,7 @@ class _BaseTransfer:
     self._output_dimension = None
 
   def close(self):
+    """Release temporary directories created during construction."""
     release_temp_dirs(self)
 
   def __enter__(self):
@@ -774,6 +1051,7 @@ class _BaseTransfer:
     self.close()
 
   def _get_model_meta(self):
+    """Fetch and cache model schema metadata from GitHub. Returns {} on failure."""
     if self._model_meta is None:
       try:
         self._model_meta = fetch_schema_from_github(self.model_id)
@@ -783,14 +1061,17 @@ class _BaseTransfer:
     return self._model_meta
 
   def _get_output_dimension(self):
+    """Return the number of output columns for this model, cached after first call."""
     if self._output_dimension is None:
       self._output_dimension = output_dimension_from_metadata(self._get_model_meta())
     return self._output_dimension
 
   def _chunk_row_limit(self):
+    """Return the max rows per chunk file, adjusted for output width."""
     return chunk_row_limit(self._get_output_dimension())
 
   def _download_if_exists(self, key, local):
+    """Download key to local path. Exits the process if the download fails."""
     try:
       self.store.download_file(self.bucket, key, local)
       return True
@@ -800,6 +1081,11 @@ class _BaseTransfer:
       return False
 
   def _load_metadata(self):
+    """Download and parse the access metadata file for this model.
+
+    Returns:
+        Tuple of (local_path, metadata_dict), or None on failure.
+    """
     local = os.path.join(self.tmpdir, ACCESS_FILE)
     acc = get_acc_key(self.tranches)
     try:
@@ -810,6 +1096,14 @@ class _BaseTransfer:
       logger.error(f"{e}. Possible causes -> 1. No project 2. Incorrect model id or version")
 
   def _load_index(self):
+    """Download and parse index.json for this model.
+
+    Returns:
+        Tuple of (index_dict, local_path).
+
+    Raises:
+        RuntimeError: If index.json is not found on MinIO.
+    """
     key = get_idx_key(self.tranches)
     local = os.path.join(self.tmpdir, "index_src.json")
     if not self._download_if_exists(key, local):
@@ -818,10 +1112,35 @@ class _BaseTransfer:
       return (json.load(f), local)
 
   def select_rows(self, wanted, input_col="input"):
+    """Return a DataFrame of all rows matching the wanted input values.
+
+    Queries all Parquet chunk files via DuckDB, preserving input order.
+
+    Args:
+        wanted: List of molecule SMILES (or other input values) to look up.
+        input_col: Column name to filter on (default "input").
+
+    Returns:
+        DataFrame of matching rows, ordered by wanted.
+    """
     files = list_parquet_keys(self.store, self.bucket, self.tranches)
     return query(self.duck.con, input_col, wanted, files, preserve_order=True)
 
   def select_rows_batched(self, wanted, input_col="input", batch_size=10000):
+    """Yield DataFrames of matching rows in batches, switching strategy based on query size.
+
+    For large queries (>= STREAM_PARQUET_THRESHOLD inputs) uses incremental
+    Parquet streaming to avoid loading all chunk files into DuckDB at once.
+    For smaller queries uses DuckDB directly.
+
+    Args:
+        wanted: List of molecule SMILES to look up.
+        input_col: Column name to filter on (default "input").
+        batch_size: Number of rows per yielded DataFrame.
+
+    Yields:
+        DataFrames of matching rows.
+    """
     n = len(wanted) if hasattr(wanted, "__len__") else None
     logger.info(
       f"[select_rows_batched] starting n={n} input_col={input_col} batch_size={batch_size} bucket={self.bucket}"
@@ -850,9 +1169,19 @@ class _BaseTransfer:
         close()
 
   def _delete(self):
+    """Delete all objects for this model from the bucket. Returns the count deleted."""
     return self.store.delete_prefix(self.bucket, self.tranches)
 
   def _pull(self, df, index):
+    """Write a single DataFrame to the local bucket and register inputs with the NNS service.
+
+    Args:
+        df: DataFrame of model outputs with an "input" column.
+        index: Unused legacy parameter (kept for API compatibility).
+
+    Returns:
+        Tuple of (rows_added, 0).
+    """
     t0 = time.time()
     wt = _SinkWriter(
       self.store,
@@ -879,6 +1208,14 @@ class _BaseTransfer:
     return (tp, tu)
 
   def _pull_batched(self, chunks):
+    """Write an iterable of DataFrames to the local bucket and register with the NNS service.
+
+    Args:
+        chunks: Iterable of DataFrames, each with an "input" column.
+
+    Returns:
+        Tuple of (total_rows_added, 0).
+    """
     t0 = time.time()
     wt = _SinkWriter(
       self.store,
@@ -913,6 +1250,7 @@ class _BaseTransfer:
     return (tp, 0)
 
   def _dump(self):
+    """Download every object in the bucket to self.output_dir, preserving key paths."""
     os.makedirs(self.output_dir, exist_ok=True)
     paginator = self.store.client.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=self.bucket)
@@ -929,6 +1267,21 @@ class _BaseTransfer:
       logger.info(f"bucket empty: {self.bucket}")
 
   def _copy(self, meta_local, meta_list):
+    """Route rows from the source bucket to the public and/or private buckets based on access metadata.
+
+    Reads all rows for the wanted inputs, splits them by access level ("private" →
+    isaura-private, everything else → isaura-public), and writes each subset via
+    a _SinkWriter. Also registers all copied inputs with the NNS service.
+
+    If self.output_dir is set, falls back to _dump() instead (local filesystem copy).
+
+    Args:
+        meta_local: Local path to the access metadata file to upload alongside the data.
+        meta_list: List of dicts with "input" and "access" keys defining routing.
+
+    Returns:
+        Tuple of (rows_written_to_private, rows_written_to_public).
+    """
     t0 = time.time()
     if self.output_dir is not None:
       self._dump()
