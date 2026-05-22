@@ -10,7 +10,9 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen
 
 from isaura.const import (
+  DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME,
   GITHUB_CONTENT_URL, LOGP_BINS, METADATA_JSON, METADATA_YML,
+  MINIO_ENDPOINT, MINIO_LOCAL_AK, MINIO_LOCAL_SK,
   MKEYS, MW_BINS, _INT_KEYS, _KEYMAP,
 )
 from isaura.logging import logger
@@ -133,8 +135,82 @@ def tranche_coordinates(smiles):
   return (row, col, mw, logp)
 
 
-def run_docker_compose(up=True):
-  """Start or stop the MinIO/Milvus/NNS services via Docker Compose.
+def docker_is_installed() -> bool:
+  """Return True if the docker CLI is available on PATH."""
+  try:
+    subprocess.run(["docker", "--version"], capture_output=True, check=True, timeout=5)
+    return True
+  except (FileNotFoundError, subprocess.CalledProcessError):
+    return False
+
+
+def docker_is_running() -> bool:
+  """Return True if the Docker daemon is active and reachable."""
+  try:
+    result = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+    return result.returncode == 0
+  except Exception:
+    return False
+
+
+def get_engine_status() -> dict:
+  """Return the status of Docker and the isaura containers.
+
+  Returns:
+      Dict with keys "docker" (bool) and "containers" (list of {name, status}).
+  """
+  running = docker_is_installed() and docker_is_running()
+  containers = []
+  if running:
+    for name in ["minio"]:
+      try:
+        result = subprocess.run(
+          ["docker", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Status}}"],
+          capture_output=True, text=True, timeout=5,
+        )
+        status = result.stdout.strip() or "not created"
+      except Exception:
+        status = "unknown"
+      containers.append({"name": name, "status": status})
+  return {"docker": running, "containers": containers}
+
+
+def ensure_default_buckets(timeout: int = 30) -> None:
+  """Wait for local MinIO to be ready, then create the default buckets if they don't exist."""
+  import time
+  import boto3
+  from botocore.config import Config
+
+  url = f"{MINIO_ENDPOINT.rstrip('/')}/minio/health/ready"
+  for _ in range(timeout):
+    try:
+      if requests.get(url, timeout=2).status_code == 200:
+        break
+    except Exception:
+      pass
+    time.sleep(1)
+  else:
+    logger.warning("MinIO did not become ready in time — skipping default bucket creation.")
+    return
+
+  client = boto3.client(
+    "s3",
+    endpoint_url=MINIO_ENDPOINT,
+    aws_access_key_id=MINIO_LOCAL_AK,
+    aws_secret_access_key=MINIO_LOCAL_SK,
+    region_name="us-east-1",
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+  )
+  for bucket in [DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME]:
+    try:
+      client.head_bucket(Bucket=bucket)
+    except Exception:
+      client.create_bucket(Bucket=bucket)
+      logger.info(f"Created default bucket: {bucket}")
+
+
+def run_docker_compose(up=True) -> bool:
+  """Start or stop the MinIO service via Docker Compose.
 
   Args:
       up: If True, runs `docker compose up -d`. If False, runs `docker compose down`.
@@ -142,18 +218,38 @@ def run_docker_compose(up=True):
   Returns:
       True on success, False on failure.
   """
-  try:
-    path = Path(__file__).parent / "configs" / "docker-compose.yml"
-    cmd = ["docker", "compose", "-f", path, "up", "-d"] if up else ["docker", "compose", "-f", path, "down"]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    logger.info(f"Docker Compose {'started' if up else 'stopped'} successfully.")
+  if not docker_is_installed():
+    logger.error("Docker is not installed. Please install Docker Desktop: https://docs.docker.com/get-docker/")
+    return False
+  if not docker_is_running():
+    logger.error("Docker is not running. Please open Docker Desktop and try again.")
+    return False
+
+  path = Path(__file__).parent / "configs" / "docker-compose.yml"
+
+  if up:
+    try:
+      check = subprocess.run(
+        ["docker", "image", "inspect", "minio/minio:latest"],
+        capture_output=True, timeout=5,
+      )
+      if check.returncode != 0:
+        logger.info("MinIO image not found locally — it will be downloaded now. This may take a few minutes on first run.")
+    except Exception:
+      pass
+    logger.info("Spinning up Docker containers...")
+    cmd = ["docker", "compose", "-f", str(path), "up", "-d"]
+  else:
+    logger.info("Stopping Docker containers...")
+    cmd = ["docker", "compose", "-f", str(path), "down"]
+
+  result = subprocess.run(cmd)
+  if result.returncode == 0:
+    logger.info(f"Containers {'started' if up else 'stopped'} successfully.")
+    if up:
+      ensure_default_buckets()
     return True
-  except subprocess.CalledProcessError as e:
-    logger.error(f"Docker Compose failed: {e.stderr.strip()}")
-  except FileNotFoundError:
-    logger.error("Docker is not installed or not in PATH.")
-  except Exception as e:
-    logger.error(f"Unexpected error: {e}")
+  logger.error(f"Docker Compose {'up' if up else 'down'} failed (exit code {result.returncode}).")
   return False
 
 
@@ -176,5 +272,10 @@ def show_figlet():
     gradient.append(ch, style=f"rgb({r},{g},{b})")
   print()
   console.print(gradient, justify="center")
-  console.print(Text("[New] Version 2.1.16", style="bold bright_black"), justify="center")
+  try:
+    from importlib.metadata import version
+    _version = version("isaura")
+  except Exception:
+    _version = "unknown"
+  console.print(Text(f"Version {_version}", style="bold bright_black"), justify="center")
   print()

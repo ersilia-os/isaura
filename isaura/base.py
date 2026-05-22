@@ -225,6 +225,14 @@ class MinioStore:
       logger.error(f"Unexpected error during MinIO health check: {e}")
     return False
 
+  def credential_check(self) -> bool:
+    """Return True if the current credentials are accepted by the server."""
+    try:
+      self.client.list_buckets()
+      return True
+    except Exception:
+      return False
+
   def ensure_bucket(self, bucket):
     """Create the bucket if it does not already exist. Exits on failure."""
     try:

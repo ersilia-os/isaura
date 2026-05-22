@@ -21,6 +21,7 @@ dependencies = [
     "rdkit==2024.3.6",
     "requests>=2.32.5",
     "rich>=14.1.0",
+    "questionary>=2.0.1",
     "rich-click>=1.8.9",
     "tqdm>=4.67.1",
 ]

@@ -3,7 +3,18 @@ from pathlib import Path
 
 try:
   from dotenv import load_dotenv
-  load_dotenv(override=False)
+  _user_env = Path.home() / ".isaura" / ".env"
+  if not _user_env.exists():
+    _user_env.parent.mkdir(parents=True, exist_ok=True)
+    _user_env.write_text(
+      "MINIO_ENDPOINT=http://127.0.0.1:9000\n"
+      "NNS_ENDPOINT=http://127.0.0.1:8080\n"
+      "DEFAULT_BUCKET_NAME=isaura-public\n"
+      "DEFAULT_PRIVATE_BUCKET_NAME=isaura-private\n"
+      "MINIO_LOCAL_AK=minioadmin123\n"
+      "MINIO_LOCAL_SK=minioadmin1234\n"
+    )
+  load_dotenv(dotenv_path=_user_env, override=True)
 except Exception:
   pass
 
