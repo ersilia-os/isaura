@@ -150,14 +150,18 @@ def read(input_file, project_name, model, version, output_file, approximate):
   with IsauraReader(
     model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
   ) as r:
-    for _ in r.read_batched(output_csv=output_file):
-      pass
+    total = sum(len(chunk) for chunk in r.read_batched(output_csv=output_file))
+  dest = f" → {output_file}" if output_file else ""
+  logger.info(f"Done — {total} rows{dest}")
 
 
 @cli.command("pull")
 @apply_opts(opt_input_file, opt_project, opt_model, opt_version)
-def pull(input_file, project_name, model, version):
+@click.option("--verbose", "-V", is_flag=True, default=False, help="Show detailed internal logs")
+def pull(input_file, project_name, model, version, verbose):
   """Pull model outputs from the cloud store to local."""
+  if verbose:
+    logger.set_verbosity(True)
   pn = project_name or DEFAULT_BUCKET_NAME
   with IsauraPull(model_id=model, model_version=version, bucket=pn, input_csv=input_file) as pl:
     pl.pull()

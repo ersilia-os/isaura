@@ -44,7 +44,7 @@ class StreamingCsvSink:
     """Append a PyArrow Table to the CSV, writing the header only on the first call."""
     if table is None or table.num_rows == 0:
       return
-    opts = pa_csv.WriteOptions(include_header=not self._header_written)
+    opts = pa_csv.WriteOptions(include_header=not self._header_written, quoting_style="none", quoting_header="none")
     pa_csv.write_csv(table, self._fp, write_options=opts)
     self.rows_written += table.num_rows
     self._header_written = True

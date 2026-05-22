@@ -406,7 +406,7 @@ class IsauraReader:
       self.model_meta = {}
     self.output_dimension = output_dimension_from_metadata(self.model_meta)
     self.wide_model = self.output_dimension is not None and self.output_dimension >= 100
-    logger.info(
+    logger.debug(
       f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv} output_dim={self.output_dimension} wide={self.wide_model}"
     )
 
@@ -425,6 +425,8 @@ class IsauraReader:
     Returns:
         Tuple of (list_of_input_strings, column_header_name).
     """
+    if df is None and hasattr(self, "_cached_wanted"):
+      return self._cached_wanted
     wanted, header_set = ([], set())
     rows = df.to_dict("records") if df is not None else None
     if rows is None:
@@ -448,7 +450,9 @@ class IsauraReader:
         if h:
           header_set.add(h)
     header = list(header_set)[0] if header_set else "smiles"
-    logger.info(f"[read:wanted] collected inputs={len(wanted)} header={header}")
+    logger.debug(f"[read:wanted] collected inputs={len(wanted)} header={header}")
+    if df is None:
+      self._cached_wanted = (wanted, header)
     return (wanted, header)
 
   def _prepare_read(self, df=None):
@@ -461,6 +465,8 @@ class IsauraReader:
     Returns:
         Tuple of (start_time, resolved_wanted_list, header_column_name).
     """
+    if hasattr(self, "_cached_prepare"):
+      return self._cached_prepare
     index = None
     t0 = time.time()
     wanted, header = self._wanted(df=df)
@@ -478,19 +484,48 @@ class IsauraReader:
       logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
       group_inputs(wanted, index, bloom=self.bi)
     else:
-      logger.info(f"[read:prepare] exact mode — checking bloom filter for {len(wanted)} inputs")
+      logger.debug(f"[read:prepare] exact mode — checking bloom filter for {len(wanted)} inputs")
       bloom_t0 = time.perf_counter()
       missing = [v for v in wanted if not self.bi.seen(v)]
       bloom_dt = time.perf_counter() - bloom_t0
-      logger.info(f"[read:prepare] bloom check done in {bloom_dt:.3f}s missing={len(missing)}")
+      logger.debug(f"[read:prepare] bloom check done in {bloom_dt:.3f}s missing={len(missing)}")
       if missing:
         logger.error(
           f"inputs not indexed: {missing[:5]}{('...' if len(missing) > 5 else '')} total_missing={len(missing)}"
         )
         sys.exit(1)
     prep_dt = time.time() - t0
-    logger.info(f"[read:prepare] ready inputs={len(wanted)} header={header} prep_time={prep_dt:.2f}s")
-    return (t0, wanted, header)
+    logger.debug(f"[read:prepare] ready inputs={len(wanted)} header={header} prep_time={prep_dt:.2f}s")
+    self._cached_prepare = (t0, wanted, header)
+    return self._cached_prepare
+
+  def _detect_parquet_col(self, header):
+    """Return the molecule column name actually used in stored Parquet files.
+
+    Downloads the first chunk file and inspects its schema. Falls back to
+    header if no known INPUT_C column is found.
+    """
+    prefix = hive_prefix(self.base) + "/"
+    try:
+      keys = [
+        obj["Key"]
+        for obj in self.store.list_keys(self.bucket, prefix)
+        if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
+      ]
+      if not keys:
+        return header
+      local = os.path.join(self.tmpdir, f"schema_probe_{uuid.uuid4().hex}.parquet")
+      try:
+        self.store.download_file(self.bucket, keys[0], local)
+        schema_names = set(pq.ParquetFile(local).schema_arrow.names)
+        return next((c for c in [header] + INPUT_C if c in schema_names), header)
+      finally:
+        try:
+          os.remove(local)
+        except Exception:
+          pass
+    except Exception:
+      return header
 
   def _make_read_source(self, wanted, header, batch_size=10000, ordered=True):
     """Choose a read strategy and return (mode, payload).
@@ -506,17 +541,28 @@ class IsauraReader:
     n = len(wanted)
     if self.wide_model:
       prefix = hive_prefix(self.base) + "/"
-      logger.info(f"[read] wide streaming n={n} bucket={self.bucket}")
+      logger.debug(f"[read] wide streaming n={n} bucket={self.bucket}")
       return "wide", prefix
     if n >= STREAM_PARQUET_THRESHOLD:
       prefix = hive_prefix(self.base) + "/"
-      logger.info(f"[read] streaming n={n} bucket={self.bucket}")
+      logger.debug(f"[read] streaming n={n} bucket={self.bucket}")
       return "stream", prefix
     files = list_parquet_keys(self.store, self.bucket, self.base)
-    logger.info(f"[read] duckdb n={n} bucket={self.bucket}")
-    return "duckdb", query_batched(
-      self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=ordered
+    parquet_col = self._detect_parquet_col(header)
+    logger.debug(f"[read] duckdb n={n} bucket={self.bucket}")
+    raw = query_batched(
+      self.duck.con, parquet_col, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=ordered
     )
+    if parquet_col == header:
+      return "duckdb", raw
+
+    def _rename(batches, src, dst):
+      for chunk in batches:
+        if src in chunk.columns:
+          chunk = chunk.rename(columns={src: dst})
+        yield chunk
+
+    return "duckdb", _rename(raw, parquet_col, header)
 
   def _load_index(self):
     """Download and parse the JSON index for this model. Returns [] on failure."""
@@ -664,7 +710,7 @@ class IsauraReader:
       logger.error(f"[read] query failed: {e}")
       sys.exit(1)
     rate = total_rows / elapsed if elapsed > 0 and total_rows else 0.0
-    logger.info(
+    logger.debug(
       f"[read] done model={self.pref} inputs={len(wanted)} matched={total_rows} "
       f"chunks={n_chunks} elapsed={time.time() - t0:.2f}s rate={rate:.1f}/s rss={rss_mb():.0f}MB"
     )
@@ -727,7 +773,7 @@ class IsauraReader:
         else:
           source = payload
         if output_csv:
-          logger.info(f"[read_batched] streaming csv to {output_csv}")
+          logger.debug(f"[read_batched] streaming csv to {output_csv}")
           sink = StreamingCsvSink(output_csv)
           sink.__enter__()
         for chunk in source:
@@ -745,13 +791,13 @@ class IsauraReader:
     finally:
       if sink is not None:
         sink.__exit__(None, None, None)
-        logger.info(f"[read_batched] csv closed rows={total_rows} path={output_csv}")
+        logger.debug(f"[read_batched] csv closed rows={total_rows} path={output_csv}")
       close = getattr(source, "close", None)
       if close is not None:
         close()
     elapsed = time.time() - t0
     rate = total_rows / elapsed if elapsed > 0 and total_rows else 0.0
-    logger.success(
+    logger.debug(
       f"[read_batched] done model={self.pref} inputs={len(wanted)} matched={total_rows} "
       f"chunks={n_chunks} elapsed={elapsed:.2f}s rate={rate:.1f}/s rss={rss_mb():.0f}MB"
     )
@@ -826,9 +872,9 @@ class IsauraPull(_BaseTransfer):
 
   def pull(self):
     """Read outputs from cloud MinIO for the given inputs and store them locally."""
-    logger.info(
-      f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}"
-    )
+    t0 = time.time()
+    input_name = os.path.basename(self.input_csv) if self.input_csv else ""
+    logger.info(f"Pulling {self.model_id} ({self.model_version}) from {self.bucket}")
     with IsauraReader(
       model_id=self.model_id,
       model_version=self.model_version,
@@ -839,8 +885,16 @@ class IsauraPull(_BaseTransfer):
       access_key=mcak,
       secrete=mcsk,
     ) as r:
+      wanted, _ = r._wanted()
+      logger.info(f"✓ {len(wanted)} inputs loaded from {input_name}")
+      r._prepare_read()
+      logger.info(f"✓ All {len(wanted)} found in cloud index")
+      fetch_t0 = time.time()
       out = self._pull_batched(r.read_batched())
-    logger.info(f"pulled objects={out}")
+      logger.info(f"✓ {out[0]} rows fetched from cloud ({time.time() - fetch_t0:.1f}s)")
+      logger.info(f"✓ {out[0]} rows stored locally")
+    logger.info(f"Done — pulled {out[0]} rows in {time.time() - t0:.1f}s")
+    logger.debug(f"pulled objects={out}")
 
 
 class IsauraPush:

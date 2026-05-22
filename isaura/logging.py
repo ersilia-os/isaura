@@ -27,13 +27,18 @@ class Logger:
     self._file = None
     self._log_to_console()
 
-  def _log_to_console(self):
-    if self._console is None:
-      rich_handler = RichHandler(
-        rich_tracebacks=True, markup=True, log_time_format="%H:%M:%S", show_path=False
-      )
-      self._rich_console = rich_handler.console
-      self._console = self.logger.add(rich_handler, format="{message}", colorize=True)
+  def _log_to_console(self, level="INFO"):
+    if self._console is not None:
+      try:
+        self.logger.remove(self._console)
+      except Exception:
+        pass
+      self._console = None
+    rich_handler = RichHandler(
+      rich_tracebacks=True, markup=True, log_time_format="%H:%M:%S", show_path=False
+    )
+    self._rich_console = rich_handler.console
+    self._console = self.logger.add(rich_handler, format="{message}", colorize=True, level=level)
 
   @property
   def console(self):
@@ -48,11 +53,8 @@ class Logger:
       self._console = None
 
   def set_verbosity(self, verbose):
-    """Enable or disable console log output."""
-    if verbose:
-      self._log_to_console()
-    else:
-      self._unlog_from_console()
+    """Set console log level: DEBUG when verbose=True, INFO otherwise."""
+    self._log_to_console(level="DEBUG" if verbose else "INFO")
 
   def debug(self, text):
     self.logger.debug(text)

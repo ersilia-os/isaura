@@ -83,7 +83,7 @@ def list_parquet_keys(store, bucket, base):
     keys.sort()
     uris = [f"s3://{bucket}/{k}" for k in keys]
     dt = time.perf_counter() - t0
-    logger.info(f"[list_parquet_keys] listed {len(uris)} files in {dt:.3f}s bucket={bucket} prefix={prefix}")
+    logger.debug(f"[list_parquet_keys] listed {len(uris)} files in {dt:.3f}s bucket={bucket} prefix={prefix}")
     return uris if uris else get_files_glob(bucket, base)
   except Exception as e:
     logger.warning(f"[list_parquet_keys] boto3 listing failed ({e}), falling back to glob")

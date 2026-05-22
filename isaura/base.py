@@ -1,4 +1,5 @@
 import boto3, duckdb, gc, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys, time, uuid
+from isaura.const import INPUT_C as _INPUT_C
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from pybloom_live import ScalableBloomFilter
@@ -214,7 +215,7 @@ class MinioStore:
       url = f"{self.endpoint.rstrip('/')}/minio/health/ready"
       resp = requests.get(url, timeout=3)
       if resp.status_code == 200:
-        logger.info(f"MinIO server healthy at {url}")
+        logger.debug(f"MinIO server healthy at {url}")
         return True
       logger.error(
         f"MinIO health check failed. Maybe the minio containers not running[{resp.status_code}]: {resp.text.strip()}"
@@ -382,7 +383,7 @@ class BloomIndex:
       self.store.download_file(self.bucket, self.bloom_key, self.local_bloom)
       with open(self.local_bloom, "rb") as f:
         self.sbf = pickle.load(f)
-      logger.info(f"loaded bloom {self.bucket}/{self.bloom_key}")
+      logger.debug(f"loaded bloom {self.bucket}/{self.bloom_key}")
     except Exception:
       self.sbf = ScalableBloomFilter(
         mode=ScalableBloomFilter.SMALL_SET_GROWTH, initial_capacity=initial_capacity, error_rate=error_rate
@@ -393,13 +394,13 @@ class BloomIndex:
         self.store.download_file(self.bucket, self.index_key, self.local_index)
         with open(self.local_index, "r", encoding="utf-8") as f:
           self.index = json.load(f)
-        logger.info(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
+        logger.debug(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
       except Exception:
         self.index = {}
-        logger.info("created new index")
+        logger.debug("created new index")
     else:
       self.index = None
-      logger.info("skipped index load")
+      logger.debug("skipped index load")
     self._added = 0
 
   def seen(self, v):
@@ -617,12 +618,12 @@ class ChunkState:
     keys, t = (self._list_chunks(), "data")
     if not keys:
       self.state[t] = {"next": 1, "open": None, "rows": 0}
-      logger.info("chunk new: next=1")
+      logger.debug("chunk new: next=1")
       return
     last = keys[-1]
     idx = self._chunk_idx(last)
     self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
-    logger.info(f"chunk next: {idx + 1}")
+    logger.debug(f"chunk next: {idx + 1}")
 
   def _list_chunks(self):
     """Return a sorted list of Parquet chunk keys for this model from MinIO."""
@@ -772,7 +773,7 @@ class ChunkState:
           st["next"] += 1
           st["open"] = None
           st["rows"] = 0
-          logger.info(f"flush: closed chunk next={st['next']}")
+          logger.debug(f"flush: closed chunk next={st['next']}")
       finally:
         try:
           os.remove(tmp)
@@ -809,7 +810,7 @@ class ChunkState:
     st = self.state["data"]
     remaining = len(df)
     start = 0
-    logger.info(f"flush_df: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
+    logger.debug(f"flush_df: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
     if st["open"]:
       tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
       try:
@@ -822,7 +823,7 @@ class ChunkState:
           st["rows"] += take
           remaining -= take
           start += take
-          logger.info(f"flush_df: appended chunk idx={st['next']} +{take} -> {st['rows']}")
+          logger.debug(f"flush_df: appended chunk idx={st['next']} +{take} -> {st['rows']}")
         if st["rows"] >= self.max_rows:
           st["next"] += 1
           st["open"] = None
@@ -918,14 +919,14 @@ class _SinkWriter:
       added = len(new_df)
       self.last_added_inputs = []
       if added == 0:
-        logger.info(f"[sink] in={n_in} added=0 seen={skipped_seen} blank={skipped_blank}")
+        logger.debug(f"[sink] in={n_in} added=0 seen={skipped_seen} blank={skipped_blank}")
         return 0
       self.last_added_inputs = inputs.loc[not_seen].tolist()
       for smi in inputs.loc[not_seen]:
         self.bi.register(smi, rc=(1, 1))
       self.buffers.append(new_df)
       self.buf_rows += added
-      logger.info(
+      logger.debug(
         f"[sink] in={n_in} added={added} seen={skipped_seen} blank={skipped_blank} buf={self.buf_rows}/{self.max_rows}"
       )
       if self.buf_rows >= self.max_rows:
@@ -941,7 +942,7 @@ class _SinkWriter:
     if not parts:
       return
     merged = pd.concat(parts, ignore_index=True)
-    logger.info(f"[sink] flushing {len(merged)} rows")
+    logger.debug(f"[sink] flushing {len(merged)} rows")
     self.chunk_state.flush_df(merged, self.schema_cols)
     self.buffers = []
     self.buf_rows = 0
@@ -997,7 +998,7 @@ def upload_catalog_json(store, bucket, base_prefix, entries, chunks, tmpdir):
       json.dump(cat, f, separators=(",", ":"))
     key = f"{base_prefix.strip('/')}/{CATALOG_FILE}"
     store.upload_file(local, bucket, key)
-    logger.info(f"[catalog] {CATALOG_FILE} -> {bucket}/{key} entries={entries} chunks={chunks}")
+    logger.debug(f"[catalog] {CATALOG_FILE} -> {bucket}/{key} entries={entries} chunks={chunks}")
   except Exception as e:
     logger.warning(f"catalog.json upload failed: {e}")
   finally:
@@ -1204,7 +1205,8 @@ class _BaseTransfer:
     apprx_inputs = []
     _tp = wt.add_rows(df)
     if _tp != 0:
-      apprx_inputs.extend(df["input"].astype(str).tolist())
+      mol_col = next((c for c in _INPUT_C if c in df.columns), df.columns[0])
+      apprx_inputs.extend(df[mol_col].astype(str).tolist())
     tp += _tp
     if wt:
       wt.finalize(schema_cols=list(df.keys()))
@@ -1212,7 +1214,7 @@ class _BaseTransfer:
       apprx_df = pd.DataFrame({"input": apprx_inputs})
       post_apprx(apprx_df, self.collection)
       del apprx_df
-    logger.info(f"[pull] done rows={tp} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB")
+    logger.debug(f"[pull] done rows={tp} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB")
     return (tp, tu)
 
   def _pull_batched(self, chunks):
@@ -1237,22 +1239,24 @@ class _BaseTransfer:
     tp = 0
     apprx_inputs = []
     schema_cols = None
+    mol_col = None
     for chunk in chunks:
       if chunk is None or chunk.empty:
         continue
       if schema_cols is None:
         schema_cols = list(chunk.columns)
+        mol_col = next((c for c in _INPUT_C if c in chunk.columns), schema_cols[0])
       added = wt.add_rows(chunk)
       tp += added
       if added:
-        apprx_inputs.extend(chunk["input"].astype(str).tolist())
+        apprx_inputs.extend(chunk[mol_col].astype(str).tolist())
     wt.finalize(schema_cols=schema_cols)
     if apprx_inputs:
       try:
         post_apprx(pd.DataFrame({"input": apprx_inputs}), self.collection)
       except Exception as e:
         logger.warning(f"[pull] post_apprx failed: {e}")
-    logger.info(
+    logger.debug(
       f"[pull] done rows={tp} chunk_limit={self._chunk_row_limit()} output_dim={self._get_output_dimension()} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
     )
     return (tp, 0)
