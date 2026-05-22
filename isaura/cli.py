@@ -257,14 +257,50 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
 
 
 @cli.command("catalog")
-@apply_opts(opt_project, opt_cloud)
+@click.option("--remote", "-r", "cloud", is_flag=True, default=False,
+              help="List models in the remote store instead of local")
+@click.option("--project-name", "-pn", required=False, default=None,
+              help="Project (bucket) name — e.g. isaura-public or isaura-private")
 def cmd_inspect_models(project_name, cloud):
   """List all models stored in a project bucket."""
+  if not project_name:
+    if cloud:
+      console.print(
+        "[yellow]Please specify a project name.[/] "
+        "Use [bold]-pn isaura-public[/bold] or [bold]-pn isaura-private[/bold]."
+      )
+    else:
+      console.print(
+        "[yellow]Please specify a project name.[/] "
+        "Run [bold]isaura info[/bold] to see available local projects, "
+        "then re-run with [bold]-pn <project>[/bold]."
+      )
+    return
+  if cloud:
+    from isaura.const import MINIO_CLOUD_AK
+    if not MINIO_CLOUD_AK:
+      console.print(
+        "[yellow]No remote credentials configured.[/] "
+        "Run [bold]isaura configure --remote[/bold] first."
+      )
+      return
   insp = IsauraInspect(cloud=cloud)
-  # warm up the client so the health-check log fires before the spinner
   insp._clients(project_name)
-  with console.status("Fetching catalog...", spinner="dots"):
-    rows = insp.inspect_models(project_name, prefix_filter="")
+  try:
+    with console.status("Fetching catalog...", spinner="dots"):
+      rows = insp.inspect_models(project_name, prefix_filter="")
+  except Exception as e:
+    msg = str(e)
+    if "NoSuchBucket" in msg or "does not exist" in msg.lower():
+      console.print(f"[red]Project [bold]{project_name}[/bold] not found.[/] Run [bold]isaura info{'  --remote' if cloud else ''}[/bold] to see available projects.")
+    elif "InvalidAccessKeyId" in msg or "SignatureDoesNotMatch" in msg or "Access Key" in msg:
+      console.print("[red]Invalid credentials.[/] Run [bold]isaura configure --remote[/bold] to update them.")
+    elif "connect" in msg.lower() or "endpoint" in msg.lower():
+      target = "remote store" if cloud else "local MinIO"
+      console.print(f"[red]Could not connect to {target}.[/]" + ("" if cloud else " Is Docker running? Try [bold]isaura engine --start[/bold]."))
+    else:
+      console.print(f"[red]Catalog fetch failed:[/] {msg}")
+    return
   if not rows:
     console.print(f"[yellow]No models found in {project_name}[/]")
     return
