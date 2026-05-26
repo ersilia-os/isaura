@@ -235,12 +235,27 @@ def rm(model, version, project_name, yes):
 
 
 @cli.command("inspect")
-@apply_opts(opt_model, opt_version, opt_project, opt_access, opt_ins_input_file, opt_output_file, opt_cloud)
-@click.argument("what", type=click.Choice(["inputs"]), required=False, default="inputs")
-def cmd_inspect(what, model, version, project_name, access, input_file, output_file, cloud):
-  """List available inputs or entries for a model in the store."""
+@click.option("--model_id", "-m", required=True, help="Ersilia model ID to inspect (e.g. eos4e40)")
+@click.option("--version", "-v", default="v1", show_default=True, help="Model version")
+@click.option("--project-name", "-pn", required=False, default=None,
+              help="Restrict search to this project bucket. If omitted, --access is used to select buckets.")
+@click.option("--access", type=click.Choice(["both", "public", "private"]), default=None, required=True,
+              help="Which bucket scope to search: public, private, or both. Ignored when --project-name is set.")
+@click.option("--input", "-i", "input_file", required=True,
+              help="CSV of molecules to check against the store.")
+@click.option("--output", "-o", "output_file", required=True,
+              help="Path to write the results CSV. Each row in the input is annotated with whether it is stored.")
+@click.option("--remote", "-r", "cloud", is_flag=True, default=False,
+              help="Query the remote (cloud) store. Default: local MinIO instance.")
+def cmd_inspect(model_id, version, project_name, access, input_file, output_file, cloud):
+  """Check which molecules from an input CSV are already stored for a model.
+
+  Reads the molecules in --input, queries the store, and writes a results CSV
+  to --output annotating each molecule as found or missing. Useful before
+  running a job to avoid re-computing already-cached results.
+  """
   insp = IsauraInspect(
-    model_id=model, model_version=version, project_name=project_name, access=access, cloud=cloud
+    model_id=model_id, model_version=version, project_name=project_name, access=access, cloud=cloud
   )
   if cloud:
     for b in insp.buckets():
@@ -249,11 +264,8 @@ def cmd_inspect(what, model, version, project_name, access, input_file, output_f
   else:
     ctx = contextlib.nullcontext()
   with ctx:
-    if input_file:
-      df = insp.inspect_inputs(input_file, output_file)
-    else:
-      df = insp.list_available(output_file)
-  logger.info(f"wrote {len(df)} rows{(' -> ' + output_file if output_file else '')}")
+    df = insp.inspect_inputs(input_file, output_file)
+  logger.info(f"wrote {len(df)} rows → {output_file}")
 
 
 @cli.command("catalog")
@@ -346,12 +358,30 @@ def info(cloud):
 
 
 @cli.command("stats")
-@apply_opts(opt_project, opt_access, opt_cloud, opt_stats_outdir, opt_isaura_dir)
-def cmd_stats(project_name, access, cloud, output_dir, isaura_dir):
-  """Generate a JSON inventory of all stored models and their sizes."""
+@click.option("--project-name", "-pn", required=True,
+              help="Project (bucket) name to collect statistics for (e.g. isaura-public, isaura-private, or a custom project).")
+@click.option("--remote", "-r", "cloud", is_flag=True, default=False,
+              help="Collect statistics from the remote (cloud) store. Default: local MinIO instance.")
+@click.option("--output-dir", "-o", required=True,
+              help="Folder where the stats JSON file will be written. "
+                   "The file is named isaura_stats_<timestamp>.json.")
+@click.option("--isaura-dir", "-d", required=False, default=".", hidden=True,
+              help="Path to an isaura folder (used mainly to resolve output defaults).")
+def cmd_stats(project_name, cloud, output_dir, isaura_dir):
+  """Generate a JSON inventory of all models stored in a project bucket.
+
+  Walks the bucket, counts stored molecules and chunk files per model, and
+  writes a timestamped JSON report to --output-dir. Useful for auditing storage
+  usage before or after a bulk write, copy, or move operation.
+
+  \b
+  Example:
+    isaura stats -pn isaura-public -o ./reports
+    isaura stats -pn ersilia-hiv --remote -o ./reports
+  """
   ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
   out_path = os.path.join(output_dir, f"isaura_stats_{ts}.json")
-  st = IsauraStat(project_name=project_name, access=access, cloud=cloud, endpoint=None)
+  st = IsauraStat(project_name=project_name, cloud=cloud, endpoint=None)
   written = st.write_json(out_path)
   logger.info(f"isaura stats wrote: {written}")
 
