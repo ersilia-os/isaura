@@ -130,7 +130,7 @@ class ReadProgress:
       TextColumn("[yellow]pending[/] {task.fields[unresolved]}"),
       TextColumn("[magenta]rss[/] {task.fields[rss]}MB"),
       TimeElapsedColumn(), TimeRemainingColumn(),
-      console=self.console, transient=True,
+      console=self.console, transient=False,
       redirect_stdout=False, redirect_stderr=False,
       refresh_per_second=10, expand=True,
     )

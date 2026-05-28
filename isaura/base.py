@@ -238,20 +238,30 @@ class MinioStore:
     """Create the bucket if it does not already exist. Exits on failure."""
     try:
       self.client.head_bucket(Bucket=bucket)
-    except Exception as e:
-      logger.error(e)
+    except Exception:
       try:
         self.client.create_bucket(Bucket=bucket)
       except Exception as e:
         logger.error(e)
         sys.exit(1)
 
+  def require_bucket(self, bucket):
+    """Exit with a helpful error if the bucket does not exist."""
+    try:
+      self.client.head_bucket(Bucket=bucket)
+    except Exception:
+      logger.error(
+        f"Project [bold]{bucket}[/bold] does not exist. "
+        f"Run [bold]isaura info[/bold] to see available projects or [bold]isaura create -pn {bucket} --access <public|private>[/bold] to create it."
+      )
+      sys.exit(1)
+
   def download_file(self, bucket, key, local):
     """Download an object from MinIO to a local path. Raises on missing key."""
     try:
       self.client.download_file(bucket, key, local, Config=self.transfer_config)
     except Exception as e:
-      logger.warning(f"The file {key} is not found in bucket {bucket}. Details -> {e}")
+      logger.debug(f"The file {key} is not found in bucket {bucket}. Details -> {e}")
       raise
 
   def upload_file(self, local, bucket, key, extra_args=None):
@@ -388,7 +398,7 @@ class BloomIndex:
       self.sbf = ScalableBloomFilter(
         mode=ScalableBloomFilter.SMALL_SET_GROWTH, initial_capacity=initial_capacity, error_rate=error_rate
       )
-      logger.info("created new bloom")
+      logger.debug("created new bloom")
     if load_index:
       try:
         self.store.download_file(self.bucket, self.index_key, self.local_index)
@@ -755,7 +765,7 @@ class ChunkState:
     st = self.state["data"]
     remaining = len(rows)
     start = 0
-    logger.info(f"flush: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
+    logger.debug(f"flush: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
     if st["open"]:
       tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
       try:
@@ -768,7 +778,7 @@ class ChunkState:
           st["rows"] += take
           remaining -= take
           start += take
-          logger.info(f"flush: appended chunk idx={st['next']} +{take} -> {st['rows']}")
+          logger.debug(f"flush: appended chunk idx={st['next']} +{take} -> {st['rows']}")
         if st["rows"] >= self.max_rows:
           st["next"] += 1
           st["open"] = None
@@ -786,12 +796,12 @@ class ChunkState:
       if take < self.max_rows:
         st["open"] = os_key
         st["rows"] = take
-        logger.info(f"flush: new open chunk idx={st['next']} rows={take}")
+        logger.debug(f"flush: new open chunk idx={st['next']} rows={take}")
       else:
         st["next"] += 1
         st["open"] = None
         st["rows"] = 0
-        logger.info(f"flush: full chunk idx={st['next'] - 1} rows={take}")
+        logger.debug(f"flush: full chunk idx={st['next'] - 1} rows={take}")
       remaining -= take
       start += take
 
@@ -1035,6 +1045,7 @@ class _BaseTransfer:
     self.tranches = get_base(model_id, model_version)
     self.collection = get_coll(self.model_id, self.model_version)
     self.store = MinioStore()
+    self.store.require_bucket(self.bucket)
     self.tmpdir = make_temp("isaura_xfer_")
     self.tmpdir_sinkw = make_temp("isaura_sinkw_")
     bind_temp_dirs(self, self.tmpdir, self.tmpdir_sinkw)
@@ -1151,20 +1162,20 @@ class _BaseTransfer:
         DataFrames of matching rows.
     """
     n = len(wanted) if hasattr(wanted, "__len__") else None
-    logger.info(
+    logger.debug(
       f"[select_rows_batched] starting n={n} input_col={input_col} batch_size={batch_size} bucket={self.bucket}"
     )
     source = None
     try:
       if n is not None and n >= STREAM_PARQUET_THRESHOLD:
         prefix = hive_prefix(self.tranches) + "/"
-        logger.info(f"[select_rows_batched] streaming mode n={n} bucket={self.bucket} prefix={prefix}")
+        logger.debug(f"[select_rows_batched] streaming mode n={n} bucket={self.bucket} prefix={prefix}")
         source = stream_parquet_filtered(
           self.store, self.bucket, prefix, wanted, header=input_col, batch_size=batch_size
         )
       else:
         files = list_parquet_keys(self.store, self.bucket, self.tranches)
-        logger.info(
+        logger.debug(
           f"[select_rows_batched] duckdb mode n={n} bucket={self.bucket} files={(len(files) if isinstance(files, list) else files)}"
         )
         source = query_batched(
@@ -1354,7 +1365,7 @@ class _BaseTransfer:
       del df
       if n_batches % 20 == 0:
         gc.collect()
-        logger.info(
+        logger.debug(
           f"[copy] batch={n_batches} priv={tp} pub={tu} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
         )
     if w_priv:
@@ -1373,7 +1384,7 @@ class _BaseTransfer:
     gc.collect()
     elapsed = time.time() - t0
     rate = total / elapsed if elapsed > 0 else 0
-    logger.success(
+    logger.debug(
       f"[copy] done priv={tp} pub={tu} total={total} elapsed={elapsed:.1f}s rate={rate:.0f}/s rss={rss_mb():.0f}MB"
     )
     return (tp, tu)
