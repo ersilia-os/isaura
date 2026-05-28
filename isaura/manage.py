@@ -7,6 +7,7 @@ from rich.progress import (
   SpinnerColumn,
   TextColumn,
   BarColumn,
+  TaskProgressColumn,
   TimeElapsedColumn,
   TimeRemainingColumn,
 )
@@ -271,7 +272,11 @@ class IsauraWriter:
         df.iloc[start : start + WRITE_INPUT_CHUNK_ROWS] for start in range(0, len(df), WRITE_INPUT_CHUNK_ROWS)
       )
     else:
-      total_rows = None
+      try:
+        with open(self.input_csv, "rb") as _f:
+          total_rows = sum(1 for _ in _f) - 1  # subtract header
+      except Exception:
+        total_rows = None
       chunk_iter = pd.read_csv(self.input_csv, chunksize=WRITE_INPUT_CHUNK_ROWS)
     progress = None
     task_id = None
@@ -281,8 +286,10 @@ class IsauraWriter:
           SpinnerColumn(),
           TextColumn("[progress.description]{task.description}"),
           BarColumn(),
+          TaskProgressColumn(text_format="[bold bright_cyan]{task.percentage:>3.0f}%[/]"),
           TextColumn("{task.completed}" + ("/{task.total}" if total_rows else "")),
           TimeElapsedColumn(),
+          TimeRemainingColumn(),
           console=logger.console,
           transient=False,
         )
@@ -670,7 +677,7 @@ class IsauraReader:
       total_rows = 0
       n_chunks = 0
       mode, payload = self._make_read_source(wanted, header, ordered=True)
-      with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
+      with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
           source = stream_parquet_filtered(
             self.store,
@@ -750,7 +757,7 @@ class IsauraReader:
     source = None
     try:
       mode, payload = self._make_read_source(wanted, header, batch_size=batch_size, ordered=True)
-      with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
+      with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
           raw_parts = []
           for chunk in stream_parquet_filtered(
@@ -1082,7 +1089,7 @@ class IsauraPull(_BaseTransfer):
     """Read outputs from cloud MinIO for the given inputs and store them locally."""
     t0 = time.time()
     input_name = os.path.basename(self.input_csv) if self.input_csv else ""
-    logger.debug(f"Pulling {self.model_id} ({self.model_version}) from {self.bucket}")
+    console.print(f"Pulling [bold]{self.model_id}[/bold] ({self.model_version}) from [bold]{self.bucket}[/bold]")
     with IsauraReader(
       model_id=self.model_id,
       model_version=self.model_version,
@@ -1093,15 +1100,16 @@ class IsauraPull(_BaseTransfer):
       access_key=mcak,
       secrete=mcsk,
     ) as r:
-      wanted, _ = r._wanted()
-      logger.debug(f"✓ {len(wanted)} inputs loaded from {input_name}")
-      r._prepare_read()
-      logger.debug(f"✓ All {len(wanted)} found in cloud index")
+      with console.status("Loading inputs...", spinner="dots"):
+        wanted, _ = r._wanted()
+      console.print(f"[green]✓[/green] {len(wanted):,} inputs loaded from {input_name}")
+      with console.status("Checking cloud index...", spinner="dots"):
+        r._prepare_read()
+      console.print(f"[green]✓[/green] All {len(wanted):,} found in cloud index")
       fetch_t0 = time.time()
       out = self._pull_batched(r.read_batched())
-      logger.debug(f"✓ {out[0]} rows fetched from cloud ({time.time() - fetch_t0:.1f}s)")
-      logger.debug(f"✓ {out[0]} rows stored locally")
-    console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] pulled [bold]{out[0]}[/bold] rows from [bold]{self.bucket}[/bold] in {time.time() - t0:.1f}s")
+      console.print(f"[green]✓[/green] {out[0]:,} rows fetched and stored locally ({time.time() - fetch_t0:.1f}s)")
+    console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] pulled [bold]{out[0]:,}[/bold] rows from [bold]{self.bucket}[/bold] in {time.time() - t0:.1f}s")
     logger.debug(f"pulled objects={out}")
 
 
@@ -1188,7 +1196,7 @@ class IsauraPush:
         if not obj["Key"].endswith(skip_suffixes)
       ]
       if not keys:
-        logger.warning(f"[push] no data for {self.model_id} in {src_bucket}. Skipping {access}.")
+        logger.debug(f"[push] no data for {self.model_id} in {src_bucket}. Skipping {access}.")
         continue
       has_data = True
       dst_bucket = f"isaura-{access}"

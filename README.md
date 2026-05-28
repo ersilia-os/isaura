@@ -18,10 +18,8 @@ Fast, reproducible access to **precalculated model outputs** from the **Ersilia 
 
 [Installation](#installation) ·
 [CLI](#cli) ·
-[Python API](#python-api) ·
 [Configuration](#configuration) ·
-[Docs](#docs) ·
-[Contributing](#contributing)
+[Docs](#docs)
 
 </div>
 
@@ -109,7 +107,7 @@ This checks connectivity for local and cloud (if configured) and prints a result
 
 ## CLI
 
-### Managing configuration
+### Configuration
 
 ```bash
 isaura configure                     # show current configuration
@@ -119,7 +117,7 @@ isaura configure --show-secrets      # show all credential values unmasked
 isaura configure --test-credentials  # test local and cloud connectivity
 ```
 
-### Managing local services
+### Local services
 
 ```bash
 isaura engine           # show status of Docker and MinIO
@@ -127,97 +125,106 @@ isaura engine --start   # start local MinIO
 isaura engine --stop    # stop local MinIO
 ```
 
-### Common data commands
+### Projects
 
-#### Write (store outputs)
-
-```bash
-isaura write -i data/ersilia_output.csv -m eos8a4x -v v2 -pn myproject --access public
-```
-
-#### Read (retrieve outputs)
+A **project** is a named MinIO bucket used as a staging area before data reaches the canonical `isaura-public` or `isaura-private` buckets.
 
 ```bash
-isaura read -i data/inputs.csv -m eos8a4x -v v2 -pn myproject -o data/outputs.csv
+isaura info                  # list local projects with access type and creation date
+isaura info --remote         # list remote projects
+
+isaura create -pn myproject --access public   # create a new local project
+isaura destroy -pn myproject                  # destroy an entire project
+isaura destroy -pn myproject -m eos8a4x -v v1 # destroy a specific model version
 ```
 
-#### Copy artifacts to a local directory
+> `isaura-public` and `isaura-private` are reserved — they cannot be fully destroyed, but individual model versions inside them can be removed with `--model-id` and `--version`.
+
+### Writing outputs
+
+Store model outputs in a project bucket:
 
 ```bash
-isaura copy -m eos8a4x -v v1 -pn myproject -o ~/Documents/isaura-backup/
+isaura write -i data/ersilia_output.csv -m eos8a4x -v v1 -pn myproject
 ```
 
-#### Inspect available entries
+The model ID in `--model-id` is validated against the filename — if you accidentally pass a file from a different model, isaura will warn you before writing anything.
+
+### Reading outputs
+
+Retrieve stored outputs for a set of inputs:
 
 ```bash
-isaura inspect -m eos8a4x -v v1 -o reports/available.csv
+# explicit version
+isaura read -i data/inputs.csv -m eos8a4x -v v1 -pn myproject -o data/outputs.csv
+
+# omit --version to automatically use the latest stored version
+isaura read -i data/inputs.csv -m eos8a4x -pn myproject -o data/outputs.csv
 ```
 
-#### Upload to cloud store
+`--project-name` is required. `--output` is optional — without it results are printed but not saved.
 
-The cloud only hosts two canonical buckets: `isaura-public` and `isaura-private`. If your local work uses a custom project name, copy or move it into the appropriate canonical bucket first, then push.
+### Inspecting what is stored
 
-**Step 1 — write outputs to your local project:**
+Check which molecules from an input file are already cached:
 
 ```bash
-isaura write -i data/ersilia_output.csv -m eos8a4x -v v1 -pn myproject --access public
+isaura inspect --model_id eos8a4x -v v1 --access public -i data/inputs.csv -o reports/available.csv
 ```
 
-**Step 2 — copy (or move) into the canonical bucket:**
+Browse all models in a project:
 
 ```bash
-# copy (keeps data in myproject as well)
-isaura copy -m eos8a4x -v v1 -pn myproject
-
-# or move (removes data from myproject after copying)
-isaura move -m eos8a4x -v v1 -pn myproject
+isaura catalog -pn myproject           # local
+isaura catalog -pn isaura-public -r    # remote
 ```
+
+### Publishing to the cloud
+
+The cloud hosts two canonical buckets: `isaura-public` and `isaura-private`. Write to a local project first, persist it into the canonical bucket, then push to cloud.
+
+**Step 1 — write to your local project:**
+
+```bash
+isaura write -i data/ersilia_output.csv -m eos8a4x -v v1 -pn myproject
+```
+
+**Step 2 — persist into the canonical bucket:**
+
+```bash
+isaura persist -m eos8a4x -v v1 -pn myproject
+```
+
+This routes molecules tagged `public` → `isaura-public` and `private` → `isaura-private` based on the project's access setting.
 
 **Step 3 — push to cloud:**
 
 ```bash
 isaura push -m eos8a4x -v v1 -pn isaura-public
-# or for private data:
-isaura push -m eos8a4x -v v1 -pn isaura-private
 ```
 
 > Cloud credentials must be configured first with `isaura configure --remote`.
 
----
+### Pulling from the cloud
 
-## Python API
+Download precalculations from the remote store into your local MinIO:
 
-```python
-from isaura.manage import IsauraWriter, IsauraReader
+```bash
+# explicit version
+isaura pull -i data/inputs.csv -m eos8a4x -v v1 -pn isaura-public
+
+# omit --version to automatically pull the latest stored version
+isaura pull -i data/inputs.csv -m eos8a4x -pn isaura-public
 ```
 
-Write a precalculation:
+### Storage statistics
 
-```python
-writer = IsauraWriter(
-    input_csv="data/input.csv",
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-    access="public",
-)
-writer.write()
+Generate a JSON inventory of all models in a bucket:
+
+```bash
+isaura stats -pn isaura-public -o ./reports
+isaura stats -pn myproject --remote -o ./reports
 ```
-
-Read stored results:
-
-```python
-reader = IsauraReader(
-    model_id="eos8a4x",
-    model_version="v1",
-    bucket="my-project",
-    input_csv="data/query.csv",
-    approximate=False,
-)
-reader.read(output_csv="results.csv")
-```
-
-More examples: **[API and CLI usage →](docs/API_AND_CLI_USAGE.md)**
 
 ---
 
@@ -242,18 +249,6 @@ See the full list of available variables: **[CONFIGURATION →](docs/CONFIGURATI
 * 🧰 **CLI and API reference**: [here](docs/API_AND_CLI_USAGE.md)
 * 🧪 **Benchmark**: [here](docs/BENCHMARK.md)
 * 🩹 **Troubleshooting / recovery**: [here](docs/TROUBLESHOOTING.md)
-
----
-
-## Contributing
-
-PRs are welcome. Please run format + lint before pushing:
-
-```bash
-uv run ruff format .
-```
-
-If you're changing CLI behavior, please update **[here](docs/API_AND_CLI_USAGE.md)**.
 
 ---
 

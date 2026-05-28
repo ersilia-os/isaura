@@ -2,11 +2,10 @@ import pyarrow as pa
 import pyarrow.csv as pa_csv
 from rich.console import Console
 from rich.progress import (
-  Progress, ProgressColumn, SpinnerColumn, TextColumn,
-  BarColumn, MofNCompleteColumn, TaskProgressColumn,
+  Progress, SpinnerColumn, TextColumn,
+  BarColumn, TaskProgressColumn,
   TimeRemainingColumn, TimeElapsedColumn,
 )
-from rich.progress_bar import ProgressBar
 from rich.table import Table
 
 from isaura.utils import rss_mb
@@ -60,86 +59,49 @@ class StreamingCsvSink:
     self.write_table(pa.Table.from_pandas(df, preserve_index=False))
 
 
-class _PulseBarColumn(ProgressColumn):
-  """Rich progress column that renders a pulsing bar while a task is in progress.
-
-  Switches to a solid filled bar when the task is complete.
-  """
-
-  def __init__(
-    self, bar_width=40,
-    style="rgb(36,26,58)",
-    complete_style="bold rgb(56,189,248)",
-    finished_style="bold rgb(34,197,94)",
-    pulse_style="bold rgb(244,114,182)",
-  ):
-    super().__init__()
-    self.bar_width = int(bar_width)
-    self.style = style
-    self.complete_style = complete_style
-    self.finished_style = finished_style
-    self.pulse_style = pulse_style
-
-  def render(self, task):
-    return ProgressBar(
-      total=task.total, completed=task.completed,
-      width=max(1, self.bar_width), pulse=not task.finished,
-      animation_time=task.get_time(),
-      style=self.style, complete_style=self.complete_style,
-      finished_style=self.finished_style, pulse_style=self.pulse_style,
-    )
-
-
 class ReadProgress:
   """Context manager that displays a live Rich progress bar during a read operation.
 
-  Shows files scanned, rows emitted, pending inputs, memory usage, and
-  elapsed/remaining time. Designed to be used with the `with` statement and
-  updated incrementally via update().
+  Shows files processed, row count, and elapsed/remaining time.
+  Designed to be used with the `with` statement and updated incrementally via update().
 
   Args:
       total_inputs: Total number of molecule inputs being queried (used to size the bar).
       console: Rich Console to render to. Defaults to a new stderr console.
+      description: Label shown next to the progress bar.
   """
 
-  def __init__(self, total_inputs=None, console=None):
+  def __init__(self, total_inputs=None, console=None, description="Reading"):
     self.total_inputs = total_inputs
     self.console = console or Console(force_terminal=True, stderr=True)
+    self.description = description
     self.progress = None
     self.task_id = None
+    self.found_rows = 0
     self.files_done = 0
     self.files_total = 0
-    self.found_rows = 0
     self.emitted_rows = 0
     self.unresolved = total_inputs or 0
-    self._tick = 0
-    self._phrases = ["scanning", "matching", "streaming", "finalizing"]
 
   def __enter__(self):
+    total = self.total_inputs
     self.progress = Progress(
-      SpinnerColumn(spinner_name="aesthetic"),
-      TextColumn("[bold magenta]{task.fields[phase]}[/]"),
-      _PulseBarColumn(bar_width=28, style="rgb(40,28,58)",
-        complete_style="bold rgb(56,189,248)",
-        finished_style="bold rgb(34,197,94)",
-        pulse_style="bold rgb(244,114,182)"),
+      SpinnerColumn(),
+      TextColumn("[progress.description]{task.description}"),
+      BarColumn(),
       TaskProgressColumn(text_format="[bold bright_cyan]{task.percentage:>3.0f}%[/]"),
-      MofNCompleteColumn(),
+      TextColumn("{task.completed}/{task.total}"),
       TextColumn("[cyan]files[/] {task.fields[files_done]}/{task.fields[files_total]}"),
-      TextColumn("[green]emitted[/] {task.fields[emitted_rows]}"),
-      TextColumn("[yellow]pending[/] {task.fields[unresolved]}"),
-      TextColumn("[magenta]rss[/] {task.fields[rss]}MB"),
-      TimeElapsedColumn(), TimeRemainingColumn(),
+      TimeElapsedColumn(),
+      TimeRemainingColumn(),
       console=self.console, transient=False,
       redirect_stdout=False, redirect_stderr=False,
       refresh_per_second=10, expand=True,
     )
     self.progress.__enter__()
-    total = self.total_inputs if self.total_inputs is not None else 100
     self.task_id = self.progress.add_task(
-      self._render("starting"), total=total, completed=0,
-      phase=self._render_phase("starting"), files_done=0, files_total=0,
-      emitted_rows=0, unresolved=self.unresolved, rss=f"{rss_mb():.0f}",
+      self.description, total=total, completed=0,
+      files_done=0, files_total=0,
     )
     return self
 
@@ -147,39 +109,27 @@ class ReadProgress:
     if self.progress is not None:
       self.progress.__exit__(et, ev, tb)
 
-  def _render(self, stage):
-    phrase = self._phrases[self._tick % len(self._phrases)]
-    return f"{phrase} {stage}"
-
-  def _render_phase(self, stage):
-    return self._render(stage).replace("_", " ")
-
   def update(self, stage=None, files_done=None, files_total=None,
              found_rows=None, emitted_rows=None, unresolved=None):
     """Update the progress bar with the latest scan state."""
+    if found_rows is not None:
+      self.found_rows = found_rows
     if files_done is not None:
       self.files_done = files_done
     if files_total is not None:
       self.files_total = files_total
-    if found_rows is not None:
-      self.found_rows = found_rows
     if emitted_rows is not None:
       self.emitted_rows = emitted_rows
     if unresolved is not None:
       self.unresolved = unresolved
-    self._tick += 1
     if self.progress is not None and self.task_id is not None:
       completed = self.found_rows
       total = self.total_inputs if self.total_inputs is not None else max(100, completed or 0)
       if completed > total:
         total = completed
       self.progress.update(
-        self.task_id, description=self._render(stage or "working"),
-        total=total, completed=completed,
-        phase=self._render_phase(stage or "working"),
+        self.task_id, completed=completed, total=total,
         files_done=self.files_done, files_total=self.files_total,
-        emitted_rows=self.emitted_rows, unresolved=self.unresolved,
-        rss=f"{rss_mb():.0f}",
       )
 
 

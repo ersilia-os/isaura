@@ -3,7 +3,7 @@
 
 Isaura exposes a small set of high-level managers for writing, reading, and moving precalculated artifacts.
 
-> Tip: Most workflows are “write once, read many times”. After the first write, reads become fast.
+> Tip: Most workflows are "write once, read many times". After the first write, reads become fast.
 
 ---
 
@@ -14,14 +14,13 @@ from isaura.manage import (
   IsauraWriter,
   IsauraReader,
   IsauraCopy,
-  IsauraMover,
   IsauraRemover,
   IsauraInspect,
   IsauraPull,
   IsauraPush,
   IsauraStat,
 )
-````
+```
 
 ---
 
@@ -43,11 +42,7 @@ It uses `input`/`smiles` as the lookup key and stores the rest as payload column
 
 ## Write (upload/store results)
 
-Writes a CSV (or DataFrame) into the Isaura store for a given:
-
-* `model_id` (e.g. `eos8a4x`)
-* `model_version` (e.g. `v1`)
-* `bucket` (project namespace; default is `isaura-public`)
+Writes a CSV (or DataFrame) into the Isaura store for a given model ID, version, and project bucket.
 
 ```python
 from isaura.manage import IsauraWriter
@@ -56,11 +51,10 @@ with IsauraWriter(
   input_csv="data/ersilia_output.csv",
   model_id="eos8a4x",
   model_version="v1",
-  bucket="isaura-public",     # optional (defaults to public bucket)
-  access="public",            # metadata tag; typically public/private
-  endpoint=None,              # optional override MinIO endpoint
-  access_key=None,            # optional MinIO access key
-  secrete=None,               # optional MinIO secret key
+  bucket="myproject",
+  endpoint=None,        # optional MinIO endpoint override
+  access_key=None,      # optional MinIO access key
+  secrete=None,         # optional MinIO secret key
 ) as w:
   w.write()
 ```
@@ -74,10 +68,10 @@ from isaura.manage import IsauraWriter
 df = pd.read_csv("data/ersilia_output.csv")
 
 with IsauraWriter(
-  input_csv="data/ersilia_output.csv",  
+  input_csv="data/ersilia_output.csv",
   model_id="eos8a4x",
   model_version="v1",
-  bucket="isaura-public",
+  bucket="myproject",
 ) as w:
   w.write(df=df)
 ```
@@ -92,45 +86,22 @@ with IsauraWriter(
 ## Read (retrieve results)
 
 Reads rows matching inputs from a CSV (or DataFrame).
-You can run either:
-
-* **Exact** search: `approximate=False`
-* **Approximate/ANN** search: `approximate=True` (requires enough indexed data)
 
 ```python
 from isaura.manage import IsauraReader
 
-r = IsauraReader(
+with IsauraReader(
   model_id="eos8a4x",
   model_version="v1",
   input_csv="data/inputs.csv",
   approximate=False,
-  bucket="isaura-public",
+  bucket="myproject",
   endpoint=None,
   access_key=None,
   secrete=None,
-)
-
-df = r.read(output_csv="data/outputs.csv")
+) as r:
+  df = r.read(output_csv="data/outputs.csv")
 ```
-
-### Approximate retrieval (ANN)
-
-```python
-r = IsauraReader(
-  model_id="eos8a4x",
-  model_version="v1",
-  input_csv="data/inputs.csv",
-  approximate=True,
-)
-
-df = r.read()
-```
-
-**Notes**
-
-* ANN is only enabled when the index size is above a minimum (`MIN_NNS_RESULT_SIZE`).
-* ANN contacts an NN service using `NNS_ENDPOINT` and may trigger/ensure index building.
 
 ---
 
@@ -143,13 +114,10 @@ from isaura.manage import IsauraInspect
 
 insp = IsauraInspect(
   cloud=False,
-  project_name=None,
+  project_name="myproject",
   access="both",     # "public" | "private" | "both"
   endpoint=None,
 )
-
-# List unique inputs that exist and which bucket owns them
-df_available = insp.list_available(output_csv="reports/available_inputs.csv")
 
 # Check if a given input CSV is available
 df_check = insp.inspect_inputs(
@@ -158,74 +126,68 @@ df_check = insp.inspect_inputs(
 )
 
 # Inspect models in a bucket (model_id/version + entry counts)
-models = insp.inspect_models(bucket="isaura-public")
+models = insp.inspect_models(bucket="myproject")
 ```
 
 ---
 
-## Copy / Move / Remove
+## Persist / Remove
 
-These are “server-side” operations on stored artifacts for a model/version/bucket.
+These are server-side operations on stored artifacts for a model/version/bucket.
 
 ```python
-from isaura.manage import IsauraCopy, IsauraMover, IsauraRemover
+from isaura.manage import IsauraCopy, IsauraRemover
 
-IsauraCopy(model_id="eos8a4x", model_version="v1", bucket="isaura-public", output_dir="backup/").copy()
+# Persist: route rows from a project bucket into isaura-public / isaura-private
+IsauraCopy(model_id="eos8a4x", model_version="v1", bucket="myproject").copy()
 
-IsauraMover(model_id="eos8a4x", model_version="v1", bucket="isaura-public", output_dir="newplace/").move()
-
-IsauraRemover(model_id="eos8a4x", model_version="v1", bucket="isaura-public", output_dir=None).remove()
+# Remove a model/version from a bucket
+IsauraRemover(model_id="eos8a4x", model_version="v1", bucket="myproject").remove()
 ```
 
 ---
 
-## Pull / Push (cloud sync workflows)
+## Pull / Push (cloud sync)
 
 ### Pull
 
-Pulls from cloud into a local workspace by reading from the cloud endpoint and materializing objects.
+Downloads outputs from the cloud store into your local MinIO.
 
 ```python
 from isaura.manage import IsauraPull
 
-p = IsauraPull(
+with IsauraPull(
   model_id="eos8a4x",
   model_version="v1",
   bucket="isaura-public",
   input_csv="data/inputs.csv",
-)
-p.pull()
+) as p:
+  p.pull()
 ```
 
 ### Push
 
-Pushes local public/private data to cloud by:
-
-1. listing available inputs,
-2. splitting by bucket,
-3. reading locally,
-4. writing to cloud.
+Uploads local public/private data to the cloud.
 
 ```python
 from isaura.manage import IsauraPush
 
-IsauraPush(model_id="eos8a4x", model_version="v1", bucket="my-project").push()
+IsauraPush(model_id="eos8a4x", model_version="v1", bucket="myproject").push()
 ```
 
-> Cloud credentials must be provided via env vars (see `docs/CONFIGURATION.md`).
+> Cloud credentials must be provided via environment variables (see `docs/CONFIGURATION.md`).
 
 ---
 
 ## Stats (inventory report)
 
-Generate a JSON report of what’s stored, including optional column counts.
+Generate a JSON report of what's stored, including optional column counts.
 
 ```python
 from isaura.manage import IsauraStat
 
 st = IsauraStat(
-  project_name=None,
-  access="both",
+  project_name="isaura-public",
   cloud=False,
   include_columns=True,
   include_column_names=False,
@@ -239,7 +201,7 @@ The stats report includes:
 * buckets scanned
 * model counts by bucket
 * molecules per model
-* histogram of “how many models each molecule appears in”
+* histogram of "how many models each molecule appears in"
 * optional parquet column info (best effort)
 
 <br>
@@ -247,200 +209,181 @@ The stats report includes:
 ---
 
 
-# CLI usage
-
-Isaura ships with a CLI for writing/reading/store operations and local engine management.
-
-> The CLI mirrors the Python API: write/read/inspect/copy/move/remove + engine start.
+# CLI reference
 
 ---
 
-## Quick start
+## Configuration
 
 ```bash
-isaura engine --start
-````
-
-Local dashboards:
-
-* MinIO Console: `http://localhost:9001`
-* Milvus API: `http://localhost:8080`
-
----
-
-## Common commands
-
-### Write (upload/store results)
-
-Uploads outputs for a model/version from a CSV.
-Your CSV should contain an input identifier column (`input` preferred; `smiles` supported).
-
-```bash
-isaura write \
-  -i data/ersilia_output.csv \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject \
-  --access public
-```
-
-**Behavior**
-
-* Skips duplicates using the bloom/index registry.
-* Persists metadata to `access.json`.
-
----
-
-### Read (retrieve results)
-
-Fetches stored rows corresponding to inputs in a CSV.
-
-```bash
-isaura read \
-  -i data/inputs.csv \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject \
-  -o data/outputs.csv
-```
-
-### Read with approximate matching (ANN)
-
-```bash
-isaura read \
-  -i data/inputs.csv \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject \
-  -o data/outputs.csv \
-  -nn
-```
-
-**Notes**
-
-* ANN requires a sufficiently large index.
-* Uses `NNS_ENDPOINT` and may trigger/build ANN index server-side.
-
----
-
-## Inspect & catalog
-
-### Inspect inputs (validate availability)
-
-```bash
-isaura inspect inputs \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject \
-  -i data/inputs.csv \
-  -o reports/inspect_report.csv
-```
-
-### List available entries for a model/version
-
-```bash
-isaura inspect \
-  -m eos8a4x \
-  -v v1 \
-  -o reports/available.csv
-```
-
-### Catalog models in a project (bucket)
-
-```bash
-isaura catalog -pn myproject
+isaura configure                     # show current configuration
+isaura configure --remote            # add or update remote/cloud credentials
+isaura configure --update            # update a single credential interactively
+isaura configure --show-secrets      # show all credential values unmasked
+isaura configure --test-credentials  # test local and cloud connectivity
 ```
 
 ---
 
-## Transfer operations
-
-### Copy artifacts (server → local)
+## Local services
 
 ```bash
-isaura copy \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject \
-  -o ~/Documents/isaura-backup/
-```
-
-### Move artifacts (server-side relocate)
-
-```bash
-isaura move \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject
-```
-
-### Remove artifacts (permanent)
-
-```bash
-isaura remove \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject \
-  --yes
+isaura engine           # show Docker and MinIO status
+isaura engine --start   # start local MinIO
+isaura engine --stop    # stop local MinIO
 ```
 
 ---
 
-## Cloud sync
+## Projects
 
-### Pull from cloud → local
-
-```bash
-isaura pull \
-  -m eos8a4x \
-  -v v1 \
-  -pn isaura-public \
-  -i data/inputs.csv
-```
-
-### Push local → cloud
+A **project** is a named MinIO bucket used as a staging area.
 
 ```bash
-isaura push \
-  -m eos8a4x \
-  -v v1 \
-  -pn myproject
+isaura info                  # list local projects (name, access, created, path)
+isaura info --remote         # list remote projects
+
+isaura create -pn myproject --access public    # create a new local project
+isaura destroy -pn myproject                   # destroy entire project
+isaura destroy -pn myproject -m eos8a4x -v v1  # destroy a specific model version
 ```
 
-Cloud auth is via env vars:
-
-* `MINIO_CLOUD_AK`, `MINIO_CLOUD_SK`
-* `MINIO_PRIV_CLOUD_AK`, `MINIO_PRIV_CLOUD_SK`
-* `MINIO_ENDPOINT_CLOUD`
+> `isaura-public` and `isaura-private` are reserved — they cannot be fully destroyed, but individual model versions inside them can be removed.
 
 ---
 
-## Configuration (env vars)
+## Write
 
-Common:
+Store model outputs in a project bucket:
 
-* `MINIO_ENDPOINT` (default `http://127.0.0.1:9000`)
-* `NNS_ENDPOINT` (default `http://127.0.0.1:8080`)
-* `DEFAULT_BUCKET_NAME` (default `isaura-public`)
-* `DEFAULT_PRIVATE_BUCKET_NAME` (default `isaura-private`)
-* `BATCH`, `FLUSH_EVERY`, `TIMEOUT`
+```bash
+isaura write -i data/ersilia_output.csv -m eos8a4x -v v1 -pn myproject
+```
 
-Recommended: define them in a `.env` file (loaded automatically if `python-dotenv` is installed).
+| Flag | Description |
+|---|---|
+| `-i, --input` | Input CSV (required) |
+| `-m, --model-id` | Ersilia model ID (required) |
+| `-v, --version` | Model version, default `v1` |
+| `-pn, --project-name` | Target bucket (required) |
 
----
-
-## Reference: flags (most used)
-
-| Flag                  | Meaning                            |
-| --------------------- | ---------------------------------- |
-| `-i, --input-file`    | Input CSV                          |
-| `-o, --output-file`   | Output CSV                         |
-| `-m, --model`         | Model ID (e.g. `eos8a4x`)          |
-| `-v, --version`       | Model version (e.g. `v1`)          |
-| `-pn, --project-name` | Bucket/project name                |
-| `--access`            | `public` / `private` / `both`      |
-| `-nn`                 | Enable approximate (ANN) retrieval |
-| `--cloud`             | Use cloud endpoint/credentials     |
+> If the filename contains a model ID that doesn't match `--model-id`, isaura will error before writing anything.
 
 ---
 
+## Read
+
+Retrieve stored outputs for a set of inputs:
+
+```bash
+# explicit version
+isaura read -i data/inputs.csv -m eos8a4x -v v1 -pn myproject -o data/outputs.csv
+
+# auto-resolve to latest stored version
+isaura read -i data/inputs.csv -m eos8a4x -pn myproject -o data/outputs.csv
+```
+
+| Flag | Description |
+|---|---|
+| `-i, --input` | Input CSV (required) |
+| `-m, --model-id` | Ersilia model ID (required) |
+| `-v, --version` | Model version — defaults to latest stored version if omitted |
+| `-pn, --project-name` | Source bucket (required) |
+| `-o, --output` | Output CSV path (optional — prints row count if omitted) |
+| `-V, --verbose` | Show detailed internal logs |
+
+---
+
+## Inspect
+
+Check which molecules from an input CSV are already cached:
+
+```bash
+isaura inspect --model_id eos8a4x -v v1 --access public -i data/inputs.csv -o reports/available.csv
+```
+
+| Flag | Description |
+|---|---|
+| `--model_id, -m` | Ersilia model ID (required) |
+| `-v, --version` | Model version, default `v1` |
+| `-pn, --project-name` | Restrict search to this bucket |
+| `--access` | `public`, `private`, or `both` — ignored when `--project-name` is set |
+| `-i, --input` | Input CSV to check (required) |
+| `-o, --output` | Output CSV path (required) |
+| `-r, --remote` | Query the remote store (default: local) |
+
+---
+
+## Catalog
+
+List all models stored in a project:
+
+```bash
+isaura catalog -pn myproject           # local
+isaura catalog -pn isaura-public -r    # remote (requires cloud credentials)
+```
+
+---
+
+## Publishing to the cloud
+
+**Step 1 — write to a local project:**
+
+```bash
+isaura write -i data/ersilia_output.csv -m eos8a4x -v v1 -pn myproject
+```
+
+**Step 2 — persist into the canonical bucket:**
+
+```bash
+isaura persist -m eos8a4x -v v1 -pn myproject
+```
+
+Routes molecules to `isaura-public` or `isaura-private` based on the project's access setting.
+
+**Step 3 — push to cloud:**
+
+```bash
+isaura push -m eos8a4x -v v1 -pn isaura-public
+```
+
+> Cloud credentials must be configured first with `isaura configure --remote`.
+
+---
+
+## Pull
+
+Download precalculations from the remote store into local MinIO:
+
+```bash
+# explicit version
+isaura pull -i data/inputs.csv -m eos8a4x -v v1 -pn isaura-public
+
+# auto-resolve to latest stored version
+isaura pull -i data/inputs.csv -m eos8a4x -pn isaura-public
+```
+
+| Flag | Description |
+|---|---|
+| `-i, --input` | Input CSV (required) |
+| `-m, --model-id` | Ersilia model ID (required) |
+| `-v, --version` | Model version — defaults to latest stored version if omitted |
+| `-pn, --project-name` | Remote bucket to pull from |
+| `-V, --verbose` | Show detailed internal logs |
+
+---
+
+## Stats
+
+Generate a JSON inventory of all models in a bucket:
+
+```bash
+isaura stats -pn isaura-public -o ./reports
+isaura stats -pn myproject --remote -o ./reports
+```
+
+| Flag | Description |
+|---|---|
+| `-pn, --project-name` | Bucket to scan (required) |
+| `-o, --output-dir` | Folder to write the JSON report (required) |
+| `-r, --remote` | Scan the remote store (default: local) |

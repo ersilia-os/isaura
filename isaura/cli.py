@@ -2,7 +2,6 @@ import contextlib, datetime, os, sys
 import rich_click as click
 import rich_click.rich_click as rc
 from isaura.manage import (
-  IsauraMover,
   IsauraCopy,
   IsauraMolRemover,
   IsauraWriter,
@@ -23,7 +22,6 @@ from isaura.helpers import (
   show_figlet,
   run_docker_compose,
   get_engine_status,
-  spinner,
 )
 
 click.rich_click.USE_RICH_MARKUP = True
@@ -48,6 +46,34 @@ def apply_opts(*opts):
   return _wrap
 
 
+def _check_model_filename(model_id, filepath):
+  """Warn if a model ID found in the filename doesn't match model_id."""
+  import re
+  if not filepath:
+    return
+  basename = os.path.basename(filepath)
+  found = re.findall(r'eos[a-z0-9]{4}', basename.lower())
+  for match in found:
+    if match != model_id.lower():
+      console.print(
+        f"[red]Filename and --model-id do not match:[/] "
+        f"[bold]{match}[/bold] (filename) vs [bold]{model_id}[/bold] (--model-id)."
+      )
+      sys.exit(1)
+
+
+def _resolve_version(model_id, bucket, store):
+  """Return the latest version stored for a model in a bucket, or 'v1' as fallback."""
+  try:
+    keys = [obj["Key"] for obj in store.list_keys(bucket, f"{model_id}/")]
+    versions = {k.split("/")[1] for k in keys if len(k.split("/")) >= 2 and k.split("/")[1].startswith("v")}
+    if not versions:
+      return "v1"
+    return max(versions, key=lambda v: int(v[1:]) if v[1:].isdigit() else 0)
+  except Exception:
+    return "v1"
+
+
 @click.group()
 def cli():
   pass
@@ -64,7 +90,7 @@ opt_project_req = click.option("--project-name", "-pn", required=True, help="Pro
 opt_input_file = click.option("--input", "-i", "input_file", required=True, help="Path to input CSV")
 opt_ins_input_file = click.option("--input", "-i", "input_file", required=False, help="Path to input CSV")
 opt_output_file = click.option(
-  "--output-file", "-o", required=False, default=None, help="Path to output file (csv/h5)"
+  "--output", "-o", "output_file", required=False, default=None, help="Path to output file (csv/h5)"
 )
 opt_access = click.option(
   "--access",
@@ -158,6 +184,7 @@ def write(input_file, project_name, model, version, verbose):
   """Store model outputs in a project bucket."""
   if verbose:
     logger.set_verbosity(True)
+  _check_model_filename(model, input_file)
   with IsauraWriter(
     input_csv=input_file, model_id=model, model_version=version, bucket=project_name
   ) as w:
@@ -165,16 +192,27 @@ def write(input_file, project_name, model, version, verbose):
 
 
 @cli.command("read")
-@apply_opts(opt_input_file, opt_project, opt_model, opt_version, opt_output_file, opt_approx)
+@apply_opts(opt_input_file, opt_project_req, opt_model, opt_output_file)
+@click.option("--version", "-v", required=False, default=None, help="Model version (default: latest stored version)")
+# @apply_opts(opt_approx)  # approximate search disabled — under development
 @click.option("--verbose", "-V", is_flag=True, default=False, help="Show detailed internal logs")
-def read(input_file, project_name, model, version, output_file, approximate, verbose):
+def read(input_file, project_name, model, output_file, version, verbose):
   """Retrieve stored model outputs for a set of inputs."""
   if verbose:
     logger.set_verbosity(True)
-  if approximate:
-    logger.warning("Approximate Nearest Neighbor search is under active development and may return incomplete or unexpected results.")
+  _check_model_filename(model, output_file)
+  if version is None:
+    from isaura.base import MinioStore
+    from isaura.const import MINIO_ENDPOINT, MINIO_LOCAL_AK, MINIO_LOCAL_SK
+    try:
+      _store = MinioStore(endpoint=MINIO_ENDPOINT, access=MINIO_LOCAL_AK, secret=MINIO_LOCAL_SK)
+      version = _resolve_version(model, project_name, _store)
+      console.print(f"[dim]No version specified — using latest: {version}[/dim]")
+    except Exception:
+      version = "v1"
+  # approximate = False  # disabled — uncomment opt_approx above to re-enable
   with IsauraReader(
-    model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=approximate
+    model_id=model, model_version=version, bucket=project_name, input_csv=input_file, approximate=False
   ) as r:
     total = sum(len(chunk) for chunk in r.read_batched(output_csv=output_file))
   dest = f" → {output_file}" if output_file else ""
@@ -182,13 +220,23 @@ def read(input_file, project_name, model, version, output_file, approximate, ver
 
 
 @cli.command("pull")
-@apply_opts(opt_input_file, opt_project, opt_model, opt_version)
+@apply_opts(opt_input_file, opt_project, opt_model)
+@click.option("--version", "-v", required=False, default=None, help="Model version (default: latest stored version in the remote bucket)")
 @click.option("--verbose", "-V", is_flag=True, default=False, help="Show detailed internal logs")
 def pull(input_file, project_name, model, version, verbose):
   """Pull model outputs from the cloud store to local."""
   if verbose:
     logger.set_verbosity(True)
   pn = project_name or DEFAULT_BUCKET_NAME
+  if version is None:
+    from isaura.base import MinioStore
+    from isaura.const import MINIO_ENDPOINT_CLOUD, MINIO_CLOUD_AK, MINIO_CLOUD_SK
+    try:
+      _store = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=MINIO_CLOUD_AK, secret=MINIO_CLOUD_SK)
+      version = _resolve_version(model, pn, _store)
+      console.print(f"[dim]No version specified — using latest: {version}[/dim]")
+    except Exception:
+      version = "v1"
   with IsauraPull(model_id=model, model_version=version, bucket=pn, input_csv=input_file) as pl:
     pl.pull()
 
@@ -204,7 +252,7 @@ def push(project_name, model, version, verbose):
   p.push()
 
 
-@cli.command("copy")
+@cli.command("persist")
 @apply_opts(opt_model, opt_version, opt_project_req, opt_dump_outdir)
 @click.option("--verbose", "-V", is_flag=True, default=False, help="Show detailed internal logs")
 def cp(model, version, project_name, output_dir, verbose):
@@ -284,14 +332,25 @@ def rm(model, version, project_name, input_file, verbose, yes):
 
 @cli.command("destroy")
 @click.option("--project-name", "-pn", required=True, help="Project (bucket) name to destroy")
-@click.option("--model-id", "-m", "model", required=False, default=None, help="If set, destroy only this model's data")
+@click.option("--model-id", "-m", "model", required=False, default=None, help="If set, destroy only this model's data. Requires --version.")
+@click.option("--version", "-v", required=False, default=None, show_default=True, help="Model version to destroy. Required when --model-id is set.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt")
-def destroy(project_name, model, yes):
-  """Destroy a project bucket or a model's data within it. Local only — cannot target isaura-public or isaura-private."""
+def destroy(project_name, model, version, yes):
+  """Destroy a project bucket or a specific model version within it.
+
+  \b
+  • Without --model-id: destroys the entire project bucket.
+  • With --model-id and --version: destroys only that model/version combination.
+
+  Cannot target isaura-public or isaura-private.
+  """
+  if model and not version:
+    console.print("[red]--version is required when --model-id is set.[/] Example: [bold]-m eos4e40 -v v1[/bold]")
+    sys.exit(1)
   from isaura.base import MinioStore
   from isaura.const import MINIO_ENDPOINT, MINIO_LOCAL_AK, MINIO_LOCAL_SK
-  if project_name in (DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME):
-    console.print(f"[red][bold]{project_name}[/bold] is a reserved bucket and cannot be destroyed.[/]")
+  if not model and project_name in (DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME):
+    console.print(f"[red][bold]{project_name}[/bold] is a reserved bucket and cannot be destroyed.[/] Use [bold]--model-id[/bold] and [bold]--version[/bold] to remove a specific model.")
     sys.exit(1)
   store = MinioStore(endpoint=MINIO_ENDPOINT, access=MINIO_LOCAL_AK, secret=MINIO_LOCAL_SK)
   store.require_bucket(project_name)
@@ -299,7 +358,7 @@ def destroy(project_name, model, yes):
     if model:
       console.print(
         f"[yellow]Warning:[/yellow] This will permanently delete all data for "
-        f"[bold]{model}[/bold] in [bold]{project_name}[/bold] and cannot be undone."
+        f"[bold]{model}/{version}[/bold] in [bold]{project_name}[/bold] and cannot be undone."
       )
     else:
       console.print(
@@ -310,9 +369,9 @@ def destroy(project_name, model, yes):
       console.print("[dim]Cancelled.[/dim]")
       return
   if model:
-    with console.status(f"Deleting {model} from {project_name}...", spinner="dots"):
-      n = store.delete_prefix(project_name, f"{model}/")
-    console.print(f"[green]✓[/green] [bold]{model}[/bold] deleted from [bold]{project_name}[/bold]: {n} objects removed")
+    with console.status(f"Deleting {model}/{version} from {project_name}...", spinner="dots"):
+      n = store.delete_prefix(project_name, f"{model}/{version}/")
+    console.print(f"[green]✓[/green] [bold]{model}/{version}[/bold] deleted from [bold]{project_name}[/bold]: {n} objects removed")
   else:
     with console.status(f"Destroying {project_name}...", spinner="dots"):
       n = store.delete_prefix(project_name, "")
@@ -430,13 +489,35 @@ def info(cloud):
   if not buckets:
     console.print(f"[yellow]No projects found in {title.lower()}.[/]")
     return
+
+  def _access_label(bucket_name):
+    import json, tempfile
+    if "public" in bucket_name:
+      return "[green]public[/green]"
+    if "private" in bucket_name:
+      return "[red]private[/red]"
+    try:
+      tmp = tempfile.mktemp()
+      store.download_file(bucket_name, "access.json", tmp)
+      with open(tmp) as f:
+        val = json.load(f).get("access", "")
+      if val == "public":
+        return "[green]public[/green]"
+      if val == "private":
+        return "[red]private[/red]"
+    except Exception:
+      pass
+    return "[dim]–[/dim]"
+
   def _location(bucket_name):
     if cloud:
       return f"{endpoint}/{bucket_name}"
     return os.path.expanduser(f"~/minio-data/{bucket_name}")
-  rows = [{"name": b["Name"], "created": b["CreationDate"].strftime("%Y-%m-%d %H:%M"), "location": _location(b["Name"])} for b in buckets]
+
+  rows = [{"name": b["Name"], "created": b["CreationDate"].strftime("%Y-%m-%d %H:%M"), "access": _access_label(b["Name"]), "location": _location(b["Name"])} for b in buckets]
   table = make_table(title, [
     {"key": "name", "name": "Project", "justify": "left", "style": "bold"},
+    {"key": "access", "name": "Access", "justify": "left"},
     {"key": "created", "name": "Created", "justify": "left"},
     {"key": "location", "name": "URL" if cloud else "Path", "justify": "left", "style": "dim"},
   ], rows)

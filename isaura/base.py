@@ -20,6 +20,7 @@ from isaura.helpers import (
   MINIO_MULTIPART_CHUNKSIZE,
   MINIO_MAX_CONCURRENCY,
   logger,
+  console,
   rss_mb,
   chunk_row_limit,
   chunk_write_batch_rows,
@@ -1261,16 +1262,18 @@ class _BaseTransfer:
       tp += added
       if added:
         apprx_inputs.extend(chunk[mol_col].astype(str).tolist())
-    wt.finalize(schema_cols=schema_cols)
+    with console.status("Storing to local MinIO...", spinner="dots"):
+      wt.finalize(schema_cols=schema_cols)
+    actual = len(wt.bi.index) if wt.bi.index is not None else tp
     if apprx_inputs:
       try:
         post_apprx(pd.DataFrame({"input": apprx_inputs}), self.collection)
       except Exception as e:
         logger.warning(f"[pull] post_apprx failed: {e}")
     logger.debug(
-      f"[pull] done rows={tp} chunk_limit={self._chunk_row_limit()} output_dim={self._get_output_dimension()} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
+      f"[pull] done rows={actual} chunk_limit={self._chunk_row_limit()} output_dim={self._get_output_dimension()} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
     )
-    return (tp, 0)
+    return (actual, 0)
 
   def _dump(self):
     """Download every object in the bucket to self.output_dir, preserving key paths."""

@@ -89,7 +89,7 @@ def stream_parquet_filtered(
       )
     )
 
-    logger.info(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
+    logger.debug(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
     if progress is not None:
       progress.update(
         stage="starting",
@@ -194,7 +194,7 @@ def stream_parquet_filtered(
               del chunk
             del filtered
 
-        logger.info(
+        logger.debug(
           f"[stream] file {ki + 1}/{len(keys)} done key={key.split('/')[-1]} "
           f"yielded={total_rows_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
         )
@@ -209,7 +209,7 @@ def stream_parquet_filtered(
         except Exception:
           pass
   finally:
-    logger.info(
+    logger.debug(
       f"[stream] finished: files={len(keys)} yielded={total_rows_yielded} "
       f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
     )

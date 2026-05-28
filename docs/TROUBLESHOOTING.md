@@ -201,7 +201,7 @@ Fix:
 * Or validate inputs using inspect:
 
   ```bash
-  isaura inspect inputs -i data/inputs.csv -o reports/inspect_report.csv -m eosxxxx -v v1 -pn myproject
+  isaura inspect --model_id eosxxxx -v v1 --access public -i data/inputs.csv -o reports/inspect_report.csv
   ```
 
 ### Wrong input header
