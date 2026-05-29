@@ -407,6 +407,7 @@ class IsauraReader:
     self.tmpdir = make_temp("isaura_reader_")
     bind_temp_dirs(self, self.tmpdir)
     self.store = MinioStore(endpoint=self.endpoint, access=access_key, secret=secrete)
+    self.store.require_bucket(self.bucket)
     self.duck = DuckDBMinio(endpoint=self.endpoint, access=access_key, secret=secrete)
     self.bi = BloomIndex(
       self.store,
@@ -1413,10 +1414,9 @@ class IsauraInspect:
     return (union, owner)
 
   def list_available(self, output_csv=None):
-    """Return a DataFrame of all stored inputs with columns: input, model_version, access."""
+    """Return a DataFrame of all stored inputs with a single column: input."""
     _, owner = self._indices_union(force=self.cloud)
-    model_version = f"{self.model_id}_{self.model_version}" if self.model_id else (self.model_version or "")
-    df = pd.DataFrame([{"input": smi, "model_version": model_version, "bucket": b} for smi, b in owner.items()])
+    df = pd.DataFrame([{"input": smi} for smi in owner])
     if output_csv:
       df.to_csv(output_csv, index=False)
     return df
@@ -1424,13 +1424,12 @@ class IsauraInspect:
   def inspect_inputs(self, input_csv, output_csv=None):
     """Check which inputs from input_csv are available in the store.
 
-    Returns a DataFrame with columns: input, model_version, access.
+    Returns a DataFrame with a single column: input.
     """
     _, owner = self._indices_union(force=self.cloud)
     with open(input_csv, newline="", encoding="utf-8") as f:
       wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
-    model_version = f"{self.model_id}_{self.model_version}" if self.model_id else (self.model_version or "")
-    df = pd.DataFrame([{"input": s, "model_version": model_version, "bucket": owner[s]} for s in wanted if s in owner])
+    df = pd.DataFrame([{"input": s} for s in wanted if s in owner])
     if output_csv:
       df.to_csv(output_csv, index=False)
     return df

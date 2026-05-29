@@ -79,7 +79,8 @@ def cli():
   pass
 
 
-show_figlet()
+if "--help" in sys.argv or "-h" in sys.argv or len(sys.argv) == 1:
+  show_figlet()
 opt_model = click.option("--model-id", "-m", "model", required=True, help="Ersilia model id (eosxxxx)")
 opt_model_opt = click.option("--model-id", "-m", "model", required=False, default=None, help="Ersilia model id (eosxxxx)")
 opt_version = click.option("--version", "-v", default="v1", show_default=True, help="Model version")
@@ -381,16 +382,30 @@ def destroy(project_name, model, version, yes):
 
 @cli.command("inspect")
 @click.option("--model-id", "-m", "model_id", required=True, help="Ersilia model ID to inspect (e.g. eos4e40)")
-@click.option("--version", "-v", default="v1", show_default=True, help="Model version")
+@click.option("--version", "-v", default=None, help="Model version (default: latest stored version)")
 @click.option("--project-name", "-pn", required=True, help="Project bucket to search (e.g. isaura-public, isaura-private).")
-@click.option("--input", "-i", "input_file", required=False, default=None,
-              help="CSV of molecules to check against the store. If omitted, all stored molecules are returned.")
+@click.option("--input", "-i", "input_file", required=True,
+              help="CSV of molecules to check against the store.")
 @click.option("--output", "-o", "output_file", required=True,
               help="Path to write the results CSV.")
 @click.option("--remote", "-r", "cloud", is_flag=True, default=False,
               help="Query the remote (cloud) store. Default: local MinIO instance.")
 def cmd_inspect(model_id, version, project_name, input_file, output_file, cloud):
-  """Check which molecules from an input CSV are already stored for a model. If no input is given, returns all stored molecules."""
+  """Check which molecules from an input CSV are already stored for a model."""
+  from isaura.base import MinioStore
+  if cloud:
+    from isaura.const import MINIO_ENDPOINT_CLOUD, MINIO_CLOUD_AK, MINIO_CLOUD_SK
+    _store = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=MINIO_CLOUD_AK, secret=MINIO_CLOUD_SK)
+  else:
+    from isaura.const import MINIO_ENDPOINT, MINIO_LOCAL_AK, MINIO_LOCAL_SK
+    _store = MinioStore(endpoint=MINIO_ENDPOINT, access=MINIO_LOCAL_AK, secret=MINIO_LOCAL_SK)
+  _store.require_bucket(project_name)
+  if version is None:
+    try:
+      version = _resolve_version(model_id, project_name, _store)
+      console.print(f"[dim]No version specified — using latest: {version}[/dim]")
+    except Exception:
+      version = "v1"
   insp = IsauraInspect(
     model_id=model_id, model_version=version, project_name=project_name, cloud=cloud
   )
@@ -401,10 +416,7 @@ def cmd_inspect(model_id, version, project_name, input_file, output_file, cloud)
   else:
     ctx = contextlib.nullcontext()
   with ctx:
-    if input_file:
-      df = insp.inspect_inputs(input_file, output_file)
-    else:
-      df = insp.list_available(output_file)
+    df = insp.inspect_inputs(input_file, output_file)
   logger.info(f"wrote {len(df)} rows → {output_file}")
 
 
@@ -536,6 +548,13 @@ def info(cloud):
               help="Path to an isaura folder (used mainly to resolve output defaults).")
 def cmd_stats(project_name, cloud, output_dir, isaura_dir):
   """Generate a JSON inventory of all models stored in a project bucket."""
+  from isaura.base import MinioStore
+  if cloud:
+    from isaura.const import MINIO_ENDPOINT_CLOUD, MINIO_CLOUD_AK, MINIO_CLOUD_SK
+    MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=MINIO_CLOUD_AK, secret=MINIO_CLOUD_SK).require_bucket(project_name)
+  else:
+    from isaura.const import MINIO_ENDPOINT, MINIO_LOCAL_AK, MINIO_LOCAL_SK
+    MinioStore(endpoint=MINIO_ENDPOINT, access=MINIO_LOCAL_AK, secret=MINIO_LOCAL_SK).require_bucket(project_name)
   ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
   out_path = os.path.join(output_dir, f"isaura_stats_{ts}.json")
   st = IsauraStat(project_name=project_name, cloud=cloud, endpoint=None)
