@@ -1,13 +1,14 @@
 [project]
 name = "isaura"
-version = "2.1.29"
+version = "2.2.0"
 description = "A lake of precalculated properties of biomedical entities based on the Ersilia Model Hub"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
   { name = "Miquel Duran Frigola", email = "miquel@ersilia.io" },
   { name = "Abel Legese Shibiru", email = "abel@ersilia.io" },
-  { name = "Marina Miñarro Lleonar", email = "marina@ersilia.io"}
+  { name = "Marina Miñarro Lleonar", email = "marina@ersilia.io"},
+  { name = Ersilia Open Source Initiative, email = "hello@ersilia.io}
 ]
 dependencies = [
     "boto3>=1.40.35",
