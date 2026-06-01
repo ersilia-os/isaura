@@ -8,7 +8,7 @@ authors = [
   { name = "Miquel Duran Frigola", email = "miquel@ersilia.io" },
   { name = "Abel Legese Shibiru", email = "abel@ersilia.io" },
   { name = "Marina Miñarro Lleonar", email = "marina@ersilia.io"},
-  { name = Ersilia Open Source Initiative, email = "hello@ersilia.io}
+  { name = "Ersilia Open Source Initiative", email = "hello@ersilia.io"}
 ]
 dependencies = [
     "boto3>=1.40.35",
