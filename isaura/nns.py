@@ -127,7 +127,7 @@ def post_apprx(df, collection, nlist=None):
   t0 = time.time()
   try:
     with requests.Session() as s:
-      log("start streaming to nns api")
+      logger.debug("start streaming to nns api")
       resp = s.post(
         f"{NNS_ENDPOINT_BASE}/insert",
         params=_get_params(collection),
@@ -136,19 +136,19 @@ def post_apprx(df, collection, nlist=None):
         timeout=None,
       )
     dt = (time.time() - t0) * 1000
-    log(f"done total_ms={dt:.0f}. Body: {resp.text[:1000]}")
+    logger.debug(f"done total_ms={dt:.0f}. Body: {resp.text[:1000]}")
     try:
       start_build_index(collection, nlist=nlist, rebuild=False, wait=False)
       st = build_index_status(collection)
-      logger.info(
+      logger.debug(
         f"index build triggered collection={collection} exists={st.get('exists')} "
         f"building={st.get('is_building')} finished={st.get('is_finished')}"
       )
     except requests.RequestException as e:
-      logger.error(f"index build trigger failed collection={collection}: {e}")
+      logger.debug(f"index build trigger failed collection={collection}: {e}")
     return resp
   except requests.RequestException as e:
-    logger.error(f"approx NN search failed: {e}")
+    logger.debug(f"approx NN search failed: {e}")
     return None
 
 
@@ -188,7 +188,7 @@ def get_apprx(inputs, collection, fallback_search=None):
     results = payload.get("results", [])
     return [x.get("match") for x in results if "match" in x]
   except requests.RequestException as e:
-    logger.error(f"approx NN search failed: {e}")
+    logger.debug(f"approx NN search failed: {e}")
     if callable(fallback_search):
       return fallback_search(inputs, collection)
     return []

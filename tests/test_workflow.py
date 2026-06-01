@@ -15,6 +15,13 @@ def cli(*args):
   return r
 
 
+def cli_fails(*args):
+  """Run a CLI command and assert it exits with a non-zero code."""
+  r = subprocess.run(["isaura", *args], capture_output=True, text=True)
+  assert r.returncode != 0, f"Expected failure but command succeeded: isaura {' '.join(args)}"
+  return r
+
+
 def load_inputs(path):
   with open(path, newline="") as f:
     return {(row.get("input") or row.get("smiles", "")).strip() for row in csv.DictReader(f)} - {""}
@@ -29,7 +36,14 @@ def normalized(df):
   return df.sort_values(ic).reset_index(drop=True)
 
 
+def test_0_create_project(cfg, state):
+  cli("create", "-pn", cfg["src"], "--access", "public")
+  state["created"] = True
+
+
 def test_1_write(cfg, state):
+  if not state.get("created"):
+    pytest.skip("project creation did not pass")
   cli(
     "write",
     "-m",
@@ -38,8 +52,6 @@ def test_1_write(cfg, state):
     cfg["version"],
     "-pn",
     cfg["src"],
-    "--access",
-    "public",
     "-i",
     cfg["input"],
   )
@@ -86,36 +98,36 @@ def test_4_inspect(cfg, state):
   if not state.get("wrote"):
     pytest.skip("write did not pass")
   out = tempfile.mktemp(suffix=".csv")
-  cli("inspect", "-m", cfg["model"], "-v", cfg["version"], "-pn", cfg["src"], "--access", "public", "-o", out)
+  cli(
+    "inspect",
+    "--model-id", cfg["model"],
+    "-v", cfg["version"],
+    "-pn", cfg["src"],
+    "-i", cfg["input"],
+    "-o", out,
+  )
   df = pd.read_csv(out)
   assert len(df) > 0, "inspect returned empty result"
 
 
-def test_5_copy(cfg, state):
+def test_5_persist(cfg, state):
   if not state.get("wrote"):
     pytest.skip("write did not pass")
-  cli("copy", "-m", cfg["model"], "-v", cfg["version"], "-pn", cfg["src"])
-  state["copied"] = True
+  cli("persist", "-m", cfg["model"], "-v", cfg["version"], "-pn", cfg["src"])
+  state["persisted"] = True
 
 
-def test_6_move(cfg, state):
-  if not state.get("wrote"):
-    pytest.skip("write did not pass")
-  cli("move", "-m", cfg["model"], "-v", cfg["version"], "-pn", cfg["src"])
-  state["moved"] = True
+def test_6_destroy_model(cfg, state):
+  if not state.get("persisted"):
+    pytest.skip("persist did not pass")
+  cli("destroy", "-m", cfg["model"], "-v", cfg["version"], "-pn", PUB, "--yes")
 
 
-def test_7_remove_model(cfg, state):
-  if not (state.get("copied") or state.get("moved")):
-    pytest.skip("copy/move did not pass")
-  cli("remove", "-m", cfg["model"], "-v", cfg["version"], "-pn", PUB, "--yes")
+def test_7_destroy_project(cfg, state):
+  cli("destroy", "-pn", cfg["src"], "--yes")
 
 
-def test_8_remove_project(cfg, state):
-  cli("remove", "-pn", cfg["src"], "--yes")
-
-
-def test_9_stats_writes_model_sizes(monkeypatch, tmp_path):
+def test_8_stats_writes_model_sizes(monkeypatch, tmp_path):
   from isaura.cli import cli as isaura_cli
 
   class FakeInspect:
@@ -141,14 +153,16 @@ def test_9_stats_writes_model_sizes(monkeypatch, tmp_path):
     def parquet_columns(self, bucket, parquet_key):
       return ["input", "mol_weight"]
 
+  from isaura.base import MinioStore
   monkeypatch.setattr("isaura.manage.IsauraInspect", FakeInspect)
   monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda mid: {"id": mid})
+  monkeypatch.setattr(MinioStore, "require_bucket", lambda self, b: None)
 
   out_dir = tmp_path / "stats"
   runner = CliRunner()
   result = runner.invoke(
     isaura_cli,
-    ["stats", "-pn", "isaura-test", "--access", "public", "-o", str(out_dir), "-d", "."],
+    ["stats", "-pn", "isaura-test", "-o", str(out_dir)],
   )
 
   assert result.exit_code == 0, result.output
@@ -158,3 +172,96 @@ def test_9_stats_writes_model_sizes(monkeypatch, tmp_path):
   assert data["models_total"] == 1
   assert data["models"][0]["total_bytes"] == 1073742336
   assert data["models"][0]["total_gb"] == 1.000000
+
+
+# ---------------------------------------------------------------------------
+# Negative tests
+# ---------------------------------------------------------------------------
+
+class TestWriteNegative:
+  def test_write_missing_model_id(self, cfg):
+    """write without --model-id must fail."""
+    cli_fails("write", "-pn", cfg["src"], "-v", cfg["version"], "-i", cfg["input"])
+
+  def test_write_missing_project_name(self, cfg):
+    """write without --project-name must fail."""
+    cli_fails("write", "-m", cfg["model"], "-v", cfg["version"], "-i", cfg["input"])
+
+  def test_write_missing_input(self, cfg):
+    """write without --input must fail."""
+    cli_fails("write", "-m", cfg["model"], "-v", cfg["version"], "-pn", cfg["src"])
+
+  def test_write_model_filename_mismatch(self, cfg, tmp_path):
+    """write where filename contains a different model ID must fail."""
+    wrong = tmp_path / "eos9999_output.csv"
+    wrong.write_text("input,value\nCCO,1.0\n")
+    cli_fails("write", "-m", cfg["model"], "-v", cfg["version"], "-pn", cfg["src"], "-i", str(wrong))
+
+
+class TestReadNegative:
+  def test_read_missing_model_id(self, cfg):
+    """read without --model-id must fail."""
+    cli_fails("read", "-pn", cfg["src"], "-i", cfg["input"])
+
+  def test_read_missing_project_name(self, cfg):
+    """read without --project-name must fail."""
+    cli_fails("read", "-m", cfg["model"], "-i", cfg["input"])
+
+  def test_read_missing_input(self, cfg):
+    """read without --input must fail."""
+    cli_fails("read", "-m", cfg["model"], "-pn", cfg["src"])
+
+  def test_read_model_filename_mismatch(self, cfg, tmp_path):
+    """read where output filename contains a different model ID must fail."""
+    out = tmp_path / "eos9999_output.csv"
+    cli_fails("read", "-m", cfg["model"], "-pn", cfg["src"], "-i", cfg["input"], "-o", str(out))
+
+
+class TestInspectNegative:
+  def test_inspect_missing_model_id(self, cfg):
+    """inspect without --model_id must fail."""
+    cli_fails("inspect", "-v", cfg["version"], "--access", "public", "-i", cfg["input"], "-o", "out.csv")
+
+  def test_inspect_missing_input(self, cfg):
+    """inspect without --input must fail."""
+    cli_fails("inspect", "--model_id", cfg["model"], "-v", cfg["version"], "--access", "public", "-o", "out.csv")
+
+  def test_inspect_missing_output(self, cfg):
+    """inspect without --output must fail."""
+    cli_fails("inspect", "--model_id", cfg["model"], "-v", cfg["version"], "--access", "public", "-i", cfg["input"])
+
+  def test_inspect_missing_access(self, cfg):
+    """inspect without --access (and no --project-name) must fail."""
+    cli_fails("inspect", "--model_id", cfg["model"], "-v", cfg["version"], "-i", cfg["input"], "-o", "out.csv")
+
+
+class TestDestroyNegative:
+  def test_destroy_model_without_version(self, cfg):
+    """destroy with --model-id but without --version must fail."""
+    cli_fails("destroy", "-pn", cfg["src"], "-m", cfg["model"], "--yes")
+
+  def test_destroy_reserved_bucket_without_model(self):
+    """destroy of a canonical bucket without specifying a model must fail."""
+    cli_fails("destroy", "-pn", "isaura-public", "--yes")
+
+  def test_destroy_missing_project_name(self, cfg):
+    """destroy without --project-name must fail."""
+    cli_fails("destroy", "-m", cfg["model"], "-v", cfg["version"], "--yes")
+
+
+class TestCatalogNegative:
+  def test_catalog_missing_project_name(self):
+    """catalog without --project-name must print an error and exit cleanly (rc=0 with message)."""
+    r = subprocess.run(["isaura", "catalog"], capture_output=True, text=True)
+    combined = r.stdout + r.stderr
+    assert "project" in combined.lower(), "Expected a helpful message about missing project name"
+
+
+class TestStatsNegative:
+  def test_stats_missing_project_name(self, tmp_path):
+    """stats without --project-name must fail."""
+    cli_fails("stats", "-o", str(tmp_path))
+
+  def test_stats_missing_output_dir(self, cfg):
+    """stats without --output-dir must fail."""
+    cli_fails("stats", "-pn", cfg["src"])

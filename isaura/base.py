@@ -1,4 +1,5 @@
 import boto3, duckdb, gc, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys, time, uuid
+from isaura.const import INPUT_C as _INPUT_C
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from pybloom_live import ScalableBloomFilter
@@ -19,6 +20,7 @@ from isaura.helpers import (
   MINIO_MULTIPART_CHUNKSIZE,
   MINIO_MAX_CONCURRENCY,
   logger,
+  console,
   rss_mb,
   chunk_row_limit,
   chunk_write_batch_rows,
@@ -214,7 +216,7 @@ class MinioStore:
       url = f"{self.endpoint.rstrip('/')}/minio/health/ready"
       resp = requests.get(url, timeout=3)
       if resp.status_code == 200:
-        logger.info(f"MinIO server healthy at {url}")
+        logger.debug(f"MinIO server healthy at {url}")
         return True
       logger.error(
         f"MinIO health check failed. Maybe the minio containers not running[{resp.status_code}]: {resp.text.strip()}"
@@ -225,24 +227,42 @@ class MinioStore:
       logger.error(f"Unexpected error during MinIO health check: {e}")
     return False
 
+  def credential_check(self) -> bool:
+    """Return True if the current credentials are accepted by the server."""
+    try:
+      self.client.list_buckets()
+      return True
+    except Exception:
+      return False
+
   def ensure_bucket(self, bucket):
     """Create the bucket if it does not already exist. Exits on failure."""
     try:
       self.client.head_bucket(Bucket=bucket)
-    except Exception as e:
-      logger.error(e)
+    except Exception:
       try:
         self.client.create_bucket(Bucket=bucket)
       except Exception as e:
         logger.error(e)
         sys.exit(1)
 
+  def require_bucket(self, bucket):
+    """Exit with a helpful error if the bucket does not exist."""
+    try:
+      self.client.head_bucket(Bucket=bucket)
+    except Exception:
+      logger.error(
+        f"Project [bold]{bucket}[/bold] does not exist. "
+        f"Run [bold]isaura info[/bold] to see available projects or [bold]isaura create -pn {bucket} --access <public|private>[/bold] to create it."
+      )
+      sys.exit(1)
+
   def download_file(self, bucket, key, local):
     """Download an object from MinIO to a local path. Raises on missing key."""
     try:
       self.client.download_file(bucket, key, local, Config=self.transfer_config)
     except Exception as e:
-      logger.warning(f"The file {key} is not found in bucket {bucket}. Details -> {e}")
+      logger.debug(f"The file {key} is not found in bucket {bucket}. Details -> {e}")
       raise
 
   def upload_file(self, local, bucket, key, extra_args=None):
@@ -374,24 +394,24 @@ class BloomIndex:
       self.store.download_file(self.bucket, self.bloom_key, self.local_bloom)
       with open(self.local_bloom, "rb") as f:
         self.sbf = pickle.load(f)
-      logger.info(f"loaded bloom {self.bucket}/{self.bloom_key}")
+      logger.debug(f"loaded bloom {self.bucket}/{self.bloom_key}")
     except Exception:
       self.sbf = ScalableBloomFilter(
         mode=ScalableBloomFilter.SMALL_SET_GROWTH, initial_capacity=initial_capacity, error_rate=error_rate
       )
-      logger.info("created new bloom")
+      logger.debug("created new bloom")
     if load_index:
       try:
         self.store.download_file(self.bucket, self.index_key, self.local_index)
         with open(self.local_index, "r", encoding="utf-8") as f:
           self.index = json.load(f)
-        logger.info(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
+        logger.debug(f"loaded index {self.bucket}/{self.index_key} entries={len(self.index)}")
       except Exception:
         self.index = {}
-        logger.info("created new index")
+        logger.debug("created new index")
     else:
       self.index = None
-      logger.info("skipped index load")
+      logger.debug("skipped index load")
     self._added = 0
 
   def seen(self, v):
@@ -609,12 +629,12 @@ class ChunkState:
     keys, t = (self._list_chunks(), "data")
     if not keys:
       self.state[t] = {"next": 1, "open": None, "rows": 0}
-      logger.info("chunk new: next=1")
+      logger.debug("chunk new: next=1")
       return
     last = keys[-1]
     idx = self._chunk_idx(last)
     self.state[t] = {"next": idx + 1, "open": None, "rows": 0}
-    logger.info(f"chunk next: {idx + 1}")
+    logger.debug(f"chunk next: {idx + 1}")
 
   def _list_chunks(self):
     """Return a sorted list of Parquet chunk keys for this model from MinIO."""
@@ -746,7 +766,7 @@ class ChunkState:
     st = self.state["data"]
     remaining = len(rows)
     start = 0
-    logger.info(f"flush: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
+    logger.debug(f"flush: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
     if st["open"]:
       tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
       try:
@@ -759,12 +779,12 @@ class ChunkState:
           st["rows"] += take
           remaining -= take
           start += take
-          logger.info(f"flush: appended chunk idx={st['next']} +{take} -> {st['rows']}")
+          logger.debug(f"flush: appended chunk idx={st['next']} +{take} -> {st['rows']}")
         if st["rows"] >= self.max_rows:
           st["next"] += 1
           st["open"] = None
           st["rows"] = 0
-          logger.info(f"flush: closed chunk next={st['next']}")
+          logger.debug(f"flush: closed chunk next={st['next']}")
       finally:
         try:
           os.remove(tmp)
@@ -777,12 +797,12 @@ class ChunkState:
       if take < self.max_rows:
         st["open"] = os_key
         st["rows"] = take
-        logger.info(f"flush: new open chunk idx={st['next']} rows={take}")
+        logger.debug(f"flush: new open chunk idx={st['next']} rows={take}")
       else:
         st["next"] += 1
         st["open"] = None
         st["rows"] = 0
-        logger.info(f"flush: full chunk idx={st['next'] - 1} rows={take}")
+        logger.debug(f"flush: full chunk idx={st['next'] - 1} rows={take}")
       remaining -= take
       start += take
 
@@ -801,7 +821,7 @@ class ChunkState:
     st = self.state["data"]
     remaining = len(df)
     start = 0
-    logger.info(f"flush_df: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
+    logger.debug(f"flush_df: chunk rows={remaining} cols={len(schema_cols or [])} limit={self.max_rows}")
     if st["open"]:
       tmp = os.path.join(self.tmpdir, f"open_{uuid.uuid4().hex}.parquet")
       try:
@@ -814,7 +834,7 @@ class ChunkState:
           st["rows"] += take
           remaining -= take
           start += take
-          logger.info(f"flush_df: appended chunk idx={st['next']} +{take} -> {st['rows']}")
+          logger.debug(f"flush_df: appended chunk idx={st['next']} +{take} -> {st['rows']}")
         if st["rows"] >= self.max_rows:
           st["next"] += 1
           st["open"] = None
@@ -910,14 +930,14 @@ class _SinkWriter:
       added = len(new_df)
       self.last_added_inputs = []
       if added == 0:
-        logger.info(f"[sink] in={n_in} added=0 seen={skipped_seen} blank={skipped_blank}")
+        logger.debug(f"[sink] in={n_in} added=0 seen={skipped_seen} blank={skipped_blank}")
         return 0
       self.last_added_inputs = inputs.loc[not_seen].tolist()
       for smi in inputs.loc[not_seen]:
         self.bi.register(smi, rc=(1, 1))
       self.buffers.append(new_df)
       self.buf_rows += added
-      logger.info(
+      logger.debug(
         f"[sink] in={n_in} added={added} seen={skipped_seen} blank={skipped_blank} buf={self.buf_rows}/{self.max_rows}"
       )
       if self.buf_rows >= self.max_rows:
@@ -933,7 +953,7 @@ class _SinkWriter:
     if not parts:
       return
     merged = pd.concat(parts, ignore_index=True)
-    logger.info(f"[sink] flushing {len(merged)} rows")
+    logger.debug(f"[sink] flushing {len(merged)} rows")
     self.chunk_state.flush_df(merged, self.schema_cols)
     self.buffers = []
     self.buf_rows = 0
@@ -989,7 +1009,7 @@ def upload_catalog_json(store, bucket, base_prefix, entries, chunks, tmpdir):
       json.dump(cat, f, separators=(",", ":"))
     key = f"{base_prefix.strip('/')}/{CATALOG_FILE}"
     store.upload_file(local, bucket, key)
-    logger.info(f"[catalog] {CATALOG_FILE} -> {bucket}/{key} entries={entries} chunks={chunks}")
+    logger.debug(f"[catalog] {CATALOG_FILE} -> {bucket}/{key} entries={entries} chunks={chunks}")
   except Exception as e:
     logger.warning(f"catalog.json upload failed: {e}")
   finally:
@@ -1026,6 +1046,7 @@ class _BaseTransfer:
     self.tranches = get_base(model_id, model_version)
     self.collection = get_coll(self.model_id, self.model_version)
     self.store = MinioStore()
+    self.store.require_bucket(self.bucket)
     self.tmpdir = make_temp("isaura_xfer_")
     self.tmpdir_sinkw = make_temp("isaura_sinkw_")
     bind_temp_dirs(self, self.tmpdir, self.tmpdir_sinkw)
@@ -1142,20 +1163,20 @@ class _BaseTransfer:
         DataFrames of matching rows.
     """
     n = len(wanted) if hasattr(wanted, "__len__") else None
-    logger.info(
+    logger.debug(
       f"[select_rows_batched] starting n={n} input_col={input_col} batch_size={batch_size} bucket={self.bucket}"
     )
     source = None
     try:
       if n is not None and n >= STREAM_PARQUET_THRESHOLD:
         prefix = hive_prefix(self.tranches) + "/"
-        logger.info(f"[select_rows_batched] streaming mode n={n} bucket={self.bucket} prefix={prefix}")
+        logger.debug(f"[select_rows_batched] streaming mode n={n} bucket={self.bucket} prefix={prefix}")
         source = stream_parquet_filtered(
           self.store, self.bucket, prefix, wanted, header=input_col, batch_size=batch_size
         )
       else:
         files = list_parquet_keys(self.store, self.bucket, self.tranches)
-        logger.info(
+        logger.debug(
           f"[select_rows_batched] duckdb mode n={n} bucket={self.bucket} files={(len(files) if isinstance(files, list) else files)}"
         )
         source = query_batched(
@@ -1196,7 +1217,8 @@ class _BaseTransfer:
     apprx_inputs = []
     _tp = wt.add_rows(df)
     if _tp != 0:
-      apprx_inputs.extend(df["input"].astype(str).tolist())
+      mol_col = next((c for c in _INPUT_C if c in df.columns), df.columns[0])
+      apprx_inputs.extend(df[mol_col].astype(str).tolist())
     tp += _tp
     if wt:
       wt.finalize(schema_cols=list(df.keys()))
@@ -1204,7 +1226,7 @@ class _BaseTransfer:
       apprx_df = pd.DataFrame({"input": apprx_inputs})
       post_apprx(apprx_df, self.collection)
       del apprx_df
-    logger.info(f"[pull] done rows={tp} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB")
+    logger.debug(f"[pull] done rows={tp} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB")
     return (tp, tu)
 
   def _pull_batched(self, chunks):
@@ -1229,25 +1251,29 @@ class _BaseTransfer:
     tp = 0
     apprx_inputs = []
     schema_cols = None
+    mol_col = None
     for chunk in chunks:
       if chunk is None or chunk.empty:
         continue
       if schema_cols is None:
         schema_cols = list(chunk.columns)
+        mol_col = next((c for c in _INPUT_C if c in chunk.columns), schema_cols[0])
       added = wt.add_rows(chunk)
       tp += added
       if added:
-        apprx_inputs.extend(chunk["input"].astype(str).tolist())
-    wt.finalize(schema_cols=schema_cols)
+        apprx_inputs.extend(chunk[mol_col].astype(str).tolist())
+    with console.status("Storing to local MinIO...", spinner="dots"):
+      wt.finalize(schema_cols=schema_cols)
+    actual = len(wt.bi.index) if wt.bi.index is not None else tp
     if apprx_inputs:
       try:
         post_apprx(pd.DataFrame({"input": apprx_inputs}), self.collection)
       except Exception as e:
         logger.warning(f"[pull] post_apprx failed: {e}")
-    logger.info(
-      f"[pull] done rows={tp} chunk_limit={self._chunk_row_limit()} output_dim={self._get_output_dimension()} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
+    logger.debug(
+      f"[pull] done rows={actual} chunk_limit={self._chunk_row_limit()} output_dim={self._get_output_dimension()} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
     )
-    return (tp, 0)
+    return (actual, 0)
 
   def _dump(self):
     """Download every object in the bucket to self.output_dir, preserving key paths."""
@@ -1342,7 +1368,7 @@ class _BaseTransfer:
       del df
       if n_batches % 20 == 0:
         gc.collect()
-        logger.info(
+        logger.debug(
           f"[copy] batch={n_batches} priv={tp} pub={tu} elapsed={time.time() - t0:.1f}s rss={rss_mb():.0f}MB"
         )
     if w_priv:
@@ -1361,7 +1387,7 @@ class _BaseTransfer:
     gc.collect()
     elapsed = time.time() - t0
     rate = total / elapsed if elapsed > 0 else 0
-    logger.success(
+    logger.debug(
       f"[copy] done priv={tp} pub={tu} total={total} elapsed={elapsed:.1f}s rate={rate:.0f}/s rss={rss_mb():.0f}MB"
     )
     return (tp, tu)

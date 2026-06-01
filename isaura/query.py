@@ -85,7 +85,7 @@ def query_batched(
   wanted_list = list(wanted)
   src, src_desc = _src_expr(file_glob)
 
-  logger.info(
+  logger.debug(
     f"[query_batched] inputs={len(wanted_list)} "
     f"batch_size={batch_size} mem={mem_lim}GB threads={threads} src={src_desc}"
   )
@@ -127,7 +127,7 @@ def query_batched(
     conn.unregister("__wanted_inputs")
 
   dt = time.perf_counter() - t0
-  logger.info(f"[query_batched] done rows={total_rows} batches={n_batches} elapsed={dt:.2f}s rss={rss_mb():.0f}MB")
+  logger.debug(f"[query_batched] done rows={total_rows} batches={n_batches} elapsed={dt:.2f}s rss={rss_mb():.0f}MB")
 
 
 def chunked_query_batched(

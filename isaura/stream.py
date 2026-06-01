@@ -5,7 +5,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from isaura.const import STREAM_DENSE_BATCH_ROWS, STREAM_DENSE_FILE_RATIO
+from isaura.const import INPUT_C, STREAM_DENSE_BATCH_ROWS, STREAM_DENSE_FILE_RATIO
 from isaura.logging import logger
 from isaura.utils import cleanup_temp_dir, make_temp, rss_mb
 
@@ -89,7 +89,7 @@ def stream_parquet_filtered(
       )
     )
 
-    logger.info(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
+    logger.debug(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
     if progress is not None:
       progress.update(
         stage="starting",
@@ -123,13 +123,16 @@ def stream_parquet_filtered(
           bool(dense_file_ratio) and n_rows > 0 and remaining >= max(1, int(n_rows * dense_file_ratio))
         )
 
+        schema_names = set(pf.schema_arrow.names)
+        parquet_col = next((c for c in [header] + INPUT_C if c in schema_names), header)
+
         if use_dense:
           dense_batch_rows = max(batch_size, STREAM_DENSE_BATCH_ROWS)
           for batch in pf.iter_batches(batch_size=dense_batch_rows):
             if remaining <= 0:
               break
             table = pa.Table.from_batches([batch])
-            mask = pc.is_in(table.column(header), wanted_arr)
+            mask = pc.is_in(table.column(parquet_col), wanted_arr)
             if pc.any(mask).as_py() is not True:
               continue
             filtered = table.filter(mask)
@@ -137,6 +140,8 @@ def stream_parquet_filtered(
               continue
             for start in range(0, filtered.num_rows, batch_size):
               chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+              if parquet_col != header:
+                chunk = chunk.rename(columns={parquet_col: header})
               matched = set(chunk[header].astype(str).str.strip())
               remaining -= len(matched & wanted_set)
               wanted_set -= matched
@@ -157,7 +162,7 @@ def stream_parquet_filtered(
           for rg_idx in range(n_rg):
             if remaining <= 0:
               break
-            key_col = pf.read_row_group(rg_idx, columns=[header]).column(header)
+            key_col = pf.read_row_group(rg_idx, columns=[parquet_col]).column(parquet_col)
             mask = pc.is_in(key_col, wanted_arr)
             if pc.any(mask).as_py() is not True:
               del key_col, mask
@@ -169,6 +174,8 @@ def stream_parquet_filtered(
               continue
             for start in range(0, filtered.num_rows, batch_size):
               chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+              if parquet_col != header:
+                chunk = chunk.rename(columns={parquet_col: header})
               matched = set(chunk[header].astype(str).str.strip())
               remaining -= len(matched & wanted_set)
               wanted_set -= matched
@@ -187,7 +194,7 @@ def stream_parquet_filtered(
               del chunk
             del filtered
 
-        logger.info(
+        logger.debug(
           f"[stream] file {ki + 1}/{len(keys)} done key={key.split('/')[-1]} "
           f"yielded={total_rows_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
         )
@@ -202,7 +209,7 @@ def stream_parquet_filtered(
         except Exception:
           pass
   finally:
-    logger.info(
+    logger.debug(
       f"[stream] finished: files={len(keys)} yielded={total_rows_yielded} "
       f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
     )

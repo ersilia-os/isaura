@@ -124,13 +124,13 @@ MINIO_PRIV_CLOUD_SK="<secret_key>"
 
 * ☁️ Set `MINIO_ENDPOINT_CLOUD`
 * 🔐 Export the correct cloud credentials (public and/or private)
-* 🧭 Use `--cloud` where supported (or cloud-enabled Python classes)
+* 🧭 Use `--remote` where supported (or cloud-enabled Python classes)
 
 ---
 
 ## 🧷 Notes
 
-* 🔎 ANN mode depends on the NN service and an index being built; if ANN fails, fall back to exact search.
+* 🔎 Approximate (ANN) search is available in the Python API but disabled in the CLI. It depends on the NNS service being running and an index being built.
 
 ---
 

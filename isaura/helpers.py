@@ -12,7 +12,7 @@ from isaura.nns import (  # noqa: F401
   group_inputs, post_apprx, start_build_index,
 )
 from isaura.metadata import (  # noqa: F401
-  fetch_schema_from_github, output_dimension_from_metadata,
+  fetch_schema_from_github, get_engine_status, output_dimension_from_metadata,
   pick_meta, run_docker_compose, show_figlet,
   tranche_coordinates, write_access_file,
 )

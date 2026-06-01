@@ -7,6 +7,7 @@ from rich.progress import (
   SpinnerColumn,
   TextColumn,
   BarColumn,
+  TaskProgressColumn,
   TimeElapsedColumn,
   TimeRemainingColumn,
 )
@@ -34,6 +35,7 @@ from isaura.helpers import (
   release_temp_dirs,
   chunk_row_limit,
   logger,
+  console,
   output_dimension_from_metadata,
   rss_mb,
   fetch_schema_from_github,
@@ -152,7 +154,6 @@ class IsauraWriter:
     input_csv,
     model_id,
     model_version,
-    access="public",
     bucket=None,
     endpoint=None,
     access_key=None,
@@ -161,7 +162,6 @@ class IsauraWriter:
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
-    self.access = access
     self.bucket = bucket or PUB
     self.base_prefix = get_base(self.model_id, model_version)
     self.access_key = get_acc_key(self.base_prefix)
@@ -169,8 +169,9 @@ class IsauraWriter:
     self.output_dimension = output_dimension_from_metadata(self.model_meta)
     self.max_rows = int(chunk_row_limit(self.output_dimension))
     self.store = MinioStore(endpoint=endpoint, access=access_key, secret=secrete)
-    self.store.ensure_bucket(self.bucket)
+    self.store.require_bucket(self.bucket)
     self.tmpdir = make_temp("isaura_writter_")
+    self.access = self._read_bucket_access()
     bind_temp_dirs(self, self.tmpdir)
     self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
     self.bi = BloomIndex(
@@ -191,9 +192,23 @@ class IsauraWriter:
     self.buffers = []
     self.buf_rows = 0
     self.schema_cols = None
-    logger.info(
+    logger.debug(
       f"writer init: bucket={self.bucket} base={self.base_prefix} csv={self.input_csv} output_dim={self.output_dimension} chunk_limit={self.max_rows}"
     )
+
+  def _read_bucket_access(self):
+    """Resolve access level: hardcoded for canonical buckets, read from access.json for custom ones."""
+    if self.bucket == PUB:
+      return "public"
+    if self.bucket == PRI:
+      return "private"
+    local = os.path.join(self.tmpdir, f"bucket_access_{uuid.uuid4().hex}.json")
+    try:
+      self.store.download_file(self.bucket, ACCESS_FILE, local)
+      with open(local, "r", encoding="utf-8") as f:
+        return json.load(f).get("access", "public")
+    except Exception:
+      return "public"
 
   def _load_metadata(self):
     """Download and parse the existing access metadata file, or return None if absent."""
@@ -218,7 +233,7 @@ class IsauraWriter:
       existed = self._load_metadata()
       write_access_file(existed, inputs, self.access, self.metadata_path)
       self.store.upload_file(self.metadata_path, self.bucket, f"{self.base_prefix}/{ACCESS_FILE}")
-      logger.info(f"{ACCESS_FILE} -> minio://{self.bucket}/{self.base_prefix}/{ACCESS_FILE}")
+      logger.debug(f"{ACCESS_FILE} -> minio://{self.bucket}/{self.base_prefix}/{ACCESS_FILE}")
     except Exception as e:
       logger.warning(f"metadata upload failed: {e}")
 
@@ -226,7 +241,7 @@ class IsauraWriter:
     """Infer and store column schema from the first row seen."""
     if self.schema_cols is None:
       self.schema_cols = list(row.keys())
-      logger.info(f"writer schema: {self.schema_cols[:10]}")
+      logger.debug(f"writer schema: {self.schema_cols[:10]}")
 
   def _flush_if_needed(self):
     """Flush the in-memory buffer to MinIO if it has reached max_rows."""
@@ -250,46 +265,45 @@ class IsauraWriter:
     """
     total = dupes = 0
     new = []
+    old_entries = len(self.bi.index) if self.bi.index is not None else 0
     if df is not None:
       total_rows = len(df)
       chunk_iter = (
         df.iloc[start : start + WRITE_INPUT_CHUNK_ROWS] for start in range(0, len(df), WRITE_INPUT_CHUNK_ROWS)
       )
     else:
-      total_rows = None
+      try:
+        with open(self.input_csv, "rb") as _f:
+          total_rows = sum(1 for _ in _f) - 1  # subtract header
+      except Exception:
+        total_rows = None
       chunk_iter = pd.read_csv(self.input_csv, chunksize=WRITE_INPUT_CHUNK_ROWS)
     progress = None
     task_id = None
     try:
       if show_progress:
-        if total_rows is None:
-          progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TextColumn("{task.completed} rows"),
-            TimeElapsedColumn(),
-            console=logger.console,
-            transient=True,
-          )
-        else:
-          progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=logger.console,
-            transient=True,
-          )
+        progress = Progress(
+          SpinnerColumn(),
+          TextColumn("[progress.description]{task.description}"),
+          BarColumn(),
+          TaskProgressColumn(text_format="[bold bright_cyan]{task.percentage:>3.0f}%[/]"),
+          TextColumn("{task.completed}" + ("/{task.total}" if total_rows else "")),
+          TimeElapsedColumn(),
+          TimeRemainingColumn(),
+          console=logger.console,
+          transient=False,
+        )
         progress.__enter__()
-        task_id = progress.add_task("Writing rows", total=total_rows)
+        task_id = progress.add_task(
+          f"Writing [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]",
+          total=total_rows,
+        )
       for chunk in chunk_iter:
         if chunk is None or chunk.empty:
           continue
         if self.schema_cols is None:
           self.schema_cols = list(chunk.columns)
-          logger.info(f"writer schema: {self.schema_cols[:10]}")
+          logger.debug(f"writer schema: {self.schema_cols[:10]}")
         if "input" in chunk.columns:
           inputs = chunk["input"].astype(str).str.strip()
         elif "smiles" in chunk.columns:
@@ -329,7 +343,10 @@ class IsauraWriter:
     entries = len(self.bi.index) if self.bi.index is not None else 0
     chunks = len(self.chunk_state._list_chunks())
     upload_catalog_json(self.store, self.bucket, self.base_prefix, entries, chunks, self.tmpdir)
-    logger.info(f"write done: new={total} dupes={dupes}")
+    actual_new = entries - old_entries
+    actual_dupes = (total + dupes) - actual_new
+    dupes_str = f", [dim]{actual_dupes} duplicates skipped[/dim]" if actual_dupes else ""
+    console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] → [bold]{self.bucket}[/bold]: [bold]{actual_new}[/bold] molecules written{dupes_str}")
 
   def close(self):
     """Release temporary directories created during construction."""
@@ -390,6 +407,7 @@ class IsauraReader:
     self.tmpdir = make_temp("isaura_reader_")
     bind_temp_dirs(self, self.tmpdir)
     self.store = MinioStore(endpoint=self.endpoint, access=access_key, secret=secrete)
+    self.store.require_bucket(self.bucket)
     self.duck = DuckDBMinio(endpoint=self.endpoint, access=access_key, secret=secrete)
     self.bi = BloomIndex(
       self.store,
@@ -406,7 +424,7 @@ class IsauraReader:
       self.model_meta = {}
     self.output_dimension = output_dimension_from_metadata(self.model_meta)
     self.wide_model = self.output_dimension is not None and self.output_dimension >= 100
-    logger.info(
+    logger.debug(
       f"reader init bucket={self.bucket} base={self.base} csv={self.input_csv} output_dim={self.output_dimension} wide={self.wide_model}"
     )
 
@@ -425,6 +443,8 @@ class IsauraReader:
     Returns:
         Tuple of (list_of_input_strings, column_header_name).
     """
+    if df is None and hasattr(self, "_cached_wanted"):
+      return self._cached_wanted
     wanted, header_set = ([], set())
     rows = df.to_dict("records") if df is not None else None
     if rows is None:
@@ -448,7 +468,9 @@ class IsauraReader:
         if h:
           header_set.add(h)
     header = list(header_set)[0] if header_set else "smiles"
-    logger.info(f"[read:wanted] collected inputs={len(wanted)} header={header}")
+    logger.debug(f"[read:wanted] collected inputs={len(wanted)} header={header}")
+    if df is None:
+      self._cached_wanted = (wanted, header)
     return (wanted, header)
 
   def _prepare_read(self, df=None):
@@ -461,11 +483,13 @@ class IsauraReader:
     Returns:
         Tuple of (start_time, resolved_wanted_list, header_column_name).
     """
+    if hasattr(self, "_cached_prepare"):
+      return self._cached_prepare
     index = None
     t0 = time.time()
     wanted, header = self._wanted(df=df)
     if self.approximate:
-      logger.info(f"[read:prepare] approximate mode — loading index for collection={self.collection}")
+      logger.debug(f"[read:prepare] approximate mode — loading index for collection={self.collection}")
       index = self._load_index()
       if index and len(index) < MIN_NNS_RESULT_SIZE:
         logger.error(
@@ -475,22 +499,51 @@ class IsauraReader:
       st = time.perf_counter()
       wanted = get_apprx(wanted, self.collection)
       et = time.perf_counter()
-      logger.info(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
+      logger.debug(f"Approximate inputs are retrieved {len(wanted)} in {et - st:.2f} seconds!")
       group_inputs(wanted, index, bloom=self.bi)
     else:
-      logger.info(f"[read:prepare] exact mode — checking bloom filter for {len(wanted)} inputs")
+      logger.debug(f"[read:prepare] exact mode — checking bloom filter for {len(wanted)} inputs")
       bloom_t0 = time.perf_counter()
       missing = [v for v in wanted if not self.bi.seen(v)]
       bloom_dt = time.perf_counter() - bloom_t0
-      logger.info(f"[read:prepare] bloom check done in {bloom_dt:.3f}s missing={len(missing)}")
+      logger.debug(f"[read:prepare] bloom check done in {bloom_dt:.3f}s missing={len(missing)}")
       if missing:
         logger.error(
           f"inputs not indexed: {missing[:5]}{('...' if len(missing) > 5 else '')} total_missing={len(missing)}"
         )
         sys.exit(1)
     prep_dt = time.time() - t0
-    logger.info(f"[read:prepare] ready inputs={len(wanted)} header={header} prep_time={prep_dt:.2f}s")
-    return (t0, wanted, header)
+    logger.debug(f"[read:prepare] ready inputs={len(wanted)} header={header} prep_time={prep_dt:.2f}s")
+    self._cached_prepare = (t0, wanted, header)
+    return self._cached_prepare
+
+  def _detect_parquet_col(self, header):
+    """Return the molecule column name actually used in stored Parquet files.
+
+    Downloads the first chunk file and inspects its schema. Falls back to
+    header if no known INPUT_C column is found.
+    """
+    prefix = hive_prefix(self.base) + "/"
+    try:
+      keys = [
+        obj["Key"]
+        for obj in self.store.list_keys(self.bucket, prefix)
+        if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
+      ]
+      if not keys:
+        return header
+      local = os.path.join(self.tmpdir, f"schema_probe_{uuid.uuid4().hex}.parquet")
+      try:
+        self.store.download_file(self.bucket, keys[0], local)
+        schema_names = set(pq.ParquetFile(local).schema_arrow.names)
+        return next((c for c in [header] + INPUT_C if c in schema_names), header)
+      finally:
+        try:
+          os.remove(local)
+        except Exception:
+          pass
+    except Exception:
+      return header
 
   def _make_read_source(self, wanted, header, batch_size=10000, ordered=True):
     """Choose a read strategy and return (mode, payload).
@@ -506,17 +559,28 @@ class IsauraReader:
     n = len(wanted)
     if self.wide_model:
       prefix = hive_prefix(self.base) + "/"
-      logger.info(f"[read] wide streaming n={n} bucket={self.bucket}")
+      logger.debug(f"[read] wide streaming n={n} bucket={self.bucket}")
       return "wide", prefix
     if n >= STREAM_PARQUET_THRESHOLD:
       prefix = hive_prefix(self.base) + "/"
-      logger.info(f"[read] streaming n={n} bucket={self.bucket}")
+      logger.debug(f"[read] streaming n={n} bucket={self.bucket}")
       return "stream", prefix
     files = list_parquet_keys(self.store, self.bucket, self.base)
-    logger.info(f"[read] duckdb n={n} bucket={self.bucket}")
-    return "duckdb", query_batched(
-      self.duck.con, header, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=ordered
+    parquet_col = self._detect_parquet_col(header)
+    logger.debug(f"[read] duckdb n={n} bucket={self.bucket}")
+    raw = query_batched(
+      self.duck.con, parquet_col, wanted, files, batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=ordered
     )
+    if parquet_col == header:
+      return "duckdb", raw
+
+    def _rename(batches, src, dst):
+      for chunk in batches:
+        if src in chunk.columns:
+          chunk = chunk.rename(columns={src: dst})
+        yield chunk
+
+    return "duckdb", _rename(raw, parquet_col, header)
 
   def _load_index(self):
     """Download and parse the JSON index for this model. Returns [] on failure."""
@@ -608,13 +672,13 @@ class IsauraReader:
     """
     t0, wanted, header = self._prepare_read(df=df)
     if not wanted:
-      logger.info("[read] no inputs — returning empty frame")
+      logger.debug("[read] no inputs — returning empty frame")
       return pd.DataFrame()
     try:
       total_rows = 0
       n_chunks = 0
       mode, payload = self._make_read_source(wanted, header, ordered=True)
-      with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
+      with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
           source = stream_parquet_filtered(
             self.store,
@@ -650,7 +714,7 @@ class IsauraReader:
           result = self._reorder(wanted, header, result)
           total_rows = len(result)
       if output_csv and not result.empty:
-        logger.info(f"[read] writing csv to {output_csv}")
+        logger.debug(f"[read] writing csv to {output_csv}")
         with StreamingCsvSink(output_csv) as sink:
           sink.write_df(result)
         out = pd.DataFrame()
@@ -659,12 +723,12 @@ class IsauraReader:
       else:
         out = result
       elapsed = time.time() - t0
-      logger.success(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
+      logger.debug(f"Query successfully fetched for a given inputs in {elapsed:.2f} sec")
     except Exception as e:
       logger.error(f"[read] query failed: {e}")
       sys.exit(1)
     rate = total_rows / elapsed if elapsed > 0 and total_rows else 0.0
-    logger.info(
+    logger.debug(
       f"[read] done model={self.pref} inputs={len(wanted)} matched={total_rows} "
       f"chunks={n_chunks} elapsed={time.time() - t0:.2f}s rate={rate:.1f}/s rss={rss_mb():.0f}MB"
     )
@@ -694,7 +758,7 @@ class IsauraReader:
     source = None
     try:
       mode, payload = self._make_read_source(wanted, header, batch_size=batch_size, ordered=True)
-      with ReadProgress(total_inputs=len(wanted), console=logger.console) as progress:
+      with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
           raw_parts = []
           for chunk in stream_parquet_filtered(
@@ -727,7 +791,7 @@ class IsauraReader:
         else:
           source = payload
         if output_csv:
-          logger.info(f"[read_batched] streaming csv to {output_csv}")
+          logger.debug(f"[read_batched] streaming csv to {output_csv}")
           sink = StreamingCsvSink(output_csv)
           sink.__enter__()
         for chunk in source:
@@ -745,13 +809,13 @@ class IsauraReader:
     finally:
       if sink is not None:
         sink.__exit__(None, None, None)
-        logger.info(f"[read_batched] csv closed rows={total_rows} path={output_csv}")
+        logger.debug(f"[read_batched] csv closed rows={total_rows} path={output_csv}")
       close = getattr(source, "close", None)
       if close is not None:
         close()
     elapsed = time.time() - t0
     rate = total_rows / elapsed if elapsed > 0 and total_rows else 0.0
-    logger.success(
+    logger.debug(
       f"[read_batched] done model={self.pref} inputs={len(wanted)} matched={total_rows} "
       f"chunks={n_chunks} elapsed={elapsed:.2f}s rate={rate:.1f}/s rss={rss_mb():.0f}MB"
     )
@@ -767,7 +831,7 @@ class IsauraCopy(_BaseTransfer):
 
   def copy(self):
     """Run the copy operation. Loads access metadata and routes rows to the right buckets."""
-    logger.info(f"[copy] starting model={self.model_id} v={self.model_version} bucket={self.bucket}")
+    logger.debug(f"[copy] starting model={self.model_id} v={self.model_version} bucket={self.bucket}")
     meta_local, meta = self._load_metadata()
     return self._copy(meta_local, meta)
 
@@ -810,6 +874,204 @@ class IsauraRemover(_BaseTransfer):
       logger.info(f"removed objects={n}")
 
 
+class IsauraMolRemover:
+  """Removes specific molecules from a model's stored data in a bucket.
+
+  Downloads each Parquet chunk, filters out the requested rows, and re-uploads
+  the modified chunks. Rebuilds the Bloom filter and JSON index from scratch,
+  and updates the per-model access.json and catalog.json.
+
+  Args:
+      model_id: Ersilia model identifier.
+      model_version: Model version string.
+      bucket: Target MinIO bucket.
+      input_csv: Path to a CSV file with an "input" or "smiles" column.
+  """
+
+  def __init__(self, model_id, model_version, bucket, input_csv):
+    self.model_id = model_id
+    self.model_version = model_version
+    self.bucket = bucket
+    self.input_csv = input_csv
+    self.base_prefix = get_base(model_id, model_version)
+    self.store = MinioStore()
+    self.store.require_bucket(bucket)
+    self.tmpdir = make_temp("isaura_mol_remover_")
+    bind_temp_dirs(self, self.tmpdir)
+
+  def _read_inputs(self):
+    """Parse the input CSV and return a list of molecule strings."""
+    inputs = []
+    with open(self.input_csv, newline="", encoding="utf-8") as f:
+      for row in csv.DictReader(f):
+        v = (row.get("input") or row.get("smiles") or "").strip()
+        if v:
+          inputs.append(v)
+    return inputs
+
+  def _list_chunk_keys(self):
+    """Return a sorted list of Parquet chunk keys for this model."""
+    pref = hive_prefix(self.base_prefix) + "/"
+    keys = [
+      obj["Key"] for obj in self.store.list_keys(self.bucket, pref)
+      if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
+    ]
+    def _idx(key):
+      try:
+        return int(os.path.basename(key).split("_")[1].split(".")[0])
+      except Exception:
+        return 0
+    return sorted(keys, key=_idx)
+
+  def _rewrite_chunk(self, chunk_key, to_remove):
+    """Download a chunk, filter out to_remove rows, re-upload (or delete if empty).
+
+    Returns:
+        Tuple of (rows_before, rows_after).
+    """
+    import pyarrow as pa
+    local = os.path.join(self.tmpdir, f"chunk_dl_{uuid.uuid4().hex}.parquet")
+    local_out = os.path.join(self.tmpdir, f"chunk_out_{uuid.uuid4().hex}.parquet")
+    try:
+      self.store.download_file(self.bucket, chunk_key, local)
+      pf = pq.ParquetFile(local)
+      schema_names = pf.schema_arrow.names
+      input_col = next((c for c in ["input", "smiles"] if c in schema_names), schema_names[0])
+      rows_before = pf.metadata.num_rows
+      df = pf.read().to_pandas()
+      mask = ~df[input_col].astype(str).str.strip().isin(to_remove)
+      filtered = df.loc[mask].reset_index(drop=True)
+      rows_after = len(filtered)
+      if rows_after == 0:
+        self.store.client.delete_object(Bucket=self.bucket, Key=chunk_key)
+        logger.debug(f"[remove] deleted empty chunk {chunk_key}")
+      else:
+        table = pa.Table.from_pandas(filtered, preserve_index=False)
+        pq.write_table(table, local_out)
+        self.store.upload_file(local_out, self.bucket, chunk_key)
+        logger.debug(f"[remove] rewrote chunk {chunk_key}: {rows_before}→{rows_after} rows")
+      return (rows_before, rows_after)
+    except Exception as e:
+      logger.error(f"[remove] chunk {chunk_key}: {e}")
+      return (0, 0)
+    finally:
+      for f in [local, local_out]:
+        try:
+          os.remove(f)
+        except Exception:
+          pass
+
+  def _update_access_json(self, to_remove):
+    """Remove deleted molecules from the per-model access.json and re-upload."""
+    acc_key = get_acc_key(self.base_prefix)
+    local = os.path.join(self.tmpdir, f"access_upd_{uuid.uuid4().hex}.json")
+    try:
+      self.store.download_file(self.bucket, acc_key, local)
+      with open(local, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if isinstance(data, list):
+        filtered = [d for d in data if (d.get("input") or "").strip() not in to_remove]
+        with open(local, "w", encoding="utf-8") as f:
+          json.dump(filtered, f, indent=2)
+        self.store.upload_file(local, self.bucket, acc_key)
+        logger.debug(f"[remove] access.json: {len(data)}→{len(filtered)}")
+    except Exception as e:
+      logger.debug(f"[remove] access.json update skipped: {e}")
+    finally:
+      try:
+        os.remove(local)
+      except Exception:
+        pass
+
+  def remove(self, show_progress=True):
+    """Remove the specified molecules from the store.
+
+    Returns:
+        Tuple of (n_removed, n_not_found).
+    """
+    to_remove_list = self._read_inputs()
+    if not to_remove_list:
+      logger.error("No valid molecules found in input file.")
+      sys.exit(1)
+    to_remove = set(to_remove_list)
+
+    bi = BloomIndex(self.store, self.bucket, self.base_prefix, self.tmpdir)
+    if not bi.index:
+      logger.error(f"No index found for {self.model_id}/{self.model_version} in {self.bucket}.")
+      sys.exit(1)
+
+    actually_present = to_remove & set(bi.index.keys())
+    n_not_found = len(to_remove) - len(actually_present)
+
+    if not actually_present:
+      return (0, len(to_remove))
+
+    chunk_keys = self._list_chunk_keys()
+    if not chunk_keys:
+      logger.error("No chunk files found.")
+      sys.exit(1)
+
+    total_removed = 0
+    progress = None
+    task_id = None
+    try:
+      if show_progress:
+        progress = Progress(
+          SpinnerColumn(),
+          TextColumn("[progress.description]{task.description}"),
+          BarColumn(),
+          TextColumn("{task.completed}/{task.total}"),
+          TimeElapsedColumn(),
+          console=logger.console,
+          transient=False,
+        )
+        progress.__enter__()
+        task_id = progress.add_task(
+          f"Removing from [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]",
+          total=len(chunk_keys),
+        )
+      for key in chunk_keys:
+        rows_before, rows_after = self._rewrite_chunk(key, actually_present)
+        total_removed += rows_before - rows_after
+        if progress is not None and task_id is not None:
+          progress.advance(task_id, 1)
+    finally:
+      if progress is not None:
+        progress.__exit__(None, None, None)
+
+    for k in actually_present:
+      bi.index.pop(k, None)
+    from pybloom_live import ScalableBloomFilter
+    bi.sbf = ScalableBloomFilter(
+      mode=ScalableBloomFilter.SMALL_SET_GROWTH,
+      initial_capacity=max(1000000, len(bi.index)),
+      error_rate=1e-14,
+    )
+    for k in bi.index:
+      bi.sbf.add(k)
+    bi._added = 1
+    bi.persist()
+
+    self._update_access_json(actually_present)
+
+    remaining_chunks = self._list_chunk_keys()
+    upload_catalog_json(
+      self.store, self.bucket, self.base_prefix, len(bi.index), len(remaining_chunks), self.tmpdir
+    )
+
+    return (total_removed, n_not_found)
+
+  def close(self):
+    """Release temporary directories."""
+    release_temp_dirs(self)
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, et, ev, tb):
+    self.close()
+
+
 class IsauraPull(_BaseTransfer):
   """Downloads precalculated outputs from the cloud MinIO and stores them locally.
 
@@ -826,9 +1088,9 @@ class IsauraPull(_BaseTransfer):
 
   def pull(self):
     """Read outputs from cloud MinIO for the given inputs and store them locally."""
-    logger.info(
-      f"Pulling precalculation from the cloud for model={self.model_id}, version={self.model_version}, bucket={self.bucket}"
-    )
+    t0 = time.time()
+    input_name = os.path.basename(self.input_csv) if self.input_csv else ""
+    console.print(f"Pulling [bold]{self.model_id}[/bold] ({self.model_version}) from [bold]{self.bucket}[/bold]")
     with IsauraReader(
       model_id=self.model_id,
       model_version=self.model_version,
@@ -839,8 +1101,17 @@ class IsauraPull(_BaseTransfer):
       access_key=mcak,
       secrete=mcsk,
     ) as r:
+      with console.status("Loading inputs...", spinner="dots"):
+        wanted, _ = r._wanted()
+      console.print(f"[green]✓[/green] {len(wanted):,} inputs loaded from {input_name}")
+      with console.status("Checking cloud index...", spinner="dots"):
+        r._prepare_read()
+      console.print(f"[green]✓[/green] All {len(wanted):,} found in cloud index")
+      fetch_t0 = time.time()
       out = self._pull_batched(r.read_batched())
-    logger.info(f"pulled objects={out}")
+      console.print(f"[green]✓[/green] {out[0]:,} rows fetched and stored locally ({time.time() - fetch_t0:.1f}s)")
+    console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] pulled [bold]{out[0]:,}[/bold] rows from [bold]{self.bucket}[/bold] in {time.time() - t0:.1f}s")
+    logger.debug(f"pulled objects={out}")
 
 
 class IsauraPush:
@@ -905,7 +1176,7 @@ class IsauraPush:
       1 for obj in cloud_store.list_keys(dst_bucket, pref)
       if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
     )
-    logger.info(f"[push] merged bloom+index: entries={merged_entries} chunks={cloud_chunks}")
+    logger.debug(f"[push] merged bloom+index: entries={merged_entries} chunks={cloud_chunks}")
     return (merged_entries, cloud_chunks)
 
   def push(self):
@@ -926,14 +1197,14 @@ class IsauraPush:
         if not obj["Key"].endswith(skip_suffixes)
       ]
       if not keys:
-        logger.warning(f"[push] no data for {self.model_id} in {src_bucket}. Skipping {access}.")
+        logger.debug(f"[push] no data for {self.model_id} in {src_bucket}. Skipping {access}.")
         continue
       has_data = True
       dst_bucket = f"isaura-{access}"
       cloud_store = MinioStore(endpoint=MINIO_ENDPOINT_CLOUD, access=mck, secret=mcs)
       cloud_store.ensure_bucket(dst_bucket)
       tmpdir = make_temp("isaura_push_")
-      logger.info(
+      logger.debug(
         f"[push] uploading {len(keys)} objects for {self.model_id}/{self.model_version} "
         f"({access}) to cloud"
       )
@@ -955,7 +1226,7 @@ class IsauraPush:
                 errors.append(err)
         for err in errors:
           logger.warning(err)
-        logger.info(f"[push] {access} done: {done}/{len(keys)} objects uploaded to cloud")
+        logger.debug(f"[push] {access} done: {done}/{len(keys)} objects uploaded to cloud")
         with logger.console.status("Merging bloom filter and index...", spinner="dots"):
           merged_entries, cloud_chunks = self._merge_bloom_index(
             local_store, src_bucket, cloud_store, dst_bucket, tmpdir
@@ -970,6 +1241,7 @@ class IsauraPush:
     if not has_data:
       logger.error("No data found in any default bucket for a given model! Aborting push.")
       sys.exit(1)
+    console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] pushed to cloud")
 
 
 class IsauraInspect:
@@ -1142,9 +1414,9 @@ class IsauraInspect:
     return (union, owner)
 
   def list_available(self, output_csv=None):
-    """Return a DataFrame of all stored inputs and their source bucket."""
+    """Return a DataFrame of all stored inputs with a single column: input."""
     _, owner = self._indices_union(force=self.cloud)
-    df = pd.DataFrame([{"input": smi, "bucket": b} for smi, b in owner.items()])
+    df = pd.DataFrame([{"input": smi} for smi in owner])
     if output_csv:
       df.to_csv(output_csv, index=False)
     return df
@@ -1152,12 +1424,12 @@ class IsauraInspect:
   def inspect_inputs(self, input_csv, output_csv=None):
     """Check which inputs from input_csv are available in the store.
 
-    Returns a DataFrame with columns: input, available (bool), bucket.
+    Returns a DataFrame with a single column: input.
     """
     _, owner = self._indices_union(force=self.cloud)
     with open(input_csv, newline="", encoding="utf-8") as f:
       wanted = [(r.get("input") or "").strip() for r in csv.DictReader(f) if (r.get("input") or "").strip()]
-    df = pd.DataFrame([{"input": s, "available": s in owner, "bucket": owner.get(s, "")} for s in wanted])
+    df = pd.DataFrame([{"input": s} for s in wanted if s in owner])
     if output_csv:
       df.to_csv(output_csv, index=False)
     return df
