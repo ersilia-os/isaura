@@ -57,7 +57,12 @@ from isaura.helpers import (
   track_write_progress,
   write_access_file,
 )
-from isaura.const import WIDE_READ_SLICE
+from isaura.const import (
+  WIDE_READ_SLICE,
+  WIDE_REORDER_BUCKET_ROWS,
+  WIDE_REORDER_MAX_OPEN_BUCKETS,
+  WIDE_REORDER_MIN_FREE_MB,
+)
 from isaura.query import chunked_query_batched
 
 
@@ -661,6 +666,135 @@ class IsauraReader:
     for start in range(0, len(ordered), batch_size):
       yield ordered.iloc[start : start + batch_size].copy()
 
+  def _reorder_external(self, wanted, header, source_iter, batch_size=10000):
+    """Reorder streamed rows to wanted order with bounded memory (external sort).
+
+    Consumes ``source_iter`` — DataFrames of found rows in arbitrary store order
+    (e.g. from stream_parquet_filtered) — and yields DataFrames in exact
+    ``wanted`` order, batch_size rows at a time. Rows are scattered to on-disk
+    "bucket" Parquet files keyed by input position (Pass A), then gathered one
+    bucket at a time in order (Pass B), so peak RAM is ~one bucket rather than
+    the full result set. This is the memory-safe replacement for
+    concat + _reorder on wide models.
+
+    Guarantees: output has exactly len(wanted) rows; misses appear as
+    None-filled rows in their input position; duplicate inputs are emitted once
+    per occurrence; pairing is matched by ``header`` value, with a guard that
+    raises if any row would land against the wrong input (a fatal data error).
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    n = len(wanted)
+    if n == 0:
+      return
+
+    # input value -> list of positions (preserves order and duplicates)
+    wanted_norm = [str(v).strip() for v in wanted]
+    positions = {}
+    for i, k in enumerate(wanted_norm):
+      positions.setdefault(k, []).append(i)
+
+    # Widen the bucket span so the number of open writers/files stays under the
+    # cap, then size buckets so one fits comfortably in RAM during the gather.
+    span = max(WIDE_REORDER_BUCKET_ROWS, (n + WIDE_REORDER_MAX_OPEN_BUCKETS - 1) // WIDE_REORDER_MAX_OPEN_BUCKETS)
+    n_buckets = (n + span - 1) // span
+
+    spill = os.path.join(self.tmpdir, f"reorder_{uuid.uuid4().hex}")
+    os.makedirs(spill, exist_ok=True)
+    try:
+      free_mb = shutil.disk_usage(spill).free // (1024 * 1024)
+      if free_mb < WIDE_REORDER_MIN_FREE_MB:
+        logger.warning(
+          f"[reorder] low spill space: {free_mb}MB free at {spill} (< {WIDE_REORDER_MIN_FREE_MB}MB)"
+        )
+    except Exception:
+      pass
+
+    writers = {}        # bucket idx -> pq.ParquetWriter
+    bucket_paths = {}   # bucket idx -> path
+    locked_schema = None
+    scattered = 0
+    try:
+      # --- Pass A: scatter found rows to per-position-range bucket files ---
+      try:
+        for chunk in source_iter:
+          if chunk is None or len(chunk) == 0:
+            continue
+          keys = chunk[header].astype(str).str.strip()
+          # Fan each row out to every position its input occupies (duplicates).
+          pos_lists = keys.map(positions.get)
+          sub = chunk.assign(__pos=pos_lists.values)
+          sub = sub[sub["__pos"].notna()]
+          if sub.empty:
+            continue
+          sub = sub.explode("__pos")
+          sub["__order"] = sub["__pos"].astype(np.int64)
+          sub = sub.drop(columns="__pos")
+          scattered += len(sub)
+          if locked_schema is None:
+            tbl = pa.Table.from_pandas(sub, preserve_index=False)
+            locked_schema = tbl.schema
+          else:
+            tbl = pa.Table.from_pandas(sub, schema=locked_schema, preserve_index=False)
+          buckets = sub["__order"].to_numpy() // span
+          for b in np.unique(buckets):
+            b = int(b)
+            part = tbl.filter(pa.array(buckets == b))
+            w = writers.get(b)
+            if w is None:
+              bp = os.path.join(spill, f"bucket_{b}.parquet")
+              bucket_paths[b] = bp
+              w = pq.ParquetWriter(bp, locked_schema)
+              writers[b] = w
+            w.write_table(part)
+      finally:
+        for w in writers.values():
+          try:
+            w.close()
+          except Exception:
+            pass
+
+      logger.debug(
+        f"[reorder] scattered rows={scattered} buckets={len(bucket_paths)} span={span} "
+        f"n={n} rss={rss_mb():.0f}MB"
+      )
+
+      # --- Pass B: gather one bucket at a time, in input order ---
+      cols = [c for c in (locked_schema.names if locked_schema is not None else [header]) if c != "__order"]
+      for b in range(n_buckets):
+        lo = b * span
+        hi = min((b + 1) * span, n)
+        idxrange = list(range(lo, hi))
+        want_slice = wanted_norm[lo:hi]
+        bp = bucket_paths.get(b)
+        if bp is not None:
+          bdf = pq.read_table(bp).to_pandas()
+          if "__order" in bdf.columns:
+            bdf = bdf.drop_duplicates(subset="__order", keep="first").set_index("__order")
+          aligned = bdf.reindex(idxrange)
+        else:
+          aligned = pd.DataFrame(index=idxrange)
+        aligned = aligned.reindex(columns=cols)
+        # Fatal pairing guard: any present row must match its position's input.
+        present = aligned[header].notna().to_numpy()
+        if present.any():
+          stored = aligned[header].astype(str).str.strip().to_numpy()
+          mism = present & (stored != np.asarray(want_slice, dtype=object))
+          if mism.any():
+            j = int(np.argmax(mism))
+            raise ValueError(
+              f"[reorder] FATAL input/output mismatch at position {lo + j}: stored input "
+              f"{stored[j]!r} does not match requested {want_slice[j]!r}"
+            )
+        # Misses keep blank descriptors; set header for every position.
+        aligned[header] = want_slice
+        aligned = aligned.reset_index(drop=True)
+        for start in range(0, len(aligned), batch_size):
+          yield aligned.iloc[start : start + batch_size].copy()
+    finally:
+      shutil.rmtree(spill, ignore_errors=True)
+
   def read(self, output_csv=None, df=None):
     """Retrieve stored outputs and return them as a DataFrame (or write to CSV).
 
@@ -685,14 +819,20 @@ class IsauraReader:
       mode, payload = self._make_read_source(wanted, header, ordered=True)
       with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
-          source = stream_parquet_filtered(
-            self.store,
-            self.bucket,
-            payload,
+          # Memory-bounded external sort yields rows already in input order.
+          source = self._reorder_external(
             wanted,
-            header=header,
-            batch_size=10000,
-            progress=progress,
+            header,
+            stream_parquet_filtered(
+              self.store,
+              self.bucket,
+              payload,
+              wanted,
+              header=header,
+              batch_size=10000,
+              progress=progress,
+            ),
+            10000,
           )
         elif mode == "stream":
           source = stream_parquet_filtered_ordered(
@@ -715,9 +855,6 @@ class IsauraReader:
           )
         result = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
         del parts
-        if mode == "wide" and not result.empty:
-          result = self._reorder(wanted, header, result)
-          total_rows = len(result)
       if output_csv and not result.empty:
         logger.debug(f"[read] writing csv to {output_csv}")
         with StreamingCsvSink(output_csv) as sink:
@@ -773,24 +910,23 @@ class IsauraReader:
       with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
           if ordered:
-            raw_parts = []
-            for chunk in stream_parquet_filtered(
-              self.store,
-              self.bucket,
-              payload,
+            # Memory-bounded external sort: scatter found rows to on-disk
+            # buckets keyed by input position, then gather in order. Replaces
+            # the concat + full-frame _reorder that OOMs on wide models.
+            source = self._reorder_external(
               wanted,
-              header=header,
-              batch_size=batch_size,
-              progress=progress,
-            ):
-              raw_parts.append(chunk)
-            raw = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
-            del raw_parts
-            if not raw.empty:
-              source = self._reorder_batched(wanted, header, raw, batch_size)
-            else:
-              source = iter([])
-            del raw
+              header,
+              stream_parquet_filtered(
+                self.store,
+                self.bucket,
+                payload,
+                wanted,
+                header=header,
+                batch_size=batch_size,
+                progress=progress,
+              ),
+              batch_size,
+            )
           else:
             source = stream_parquet_filtered(
               self.store,

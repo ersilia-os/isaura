@@ -488,6 +488,136 @@ def test_reader_wide_model_read_preserves_input_descriptor_pairing(monkeypatch, 
   assert pd.isna(missing["d0"]) and pd.isna(missing["d1"])
 
 
+def _make_wide_reader(monkeypatch):
+  """Build an IsauraReader with mocked store/duck/bloom for unit-testing the
+  in-process _reorder_external (which only needs self.tmpdir)."""
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
+  return IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+  )
+
+
+def test_reorder_external_worst_case_order_is_bounded(monkeypatch):
+  # wanted[0]'s row arrives in the LAST chunk — the case that OOMs an in-memory
+  # ordered buffer. Force a tiny bucket span so we exercise multiple buckets and
+  # assert the gather never loads more than one span of rows at once.
+  monkeypatch.setattr("isaura.manage.WIDE_REORDER_BUCKET_ROWS", 2)
+  monkeypatch.setattr("isaura.manage.WIDE_REORDER_MAX_OPEN_BUCKETS", 256)
+  reader = _make_wide_reader(monkeypatch)
+
+  wanted = ["a", "b", "c", "d", "e"]
+  # Store order is reversed vs wanted, split across chunks (a is last).
+  chunks = [
+    pd.DataFrame([{"input": "e", "x": 4.0}, {"input": "d", "x": 3.0}]),
+    pd.DataFrame([{"input": "c", "x": 2.0}, {"input": "b", "x": 1.0}]),
+    pd.DataFrame([{"input": "a", "x": 0.0}]),
+  ]
+
+  import isaura.manage as mgr
+  real_read_table = mgr.pq.read_table
+  max_bucket_rows = {"n": 0}
+
+  def spy_read_table(path, *a, **k):
+    tbl = real_read_table(path, *a, **k)
+    max_bucket_rows["n"] = max(max_bucket_rows["n"], tbl.num_rows)
+    return tbl
+
+  monkeypatch.setattr("isaura.manage.pq.read_table", spy_read_table)
+
+  out = pd.concat(list(reader._reorder_external(wanted, "input", iter(chunks), batch_size=10)), ignore_index=True)
+
+  assert list(out["input"]) == wanted
+  assert list(out["x"]) == [0.0, 1.0, 2.0, 3.0, 4.0]
+  # No single bucket load exceeded the span (2).
+  assert max_bucket_rows["n"] <= 2
+
+
+def test_reorder_external_pairing_guard_raises_on_mismatch(monkeypatch):
+  reader = _make_wide_reader(monkeypatch)
+  wanted = ["a", "b"]
+
+  # Corrupt the bucket on read-back so a stored row's header no longer matches
+  # the input position it was filed under — the fatal mispairing the guard
+  # must catch instead of silently emitting wrong descriptors.
+  import pyarrow as pa
+  import isaura.manage as mgr
+  real_read_table = mgr.pq.read_table
+
+  def corrupt_read_table(path, *a, **k):
+    tbl = real_read_table(path, *a, **k)
+    df = tbl.to_pandas()
+    df["input"] = "WRONG"
+    return pa.Table.from_pandas(df, preserve_index=False)
+
+  monkeypatch.setattr("isaura.manage.pq.read_table", corrupt_read_table)
+
+  chunks = [pd.DataFrame([{"input": "a", "x": 1.0}, {"input": "b", "x": 2.0}])]
+  with pytest.raises(ValueError, match="FATAL"):
+    list(reader._reorder_external(wanted, "input", iter(chunks), batch_size=10))
+
+
+def test_reorder_external_preserves_duplicates(monkeypatch):
+  reader = _make_wide_reader(monkeypatch)
+  wanted = ["smiA", "smiB", "smiA", "smiC", "smiA"]
+  chunks = [
+    pd.DataFrame([
+      {"input": "smiC", "d0": "C0"},
+      {"input": "smiA", "d0": "A0"},
+      {"input": "smiB", "d0": "B0"},
+    ]),
+  ]
+  out = pd.concat(list(reader._reorder_external(wanted, "input", iter(chunks), batch_size=10)), ignore_index=True)
+  assert list(out["input"]) == wanted
+  # All three smiA positions carry smiA's own descriptor.
+  assert list(out["d0"]) == ["A0", "B0", "A0", "C0", "A0"]
+
+
+def test_reorder_external_all_misses_returns_blank_rows(monkeypatch):
+  reader = _make_wide_reader(monkeypatch)
+  wanted = ["x", "y", "z"]
+  # Source yields nothing found.
+  out = pd.concat(
+    list(reader._reorder_external(wanted, "input", iter([pd.DataFrame()]), batch_size=10)),
+    ignore_index=True,
+  )
+  assert list(out["input"]) == wanted
+  assert len(out) == 3
+
+
+def test_reorder_external_cleans_spill_dir(monkeypatch):
+  reader = _make_wide_reader(monkeypatch)
+  before = set(os.listdir(reader.tmpdir)) if os.path.isdir(reader.tmpdir) else set()
+  chunks = [pd.DataFrame([{"input": "a", "x": 1.0}])]
+  list(reader._reorder_external(["a"], "input", iter(chunks), batch_size=10))
+  after = set(os.listdir(reader.tmpdir)) if os.path.isdir(reader.tmpdir) else set()
+  # No leftover reorder_* spill directories.
+  assert not [d for d in after - before if d.startswith("reorder_")]
+
+
 def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):

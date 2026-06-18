@@ -71,6 +71,13 @@ STREAM_DOWNLOAD_WORKERS = int(os.getenv("STREAM_DOWNLOAD_WORKERS", "4"))
 
 WIDE_READ_SLICE = int(os.getenv("WIDE_READ_SLICE", "2000"))
 
+# Memory-bounded ordered wide-read reorder (external bucket-sort). Rows are
+# scattered to on-disk "bucket" parquet files keyed by input position, then
+# gathered one bucket at a time in input order so peak RAM is ~one bucket.
+WIDE_REORDER_BUCKET_ROWS = int(os.getenv("WIDE_REORDER_BUCKET_ROWS", "50000"))
+WIDE_REORDER_MAX_OPEN_BUCKETS = int(os.getenv("WIDE_REORDER_MAX_OPEN_BUCKETS", "256"))
+WIDE_REORDER_MIN_FREE_MB = int(os.getenv("WIDE_REORDER_MIN_FREE_MB", "2048"))
+
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 
 PARQUET_ROW_GROUP_SIZE = int(os.getenv("PARQUET_ROW_GROUP_SIZE", "500000"))
