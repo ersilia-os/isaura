@@ -128,6 +128,12 @@ def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
     def __init__(self, *args, **kwargs):
       pass
 
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
   class FakeDuck:
     def __init__(self, *args, **kwargs):
       self.con = object()
@@ -176,6 +182,12 @@ def test_reader_read_streaming_mode_skips_duckdb(monkeypatch):
     def __init__(self, *args, **kwargs):
       pass
 
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
   class FakeDuck:
     def __init__(self, *args, **kwargs):
       self.con = object()
@@ -214,6 +226,12 @@ def test_reader_read_batched_streaming_mode_skips_duckdb(monkeypatch, tmp_path):
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
 
   class FakeDuck:
     def __init__(self, *args, **kwargs):
@@ -261,6 +279,12 @@ def test_base_transfer_select_rows_batched_streaming_mode_skips_duckdb(monkeypat
     def __init__(self, *args, **kwargs):
       pass
 
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
     def download_file(self, *args, **kwargs):
       raise AssertionError("download_file should not run in this unit test")
 
@@ -299,10 +323,74 @@ def test_chunk_row_limit_uses_output_dimension_threshold():
   assert chunk_row_limit(None) == 2000000
 
 
-def test_reader_wide_model_uses_fast_stream_then_reorders(monkeypatch):
+def test_reader_wide_model_ordered_uses_duckdb_keep_missing(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
+
+  called = {"query": 0, "stream": 0, "kwargs": None}
+
+  def fake_query_batched(con, header, wanted, files, **kwargs):
+    called["query"] += 1
+    called["kwargs"] = kwargs
+    # Simulate the function's contract: rows in wanted order.
+    yield pd.DataFrame({header: list(wanted), "x": [float(i) for i in range(len(wanted))]})
+
+  def fake_stream(*args, **kwargs):
+    called["stream"] += 1
+    yield pd.DataFrame()
+
+  monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
+
+  reader = IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+  )
+  df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
+  chunks = list(reader.read_batched(df=df))  # ordered=True default (read command)
+
+  # Ordered wide reads go through the single-pass DuckDB path with order + miss
+  # preservation, not the unordered streaming path.
+  assert called["query"] == 1
+  assert called["stream"] == 0
+  assert called["kwargs"].get("preserve_order") is True
+  assert called["kwargs"].get("keep_missing") is True
+  all_rows = pd.concat(chunks, ignore_index=True)
+  assert list(all_rows["input"]) == ["a", "b"]
+
+
+def test_reader_wide_model_unordered_streams_without_reordering(monkeypatch):
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
 
   class FakeDuck:
     def __init__(self, *args, **kwargs):
@@ -324,25 +412,152 @@ def test_reader_wide_model_uses_fast_stream_then_reorders(monkeypatch):
 
   def fake_stream(*args, **kwargs):
     called["stream"] += 1
-    yield pd.DataFrame([{"input": "b", "x": 2.5}, {"input": "a", "x": 1.5}])
+    yield pd.DataFrame([{"input": "b", "x": 2.5}])
+    yield pd.DataFrame([{"input": "a", "x": 1.5}])
 
   monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
 
   reader = IsauraReader(
     model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
   )
+  # ordered=False must never materialize the full frame or reorder it.
+  reader._reorder = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not reorder"))
+  reader._reorder_batched = lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not reorder"))
+
   df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
-  chunks = list(reader.read_batched(df=df))
+  chunks = list(reader.read_batched(df=df, ordered=False))
 
   assert called["stream"] == 1
-  all_rows = pd.concat(chunks, ignore_index=True)
-  assert list(all_rows["input"]) == ["a", "b"]
+  # Chunks are emitted incrementally in store order, not reordered to wanted order.
+  assert [list(chunk["input"]) for chunk in chunks] == [["b"], ["a"]]
+
+
+def test_reader_wide_model_read_preserves_input_descriptor_pairing(monkeypatch, tmp_path):
+  """Critical: read output must be in input order with each row's descriptors
+  staying matched to its own SMILES, even when the store returns rows shuffled
+  and some inputs are missing."""
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
+
+  # Stored descriptors (each value encodes its own input so a mismatch is
+  # visible). The chunked DuckDB path is responsible for returning rows in
+  # wanted order with placeholders for misses; here we mock that contract and
+  # assert the reader streams it to CSV faithfully (the reorder logic itself is
+  # tested against a real DuckDB in test_chunked_query_batched_*).
+  stored = {
+    "smiC": {"d0": "C-0", "d1": "C-1"},
+    "smiA": {"d0": "A-0", "d1": "A-1"},
+    "smiE": {"d0": "E-0", "d1": "E-1"},
+  }
+
+  def fake_query_batched(con, header, wanted, files, **kwargs):
+    assert kwargs.get("preserve_order") is True
+    assert kwargs.get("keep_missing") is True
+    rows = []
+    for k in wanted:
+      desc = stored.get(k, {"d0": None, "d1": None})
+      rows.append({header: k, **desc})
+    yield pd.DataFrame(rows)
+
+  monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
+
+  reader = IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
+  )
+  # Input order includes a missing molecule ("smiB") in the middle.
+  df = pd.DataFrame([{"input": s} for s in ["smiA", "smiB", "smiC", "smiE"]])
+  out = tmp_path / "out.csv"
+  list(reader.read_batched(output_csv=str(out), df=df))  # default ordered=True
+
+  result = pd.read_csv(out)
+  # Rows in exact input order, one row per input, missing input kept as a row.
+  assert list(result["input"]) == ["smiA", "smiB", "smiC", "smiE"]
+  # Every present input keeps its OWN descriptors.
+  for s, prefix in [("smiA", "A"), ("smiC", "C"), ("smiE", "E")]:
+    row = result[result["input"] == s].iloc[0]
+    assert row["d0"] == f"{prefix}-0"
+    assert row["d1"] == f"{prefix}-1"
+  # Missing input has blank descriptors, not another molecule's values.
+  missing = result[result["input"] == "smiB"].iloc[0]
+  assert pd.isna(missing["d0"]) and pd.isna(missing["d1"])
+
+
+def test_query_batched_ordered_keep_missing_preserves_pairing(tmp_path):
+  """Core guard: the single-pass ordered query (preserve_order + keep_missing)
+  must return rows in exact wanted order (including duplicates), each input
+  paired with its own descriptors, and missing inputs as placeholder (NaN) rows.
+  Uses a real DuckDB over a local parquet file (no S3)."""
+  duckdb = pytest.importorskip("duckdb")
+  from isaura.query import query_batched
+
+  # Parquet rows are deliberately shuffled; each descriptor encodes its input.
+  stored = pd.DataFrame([
+    {"input": "smiC", "d0": "C-0", "d1": "C-1"},
+    {"input": "smiA", "d0": "A-0", "d1": "A-1"},
+    {"input": "smiE", "d0": "E-0", "d1": "E-1"},
+    {"input": "smiD", "d0": "D-0", "d1": "D-1"},
+  ])
+  pq_path = tmp_path / "chunk_1.parquet"
+  stored.to_parquet(pq_path, index=False)
+
+  # Wanted order: a miss ("smiMISS") in the middle, and a duplicate ("smiA").
+  wanted = ["smiA", "smiMISS", "smiC", "smiD", "smiE", "smiA"]
+
+  con = duckdb.connect(":memory:")
+  chunks = list(
+    query_batched(
+      con, "input", wanted, [str(pq_path)],
+      batch_size=10, tmpdir=str(tmp_path), preserve_order=True, keep_missing=True,
+    )
+  )
+  out = pd.concat(chunks, ignore_index=True)
+
+  # Exact input order, exactly one row per wanted entry (incl. the duplicate).
+  assert list(out["input"]) == wanted
+  assert len(out) == len(wanted)
+  # Every present input carries its OWN descriptors.
+  for i, k in enumerate(wanted):
+    if k == "smiMISS":
+      continue
+    prefix = k[-1]  # smiA -> A
+    assert out.loc[i, "d0"] == f"{prefix}-0"
+    assert out.loc[i, "d1"] == f"{prefix}-1"
+  # Missing input is a placeholder row: input preserved, descriptors NaN.
+  miss_idx = wanted.index("smiMISS")
+  assert pd.isna(out.loc[miss_idx, "d0"])
+  assert pd.isna(out.loc[miss_idx, "d1"])
 
 
 def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
+
+    def require_bucket(self, bucket):
+      return None
 
     def ensure_bucket(self, bucket):
       return None
@@ -382,6 +597,9 @@ def test_writer_buffers_raw_rows_until_flush(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
+
+    def require_bucket(self, bucket):
+      return None
 
     def ensure_bucket(self, bucket):
       return None
@@ -488,6 +706,12 @@ def test_reader_tempdir_is_cleaned_when_instance_is_collected(monkeypatch, tmp_p
     def __init__(self, *args, **kwargs):
       pass
 
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
   class FakeDuck:
     def __init__(self, *args, **kwargs):
       self.con = object()
@@ -534,6 +758,12 @@ def test_base_transfer_close_removes_owned_tempdirs(monkeypatch, tmp_path):
 
     def __init__(self, *args, **kwargs):
       pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
 
   class FakeDuck:
     def __init__(self, *args, **kwargs):

@@ -33,10 +33,15 @@ def query(conn, header, wanted, file_glob, columns="*", tmpdir="/tmp", preserve_
   return pd.concat(chunks, ignore_index=True)
 
 
-def _configure_conn(conn, tmpdir):
-  """Set DuckDB memory limit, temp directory, and thread count based on available resources."""
-  mem_lim = mem_gb_lim()
-  threads = cpu_cnt(ratio=0.8)
+def _configure_conn(conn, tmpdir, memory_limit_gb=None, threads=None):
+  """Set DuckDB memory limit, temp directory, and thread count.
+
+  memory_limit_gb / threads override the auto-computed defaults when given (used
+  by the wide ordered read to cap memory from total RAM and reduce per-thread
+  decompression buffers so DuckDB spills the sort instead of erroring).
+  """
+  mem_lim = memory_limit_gb if memory_limit_gb is not None else mem_gb_lim()
+  threads = threads if threads is not None else cpu_cnt(ratio=0.8)
   try:
     conn.execute(f"SET memory_limit='{mem_lim}GB'")
     conn.execute(f"SET temp_directory='{tmpdir}'")
@@ -58,12 +63,13 @@ def _src_expr(file_glob):
 def query_batched(
   conn, header, wanted, file_glob,
   batch_size=10000, columns="*", tmpdir="/tmp", preserve_order=False,
+  keep_missing=False, memory_limit_gb=None, threads=None,
 ):
   """Query Parquet files on S3 via DuckDB and yield results as DataFrames in batches.
 
   Registers the wanted list as a temporary DuckDB table and runs a single SQL
-  query with an IN filter. Memory limit and thread count are set automatically
-  based on available system resources.
+  query with an IN filter. The ORDER BY (when preserve_order) spills to
+  tmpdir on disk, so this stays memory-bounded for large ordered reads.
 
   Args:
       conn: DuckDB connection pre-configured with S3 credentials.
@@ -74,6 +80,13 @@ def query_batched(
       columns: SQL column expression (default "*" for all columns).
       tmpdir: Directory for DuckDB to spill temporary data to disk.
       preserve_order: If True, results are returned in the same order as wanted.
+      keep_missing: If True (requires preserve_order), emit one row per wanted
+          input — inputs absent from the store come back with the input value set
+          and NULL descriptors (LEFT JOIN). Prevents missing rows from shifting
+          later rows out of alignment. Assumes header is among `columns`.
+      memory_limit_gb / threads: override DuckDB's auto-tuned limits (used by the
+          wide ordered read to cap from total RAM and reduce decompression
+          memory so the sort spills to disk rather than erroring).
 
   Yields:
       DataFrames of matching rows in batch_size chunks.
@@ -81,16 +94,41 @@ def query_batched(
   if not wanted:
     return
 
-  mem_lim, threads = _configure_conn(conn, tmpdir)
+  mem_lim, threads = _configure_conn(conn, tmpdir, memory_limit_gb=memory_limit_gb, threads=threads)
   wanted_list = list(wanted)
   src, src_desc = _src_expr(file_glob)
+  # Explicit ORDER BY enforces the output order, so DuckDB needn't preserve
+  # insertion order through the pipeline — turning it off lowers peak memory.
+  insertion_order_off = False
+  if preserve_order:
+    try:
+      conn.execute("SET preserve_insertion_order=false")
+      insertion_order_off = True
+    except Exception:
+      pass
 
   logger.debug(
-    f"[query_batched] inputs={len(wanted_list)} "
+    f"[query_batched] inputs={len(wanted_list)} keep_missing={keep_missing} "
     f"batch_size={batch_size} mem={mem_lim}GB threads={threads} src={src_desc}"
   )
 
-  if preserve_order:
+  if preserve_order and keep_missing:
+    # LEFT JOIN driven by the (ordered) wanted table: every input yields a row,
+    # NULL descriptors for misses, header value taken from the wanted side.
+    sql = f"""
+      SELECT w.{header} AS {header}, p.* EXCLUDE ({header})
+      FROM __wanted_inputs w
+      LEFT JOIN (
+        SELECT {columns} FROM {src}
+        WHERE {header} IN (SELECT {header} FROM __wanted_inputs)
+      ) p ON p.{header} = w.{header}
+      ORDER BY w.__o
+    """
+    wdf = pd.DataFrame({
+      header: wanted_list,
+      "__o": np.arange(len(wanted_list), dtype=np.int64),
+    })
+  elif preserve_order:
     sql = f"""
       WITH p AS (
         SELECT {columns} FROM {src}
@@ -125,6 +163,11 @@ def query_batched(
       yield df
   finally:
     conn.unregister("__wanted_inputs")
+    if insertion_order_off:
+      try:
+        conn.execute("SET preserve_insertion_order=true")
+      except Exception:
+        pass
 
   dt = time.perf_counter() - t0
   logger.debug(f"[query_batched] done rows={total_rows} batches={n_batches} elapsed={dt:.2f}s rss={rss_mb():.0f}MB")

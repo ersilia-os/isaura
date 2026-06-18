@@ -34,14 +34,19 @@ def avail_mem():
   return int(psutil.virtual_memory().available)
 
 
-def mem_gb_lim(ratio=0.8, floor_gb=1):
-  """Return a memory limit in GB as a fraction of available RAM, with a minimum floor.
+def mem_gb_lim(ratio=0.8, floor_gb=1, total=False):
+  """Return a memory limit in GB as a fraction of RAM, with a minimum floor.
 
   Args:
-      ratio: Fraction of available memory to use (default 0.8).
+      ratio: Fraction of memory to use (default 0.8).
       floor_gb: Minimum value to return in GB (default 1).
+      total: Base the fraction on TOTAL RAM instead of currently-available RAM.
+          macOS underreports "available" (aggressive compression/caching), which
+          can collapse the limit to the floor; use total for a stable ceiling
+          when the consumer (e.g. DuckDB) spills to disk on its own.
   """
-  return max(floor_gb, int(avail_mem() * ratio / 1024**3))
+  base = psutil.virtual_memory().total if total else avail_mem()
+  return max(floor_gb, int(base * ratio / 1024**3))
 
 
 def cpu_cnt(ratio=0.6):

@@ -38,6 +38,8 @@ from isaura.helpers import (
   console,
   output_dimension_from_metadata,
   rss_mb,
+  mem_gb_lim,
+  cpu_cnt,
   fetch_schema_from_github,
   get_acc_key,
   get_apprx,
@@ -557,10 +559,37 @@ class IsauraReader:
         Tuple of (mode_string, source_or_prefix).
     """
     n = len(wanted)
+
+    def _rename(batches, src, dst):
+      for chunk in batches:
+        if src in chunk.columns:
+          chunk = chunk.rename(columns={src: dst})
+        yield chunk
+
     if self.wide_model:
-      prefix = hive_prefix(self.base) + "/"
-      logger.debug(f"[read] wide streaming n={n} bucket={self.bucket}")
-      return "wide", prefix
+      if not ordered:
+        # Unordered (pull): stream chunks straight through with bounded memory.
+        prefix = hive_prefix(self.base) + "/"
+        logger.debug(f"[read] wide streaming n={n} bucket={self.bucket}")
+        return "wide", prefix
+      # Ordered (read): one DuckDB pass — scan once, LEFT JOIN for misses, ORDER
+      # BY input order with the sort spilling to disk. Memory is capped from
+      # TOTAL RAM (macOS underreports "available", which would collapse the limit
+      # and make DuckDB error instead of spill) and threads are reduced to keep
+      # per-thread decompression buffers small. Full-frame accumulation would OOM.
+      files = list_parquet_keys(self.store, self.bucket, self.base)
+      parquet_col = self._detect_parquet_col(header)
+      mem_gb = mem_gb_lim(ratio=0.4, floor_gb=2, total=True)
+      wide_threads = max(1, min(4, cpu_cnt(ratio=0.3)))
+      logger.debug(f"[read] wide ordered duckdb n={n} mem={mem_gb}GB threads={wide_threads} bucket={self.bucket}")
+      raw = query_batched(
+        self.duck.con, parquet_col, wanted, files,
+        batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=True, keep_missing=True,
+        memory_limit_gb=mem_gb, threads=wide_threads,
+      )
+      if parquet_col == header:
+        return "duckdb", raw
+      return "duckdb", _rename(raw, parquet_col, header)
     if n >= STREAM_PARQUET_THRESHOLD:
       prefix = hive_prefix(self.base) + "/"
       logger.debug(f"[read] streaming n={n} bucket={self.bucket}")
@@ -573,13 +602,6 @@ class IsauraReader:
     )
     if parquet_col == header:
       return "duckdb", raw
-
-    def _rename(batches, src, dst):
-      for chunk in batches:
-        if src in chunk.columns:
-          chunk = chunk.rename(columns={src: dst})
-        yield chunk
-
     return "duckdb", _rename(raw, parquet_col, header)
 
   def _load_index(self):
@@ -734,7 +756,7 @@ class IsauraReader:
     )
     return out
 
-  def read_batched(self, batch_size=10000, output_csv=None, df=None):
+  def read_batched(self, batch_size=10000, output_csv=None, df=None, ordered=True):
     """Retrieve stored outputs as a generator of DataFrames, optionally writing to CSV.
 
     Memory-efficient alternative to read() for large result sets. Yields one
@@ -744,6 +766,13 @@ class IsauraReader:
         batch_size: Number of rows per yielded DataFrame.
         output_csv: Optional path to write all results to as they are streamed.
         df: Optional DataFrame of inputs to use instead of input_csv.
+        ordered: When True (default), rows are emitted in the same order as the
+            wanted inputs, with None-filled placeholders for misses. When False,
+            rows are streamed straight from the parquet files without buffering
+            or reordering — bounded memory, found rows only. Callers that don't
+            care about row order (e.g. pull, which re-indexes by molecule) should
+            pass ordered=False to avoid materializing the full result set, which
+            OOMs for wide models (output dimension >= 100) over large inputs.
 
     Yields:
         DataFrames of matching rows in batch_size chunks.
@@ -757,37 +786,59 @@ class IsauraReader:
     sink = None
     source = None
     try:
-      mode, payload = self._make_read_source(wanted, header, batch_size=batch_size, ordered=True)
+      mode, payload = self._make_read_source(wanted, header, batch_size=batch_size, ordered=ordered)
       with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
-          raw_parts = []
-          for chunk in stream_parquet_filtered(
-            self.store,
-            self.bucket,
-            payload,
-            wanted,
-            header=header,
-            batch_size=batch_size,
-            progress=progress,
-          ):
-            raw_parts.append(chunk)
-          raw = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
-          del raw_parts
-          if not raw.empty:
-            source = self._reorder_batched(wanted, header, raw, batch_size)
+          if ordered:
+            raw_parts = []
+            for chunk in stream_parquet_filtered(
+              self.store,
+              self.bucket,
+              payload,
+              wanted,
+              header=header,
+              batch_size=batch_size,
+              progress=progress,
+            ):
+              raw_parts.append(chunk)
+            raw = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
+            del raw_parts
+            if not raw.empty:
+              source = self._reorder_batched(wanted, header, raw, batch_size)
+            else:
+              source = iter([])
+            del raw
           else:
-            source = iter([])
-          del raw
+            source = stream_parquet_filtered(
+              self.store,
+              self.bucket,
+              payload,
+              wanted,
+              header=header,
+              batch_size=batch_size,
+              progress=progress,
+            )
         elif mode == "stream":
-          source = stream_parquet_filtered_ordered(
-            self.store,
-            self.bucket,
-            payload,
-            wanted,
-            header=header,
-            batch_size=batch_size,
-            progress=progress,
-          )
+          if ordered:
+            source = stream_parquet_filtered_ordered(
+              self.store,
+              self.bucket,
+              payload,
+              wanted,
+              header=header,
+              batch_size=batch_size,
+              progress=progress,
+            )
+          else:
+            source = stream_parquet_filtered(
+              self.store,
+              self.bucket,
+              payload,
+              wanted,
+              header=header,
+              batch_size=batch_size,
+              progress=progress,
+            )
         else:
           source = payload
         if output_csv:
@@ -1108,7 +1159,7 @@ class IsauraPull(_BaseTransfer):
         r._prepare_read()
       console.print(f"[green]✓[/green] All {len(wanted):,} found in cloud index")
       fetch_t0 = time.time()
-      out = self._pull_batched(r.read_batched())
+      out = self._pull_batched(r.read_batched(ordered=False))
       console.print(f"[green]✓[/green] {out[0]:,} rows fetched and stored locally ({time.time() - fetch_t0:.1f}s)")
     console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] pulled [bold]{out[0]:,}[/bold] rows from [bold]{self.bucket}[/bold] in {time.time() - t0:.1f}s")
     logger.debug(f"pulled objects={out}")
