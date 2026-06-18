@@ -38,8 +38,6 @@ from isaura.helpers import (
   console,
   output_dimension_from_metadata,
   rss_mb,
-  mem_gb_lim,
-  cpu_cnt,
   fetch_schema_from_github,
   get_acc_key,
   get_apprx,
@@ -567,29 +565,14 @@ class IsauraReader:
         yield chunk
 
     if self.wide_model:
-      if not ordered:
-        # Unordered (pull): stream chunks straight through with bounded memory.
-        prefix = hive_prefix(self.base) + "/"
-        logger.debug(f"[read] wide streaming n={n} bucket={self.bucket}")
-        return "wide", prefix
-      # Ordered (read): one DuckDB pass — scan once, LEFT JOIN for misses, ORDER
-      # BY input order with the sort spilling to disk. Memory is capped from
-      # TOTAL RAM (macOS underreports "available", which would collapse the limit
-      # and make DuckDB error instead of spill) and threads are reduced to keep
-      # per-thread decompression buffers small. Full-frame accumulation would OOM.
-      files = list_parquet_keys(self.store, self.bucket, self.base)
-      parquet_col = self._detect_parquet_col(header)
-      mem_gb = mem_gb_lim(ratio=0.4, floor_gb=2, total=True)
-      wide_threads = max(1, min(4, cpu_cnt(ratio=0.3)))
-      logger.debug(f"[read] wide ordered duckdb n={n} mem={mem_gb}GB threads={wide_threads} bucket={self.bucket}")
-      raw = query_batched(
-        self.duck.con, parquet_col, wanted, files,
-        batch_size=batch_size, tmpdir=self.tmpdir, preserve_order=True, keep_missing=True,
-        memory_limit_gb=mem_gb, threads=wide_threads,
-      )
-      if parquet_col == header:
-        return "duckdb", raw
-      return "duckdb", _rename(raw, parquet_col, header)
+      # Wide models stream chunk files; read_batched/read handle ordering
+      # (ordered → concat+reorder; unordered pull → straight passthrough). The
+      # DuckDB-over-S3 + global-sort variant was reverted (it hangs on large
+      # wide reads); ordered wide reads are still subject to the original
+      # full-frame OOM and are the next thing to redesign.
+      prefix = hive_prefix(self.base) + "/"
+      logger.debug(f"[read] wide streaming n={n} ordered={ordered} bucket={self.bucket}")
+      return "wide", prefix
     if n >= STREAM_PARQUET_THRESHOLD:
       prefix = hive_prefix(self.base) + "/"
       logger.debug(f"[read] streaming n={n} bucket={self.bucket}")

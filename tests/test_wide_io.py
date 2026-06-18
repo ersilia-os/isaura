@@ -323,7 +323,7 @@ def test_chunk_row_limit_uses_output_dimension_threshold():
   assert chunk_row_limit(None) == 2000000
 
 
-def test_reader_wide_model_ordered_uses_duckdb_keep_missing(monkeypatch):
+def test_reader_wide_model_uses_fast_stream_then_reorders(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):
       pass
@@ -350,33 +350,22 @@ def test_reader_wide_model_ordered_uses_duckdb_keep_missing(monkeypatch):
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
   monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
 
-  called = {"query": 0, "stream": 0, "kwargs": None}
-
-  def fake_query_batched(con, header, wanted, files, **kwargs):
-    called["query"] += 1
-    called["kwargs"] = kwargs
-    # Simulate the function's contract: rows in wanted order.
-    yield pd.DataFrame({header: list(wanted), "x": [float(i) for i in range(len(wanted))]})
+  called = {"stream": 0}
 
   def fake_stream(*args, **kwargs):
     called["stream"] += 1
-    yield pd.DataFrame()
+    yield pd.DataFrame([{"input": "b", "x": 2.5}, {"input": "a", "x": 1.5}])
 
-  monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
   monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
 
   reader = IsauraReader(
     model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
   )
   df = pd.DataFrame([{"input": "a"}, {"input": "b"}])
-  chunks = list(reader.read_batched(df=df))  # ordered=True default (read command)
+  chunks = list(reader.read_batched(df=df))
 
-  # Ordered wide reads go through the single-pass DuckDB path with order + miss
-  # preservation, not the unordered streaming path.
-  assert called["query"] == 1
-  assert called["stream"] == 0
-  assert called["kwargs"].get("preserve_order") is True
-  assert called["kwargs"].get("keep_missing") is True
+  # Ordered wide reads stream chunk files, then reorder to wanted order.
+  assert called["stream"] == 1
   all_rows = pd.concat(chunks, ignore_index=True)
   assert list(all_rows["input"]) == ["a", "b"]
 
@@ -463,26 +452,20 @@ def test_reader_wide_model_read_preserves_input_descriptor_pairing(monkeypatch, 
   monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
 
   # Stored descriptors (each value encodes its own input so a mismatch is
-  # visible). The chunked DuckDB path is responsible for returning rows in
-  # wanted order with placeholders for misses; here we mock that contract and
-  # assert the reader streams it to CSV faithfully (the reorder logic itself is
-  # tested against a real DuckDB in test_chunked_query_batched_*).
-  stored = {
-    "smiC": {"d0": "C-0", "d1": "C-1"},
-    "smiA": {"d0": "A-0", "d1": "A-1"},
-    "smiE": {"d0": "E-0", "d1": "E-1"},
-  }
+  # visible). The wide read streams chunk files (here shuffled, with one input
+  # missing) and is responsible for reordering to wanted order with blank
+  # placeholders for misses; assert the reader streams that to CSV faithfully.
+  stored_rows = [
+    {"input": "smiC", "d0": "C-0", "d1": "C-1"},
+    {"input": "smiA", "d0": "A-0", "d1": "A-1"},
+    {"input": "smiE", "d0": "E-0", "d1": "E-1"},
+  ]
 
-  def fake_query_batched(con, header, wanted, files, **kwargs):
-    assert kwargs.get("preserve_order") is True
-    assert kwargs.get("keep_missing") is True
-    rows = []
-    for k in wanted:
-      desc = stored.get(k, {"d0": None, "d1": None})
-      rows.append({header: k, **desc})
-    yield pd.DataFrame(rows)
+  def fake_stream(*args, **kwargs):
+    # Rows come back shuffled and missing "smiB" — reorder must fix both.
+    yield pd.DataFrame(stored_rows)
 
-  monkeypatch.setattr("isaura.manage.query_batched", fake_query_batched)
+  monkeypatch.setattr("isaura.manage.stream_parquet_filtered", fake_stream)
 
   reader = IsauraReader(
     model_id="m", model_version="v1", bucket="bucket", input_csv="unused.csv", approximate=False
@@ -503,52 +486,6 @@ def test_reader_wide_model_read_preserves_input_descriptor_pairing(monkeypatch, 
   # Missing input has blank descriptors, not another molecule's values.
   missing = result[result["input"] == "smiB"].iloc[0]
   assert pd.isna(missing["d0"]) and pd.isna(missing["d1"])
-
-
-def test_query_batched_ordered_keep_missing_preserves_pairing(tmp_path):
-  """Core guard: the single-pass ordered query (preserve_order + keep_missing)
-  must return rows in exact wanted order (including duplicates), each input
-  paired with its own descriptors, and missing inputs as placeholder (NaN) rows.
-  Uses a real DuckDB over a local parquet file (no S3)."""
-  duckdb = pytest.importorskip("duckdb")
-  from isaura.query import query_batched
-
-  # Parquet rows are deliberately shuffled; each descriptor encodes its input.
-  stored = pd.DataFrame([
-    {"input": "smiC", "d0": "C-0", "d1": "C-1"},
-    {"input": "smiA", "d0": "A-0", "d1": "A-1"},
-    {"input": "smiE", "d0": "E-0", "d1": "E-1"},
-    {"input": "smiD", "d0": "D-0", "d1": "D-1"},
-  ])
-  pq_path = tmp_path / "chunk_1.parquet"
-  stored.to_parquet(pq_path, index=False)
-
-  # Wanted order: a miss ("smiMISS") in the middle, and a duplicate ("smiA").
-  wanted = ["smiA", "smiMISS", "smiC", "smiD", "smiE", "smiA"]
-
-  con = duckdb.connect(":memory:")
-  chunks = list(
-    query_batched(
-      con, "input", wanted, [str(pq_path)],
-      batch_size=10, tmpdir=str(tmp_path), preserve_order=True, keep_missing=True,
-    )
-  )
-  out = pd.concat(chunks, ignore_index=True)
-
-  # Exact input order, exactly one row per wanted entry (incl. the duplicate).
-  assert list(out["input"]) == wanted
-  assert len(out) == len(wanted)
-  # Every present input carries its OWN descriptors.
-  for i, k in enumerate(wanted):
-    if k == "smiMISS":
-      continue
-    prefix = k[-1]  # smiA -> A
-    assert out.loc[i, "d0"] == f"{prefix}-0"
-    assert out.loc[i, "d1"] == f"{prefix}-1"
-  # Missing input is a placeholder row: input preserved, descriptors NaN.
-  miss_idx = wanted.index("smiMISS")
-  assert pd.isna(out.loc[miss_idx, "d0"])
-  assert pd.isna(out.loc[miss_idx, "d1"])
 
 
 def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
@@ -826,3 +763,70 @@ def test_stream_parquet_filtered_cleans_tmpdir_when_closed_early(monkeypatch, tm
   gen.close()
 
   assert not tempdir.exists()
+
+
+class _RecordingParquetStore:
+  """Serves real parquet chunk files from disk and records downloaded keys."""
+
+  def __init__(self, files):
+    # files: list of (key, path)
+    self.files = list(files)
+    self.downloaded = []
+
+  def list_keys(self, bucket, prefix):
+    for key, _ in self.files:
+      yield {"Key": key}
+
+  def download_file(self, bucket, key, local):
+    self.downloaded.append(key)
+    source = dict(self.files)[key]
+    with open(source, "rb") as src, open(local, "wb") as dst:
+      dst.write(src.read())
+
+
+def _build_chunk_files(tmp_path, n_files, rows_per_file):
+  files = []
+  for ci in range(n_files):
+    df = pd.DataFrame(
+      [{"input": f"m{ci}_{ri}", "x": float(ci * 1000 + ri)} for ri in range(rows_per_file)]
+    )
+    path = tmp_path / f"chunk_{ci}.parquet"
+    df.to_parquet(path, index=False)
+    files.append((f"prefix/chunk_{ci}.parquet", str(path)))
+  return files
+
+
+@pytest.mark.parametrize("prefetch", [1, 3, 10])
+def test_stream_parquet_filtered_results_invariant_to_prefetch_depth(monkeypatch, tmp_path, prefetch):
+  files = _build_chunk_files(tmp_path, n_files=6, rows_per_file=4)
+  wanted = [f"m{ci}_{ri}" for ci in range(6) for ri in range(4)]
+
+  monkeypatch.setattr("isaura.stream.STREAM_PREFETCH_FILES", prefetch)
+  monkeypatch.setattr("isaura.stream.STREAM_DOWNLOAD_WORKERS", 4)
+
+  store = _RecordingParquetStore(files)
+  got = []
+  for chunk in stream_parquet_filtered(store, "bucket", "prefix", wanted, header="input", batch_size=2):
+    got.extend(chunk["input"].tolist())
+
+  # Unordered stream: every wanted row returned exactly once, regardless of prefetch depth.
+  assert sorted(got) == sorted(wanted)
+
+
+def test_stream_parquet_filtered_early_exit_bounds_downloads(monkeypatch, tmp_path):
+  # All wanted inputs live in the first chunk; later files must not all be downloaded.
+  files = _build_chunk_files(tmp_path, n_files=20, rows_per_file=4)
+  wanted = ["m0_0", "m0_1", "m0_2", "m0_3"]
+
+  monkeypatch.setattr("isaura.stream.STREAM_PREFETCH_FILES", 3)
+  monkeypatch.setattr("isaura.stream.STREAM_DOWNLOAD_WORKERS", 2)
+
+  store = _RecordingParquetStore(files)
+  got = []
+  for chunk in stream_parquet_filtered(store, "bucket", "prefix", wanted, header="input", batch_size=2):
+    got.extend(chunk["input"].tolist())
+
+  assert sorted(got) == sorted(wanted)
+  # Early-exit caps wasted downloads at the prefetch window past the resolving file.
+  assert len(store.downloaded) < len(files)
+  assert len(store.downloaded) <= 1 + 3

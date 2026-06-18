@@ -1,11 +1,19 @@
 import os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from isaura.const import INPUT_C, STREAM_DENSE_BATCH_ROWS, STREAM_DENSE_FILE_RATIO
+from isaura.const import (
+  INPUT_C,
+  STREAM_DENSE_BATCH_ROWS,
+  STREAM_DENSE_FILE_RATIO,
+  STREAM_DOWNLOAD_WORKERS,
+  STREAM_PREFETCH_FILES,
+)
 from isaura.logging import logger
 from isaura.utils import cleanup_temp_dir, make_temp, rss_mb
 
@@ -80,6 +88,7 @@ def stream_parquet_filtered(
   keys = []
   total_rows_yielded = 0
   n_chunks_yielded = 0
+  executor = None
   try:
     keys = sorted(
       (
@@ -100,19 +109,46 @@ def stream_parquet_filtered(
         unresolved=remaining,
       )
 
-    for ki, key in enumerate(keys):
+    # Download chunk files concurrently, a bounded window ahead of the consumer,
+    # so network I/O overlaps the (single-threaded) decode/filter/yield below and
+    # the downstream local-MinIO write. Only downloads run on the pool; all arrow/
+    # pandas work stays on this thread. The window bounds disk use and caps wasted
+    # downloads at `window` files past the point all wanted inputs are resolved.
+    executor = ThreadPoolExecutor(max_workers=max(1, STREAM_DOWNLOAD_WORKERS))
+    window = max(1, STREAM_PREFETCH_FILES)
+    inflight = deque()
+    next_submit = 0
+
+    def _submit_more():
+      nonlocal next_submit
+      while len(inflight) < window and next_submit < len(keys):
+        si = next_submit
+        skey = keys[si]
+        slocal = os.path.join(tmpdir, f"s_{si}.parquet")
+        fut = executor.submit(store.download_file, bucket, skey, slocal)
+        inflight.append((si, skey, slocal, fut))
+        next_submit += 1
+
+    _submit_more()
+    while inflight:
       if remaining <= 0:
         break
+      ki, key, local, fut = inflight.popleft()
+      # Keep the window full while this file is decoded/filtered below.
+      _submit_more()
       if remaining < len(wanted_arr) * 0.5:
         wanted_arr = pa.array(list(wanted_set))
       if progress is not None:
         progress.update(stage="scanning file", files_done=ki, files_total=len(keys), unresolved=remaining)
 
-      local = os.path.join(tmpdir, f"s_{ki}.parquet")
       try:
-        store.download_file(bucket, key, local)
+        fut.result()
       except Exception as e:
         logger.warning(f"[stream] skip {key}: {e}")
+        try:
+          os.remove(local)
+        except Exception:
+          pass
         continue
 
       try:
@@ -209,6 +245,10 @@ def stream_parquet_filtered(
         except Exception:
           pass
   finally:
+    # Stop pending/in-flight downloads before wiping tmpdir to avoid racing a
+    # download thread writing into a directory being removed (early-exit / close).
+    if executor is not None:
+      executor.shutdown(wait=True, cancel_futures=True)
     logger.debug(
       f"[stream] finished: files={len(keys)} yielded={total_rows_yielded} "
       f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
