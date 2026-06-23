@@ -71,10 +71,15 @@ class ReadProgress:
       description: Label shown next to the progress bar.
   """
 
-  def __init__(self, total_inputs=None, console=None, description="Reading"):
+  def __init__(self, total_inputs=None, console=None, description="Reading", writing_description=None):
     self.total_inputs = total_inputs
     self.console = console or Console(force_terminal=True, stderr=True)
     self.description = description
+    # Shown once the read flips from scanning files to sorting/writing the
+    # output. Falls back to the reading label so callers without a distinct
+    # write phase (e.g. pull) keep a single description throughout.
+    self.writing_description = writing_description or description
+    self.stage = None
     self.progress = None
     self.task_id = None
     self.found_rows = 0
@@ -112,6 +117,8 @@ class ReadProgress:
   def update(self, stage=None, files_done=None, files_total=None,
              found_rows=None, emitted_rows=None, unresolved=None):
     """Update the progress bar with the latest scan state."""
+    if stage is not None:
+      self.stage = stage
     if found_rows is not None:
       self.found_rows = found_rows
     if files_done is not None:
@@ -123,12 +130,20 @@ class ReadProgress:
     if unresolved is not None:
       self.unresolved = unresolved
     if self.progress is not None and self.task_id is not None:
-      completed = self.found_rows
+      # During the emit/write phase (reorder + stream to CSV) the file scan is
+      # already done, so found_rows no longer moves. Track emitted_rows instead
+      # and relabel, otherwise the bar looks frozen at 100% while the CSV fills.
+      if self.stage == "emitting":
+        completed = self.emitted_rows
+        description = self.writing_description
+      else:
+        completed = self.found_rows
+        description = self.description
       total = self.total_inputs if self.total_inputs is not None else max(100, completed or 0)
       if completed > total:
         total = completed
       self.progress.update(
-        self.task_id, completed=completed, total=total,
+        self.task_id, completed=completed, total=total, description=description,
         files_done=self.files_done, files_total=self.files_total,
       )
 

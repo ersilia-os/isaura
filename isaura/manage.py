@@ -450,33 +450,46 @@ class IsauraReader:
     """
     if df is None and hasattr(self, "_cached_wanted"):
       return self._cached_wanted
-    wanted, header_set = ([], set())
-    rows = df.to_dict("records") if df is not None else None
-    if rows is None:
-      logger.debug(f"[read:wanted] parsing inputs from csv={self.input_csv}")
-      with open(self.input_csv, newline="", encoding="utf-8") as f:
-        rows = csv.DictReader(f)
-        for row in rows:
-          h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-          v = (row.get(h) or "").strip()
-          if v:
-            wanted.append(v)
-          if h:
-            header_set.add(h)
-    else:
-      logger.debug(f"[read:wanted] parsing inputs from dataframe rows={len(rows)}")
-      for row in rows:
-        h = INPUT_C[0] if row.get(INPUT_C[0]) else INPUT_C[1]
-        v = (row.get(h) or "").strip()
+    wanted = []
+    if df is not None:
+      logger.debug(f"[read:wanted] parsing inputs from dataframe rows={len(df)}")
+      columns = list(df.columns)
+      header = self._resolve_input_header(columns, source="input dataframe")
+      for v in df[header].tolist():
+        v = ("" if v is None else str(v)).strip()
         if v:
           wanted.append(v)
-        if h:
-          header_set.add(h)
-    header = list(header_set)[0] if header_set else "smiles"
+    else:
+      logger.debug(f"[read:wanted] parsing inputs from csv={self.input_csv}")
+      with open(self.input_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        header = self._resolve_input_header(reader.fieldnames or [], source=self.input_csv)
+        for row in reader:
+          v = (row.get(header) or "").strip()
+          if v:
+            wanted.append(v)
     logger.debug(f"[read:wanted] collected inputs={len(wanted)} header={header}")
     if df is None:
       self._cached_wanted = (wanted, header)
     return (wanted, header)
+
+  def _resolve_input_header(self, columns, source):
+    """Return the molecule column among `columns`, or exit with a clear error.
+
+    The input must have a column named one of INPUT_C ("input" or "smiles").
+    A wrong/missing header is the usual cause of a "0 found" result, so fail
+    loudly here naming the expected vs actual headers instead of silently
+    collecting no inputs.
+    """
+    header = next((c for c in INPUT_C if c in columns), None)
+    if header is None:
+      logger.error(
+        f"No molecule column found in {source}. Expected a header named one of "
+        f"{list(INPUT_C)}, but found: {list(columns) or 'no columns'}. "
+        f"Rename the column to 'input' or 'smiles' and try again."
+      )
+      sys.exit(1)
+    return header
 
   def _prepare_read(self, df=None):
     """Validate inputs and resolve them to queryable molecule strings.
@@ -571,10 +584,7 @@ class IsauraReader:
 
     if self.wide_model:
       # Wide models stream chunk files; read_batched/read handle ordering
-      # (ordered → concat+reorder; unordered pull → straight passthrough). The
-      # DuckDB-over-S3 + global-sort variant was reverted (it hangs on large
-      # wide reads); ordered wide reads are still subject to the original
-      # full-frame OOM and are the next thing to redesign.
+      # (ordered → concat+reorder; unordered pull → straight passthrough).
       prefix = hive_prefix(self.base) + "/"
       logger.debug(f"[read] wide streaming n={n} ordered={ordered} bucket={self.bucket}")
       return "wide", prefix
@@ -907,7 +917,12 @@ class IsauraReader:
     source = None
     try:
       mode, payload = self._make_read_source(wanted, header, batch_size=batch_size, ordered=ordered)
-      with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
+      with ReadProgress(
+        total_inputs=len(wanted),
+        console=logger.console,
+        description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]",
+        writing_description=(f"Writing [bold]{self.model_id}[/bold] → [bold]{output_csv}[/bold]" if output_csv else None),
+      ) as progress:
         if mode == "wide":
           if ordered:
             # Memory-bounded external sort: scatter found rows to on-disk

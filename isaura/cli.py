@@ -221,14 +221,14 @@ def read(input_file, project_name, model, output_file, version, verbose):
 
 
 @cli.command("pull")
-@apply_opts(opt_input_file, opt_project, opt_model)
+@apply_opts(opt_input_file, opt_project_req, opt_model)
 @click.option("--version", "-v", required=False, default=None, help="Model version (default: latest stored version in the remote bucket)")
 @click.option("--verbose", "-V", is_flag=True, default=False, help="Show detailed internal logs")
 def pull(input_file, project_name, model, version, verbose):
   """Pull model outputs from the cloud store to local."""
   if verbose:
     logger.set_verbosity(True)
-  pn = project_name or DEFAULT_BUCKET_NAME
+  pn = project_name
   if version is None:
     from isaura.base import MinioStore
     from isaura.const import MINIO_ENDPOINT_CLOUD, MINIO_CLOUD_AK, MINIO_CLOUD_SK
