@@ -1774,15 +1774,32 @@ class IsauraInspect:
       return self._inspect_models_from_listing(bucket, prefix_filter)
     out = []
     for mid, mv in self.iter_models(bucket, prefix_filter=prefix_filter):
-      chunks = sum(
-        1 for k in self.list_objects(bucket, get_pref(mid, mv))
-        if "/chunk_" in k and k.endswith(".parquet")
-      )
+      chunks = 0
+      total_bytes = 0
+      for obj in self.iter_object_meta(bucket, get_pref(mid, mv)):
+        k = obj.get("Key", "")
+        if "/chunk_" in k and k.endswith(".parquet"):
+          chunks += 1
+          total_bytes += int(obj.get("Size") or 0)
       out.append({
         "bucket": bucket, "model_id": mid, "model_version": mv,
-        "model": f"{mid}/{mv}", "entries": len(self.load_index(bucket, mid, mv)), "chunks": chunks,
+        "model": f"{mid}/{mv}", "entries": len(self.load_index(bucket, mid, mv)),
+        "size": self._fmt_size(total_bytes), "chunks": chunks,
       })
     return out
+
+  @staticmethod
+  def _fmt_size(b):
+    """Human-readable, color-tiered byte size for catalog tables (rich markup)."""
+    if b >= 1 << 30:
+      return f"[bold red]{b / (1 << 30):.1f} GB[/]"
+    if b >= 100 * (1 << 20):
+      return f"[yellow]{b / (1 << 20):.1f} MB[/]"
+    if b >= 1 << 20:
+      return f"[green]{b / (1 << 20):.1f} MB[/]"
+    if b >= 1 << 10:
+      return f"[dim]{b / (1 << 10):.1f} KB[/]"
+    return f"[dim]{b} B[/]"
 
   def _inspect_models_from_listing(self, bucket, prefix_filter=""):
     """Single LIST for discovery. catalog.json for fast counts, footer reads as fallback."""
@@ -1840,21 +1857,11 @@ class IsauraInspect:
 
     out = []
     for (mid, mv), s in sorted(stats.items()):
-      b = s["bytes"]
-      if b >= 1 << 30:
-        size = f"[bold red]{b / (1 << 30):.1f} GB[/]"
-      elif b >= 100 * (1 << 20):
-        size = f"[yellow]{b / (1 << 20):.1f} MB[/]"
-      elif b >= 1 << 20:
-        size = f"[green]{b / (1 << 20):.1f} MB[/]"
-      elif b >= 1 << 10:
-        size = f"[dim]{b / (1 << 10):.1f} KB[/]"
-      else:
-        size = f"[dim]{b} B[/]"
       rows = row_counts.get((mid, mv), 0)
       out.append({
         "bucket": bucket, "model_id": mid, "model_version": mv,
-        "model": f"{mid}/{mv}", "entries": f"{rows:,}", "size": size, "chunks": len(s["chunks"]),
+        "model": f"{mid}/{mv}", "entries": f"{rows:,}", "size": self._fmt_size(s["bytes"]),
+        "chunks": len(s["chunks"]),
       })
     return out
 

@@ -183,6 +183,7 @@ _KEYMAP = {
 inspect_table = [
   {"key": "model", "name": "model/version", "justify": "left", "style": "bold"},
   {"key": "entries", "name": "entry count", "justify": "right"},
+  {"key": "size", "name": "size", "justify": "right"},
   {"key": "chunks", "name": "chunks", "justify": "right"},
 ]
 inspect_table_cloud = [

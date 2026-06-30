@@ -78,10 +78,15 @@ class ReadProgress:
     # Shown once the read flips from scanning files to sorting/writing the
     # output. Falls back to the reading label so callers without a distinct
     # write phase (e.g. pull) keep a single description throughout.
+    # A distinct write phase exists only when the caller passes a writing label
+    # (i.e. a CSV is being written). Without it (pull / read without --output)
+    # we keep a single morphing bar.
+    self._has_write_phase = writing_description is not None
     self.writing_description = writing_description or description
     self.stage = None
     self.progress = None
     self.task_id = None
+    self.write_task_id = None
     self.found_rows = 0
     self.files_done = 0
     self.files_total = 0
@@ -129,21 +134,43 @@ class ReadProgress:
       self.emitted_rows = emitted_rows
     if unresolved is not None:
       self.unresolved = unresolved
-    if self.progress is not None and self.task_id is not None:
-      # During the emit/write phase (reorder + stream to CSV) the file scan is
-      # already done, so found_rows no longer moves. Track emitted_rows instead
-      # and relabel, otherwise the bar looks frozen at 100% while the CSV fills.
-      if self.stage == "emitting":
-        completed = self.emitted_rows
-        description = self.writing_description
-      else:
-        completed = self.found_rows
-        description = self.description
-      total = self.total_inputs if self.total_inputs is not None else max(100, completed or 0)
-      if completed > total:
-        total = completed
+    if self.progress is None or self.task_id is None:
+      return
+
+    def _total_for(completed):
+      t = self.total_inputs if self.total_inputs is not None else max(100, completed or 0)
+      return max(t, completed)
+
+    if self.stage == "emitting" and self._has_write_phase:
+      # Reading is done. Freeze the read bar at 100% (kept on screen because the
+      # Progress is non-transient) and drive a SEPARATE write bar below it, so
+      # both the read time and the CSV-write time stay visible side by side.
+      read_total = _total_for(self.found_rows)
       self.progress.update(
-        self.task_id, completed=completed, total=total, description=description,
+        self.task_id, completed=read_total, total=read_total,
+        files_done=self.files_done, files_total=self.files_total,
+      )
+      if self.write_task_id is None:
+        self.write_task_id = self.progress.add_task(
+          self.writing_description, total=_total_for(self.emitted_rows), completed=0,
+          files_done=self.files_done, files_total=self.files_total,
+        )
+      self.progress.update(
+        self.write_task_id, completed=self.emitted_rows, total=_total_for(self.emitted_rows),
+        files_done=self.files_done, files_total=self.files_total,
+      )
+    elif self.stage == "emitting":
+      # No distinct write phase (pull / read without --output): single bar that
+      # tracks emitted rows once the scan is done.
+      self.progress.update(
+        self.task_id, completed=self.emitted_rows, total=_total_for(self.emitted_rows),
+        description=self.writing_description,
+        files_done=self.files_done, files_total=self.files_total,
+      )
+    else:
+      self.progress.update(
+        self.task_id, completed=self.found_rows, total=_total_for(self.found_rows),
+        description=self.description,
         files_done=self.files_done, files_total=self.files_total,
       )
 
