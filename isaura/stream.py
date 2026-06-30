@@ -13,9 +13,28 @@ from isaura.const import (
   STREAM_DENSE_FILE_RATIO,
   STREAM_DOWNLOAD_WORKERS,
   STREAM_PREFETCH_FILES,
+  WIDE_READ_TARGET_BYTES,
 )
 from isaura.logging import logger
 from isaura.utils import cleanup_temp_dir, make_temp, rss_mb
+
+
+def _safe_decode_rows(pf, target_bytes=WIDE_READ_TARGET_BYTES, floor=256, ceil=1_000_000):
+  """Max rows to decode/convert at once so one batch stays within target_bytes.
+
+  Derived from the file's ACTUAL uncompressed bytes/row (parquet metadata), so
+  it bounds RAM regardless of how the data was typed: a file whose numeric
+  outputs were stored as wide string columns has a large bytes/row and shrinks
+  automatically, while a compact numeric file is left at the generous ceiling
+  (so narrow/typed reads behave exactly as before).
+  """
+  md = pf.metadata
+  if md is None or md.num_rows <= 0 or md.num_row_groups <= 0:
+    return ceil
+  rg = md.row_group(0)
+  rows = rg.num_rows or 1
+  bytes_per_row = max(1, rg.total_byte_size // rows)
+  return max(floor, min(ceil, int(target_bytes // bytes_per_row)))
 
 
 def _yield_filtered_chunks(filtered, header, batch_size, wanted_set, progress_cb):
@@ -56,6 +75,9 @@ def stream_parquet_filtered(
   batch_size=10000,
   dense_file_ratio=STREAM_DENSE_FILE_RATIO,
   progress=None,
+  download_workers=None,
+  prefetch_files=None,
+  dense_batch_rows=None,
 ):
   """Stream matching rows from Parquet chunk files on MinIO without loading all files into memory.
 
@@ -77,10 +99,17 @@ def stream_parquet_filtered(
       batch_size: Maximum rows per yielded DataFrame.
       dense_file_ratio: Fraction of a file's rows that must be wanted to use dense mode.
       progress: Optional ReadProgress instance for live progress updates.
+      download_workers: Concurrent download threads. None → STREAM_DOWNLOAD_WORKERS.
+          The wide-model call site passes the auto-scaled WIDE_STREAM_DOWNLOAD_WORKERS.
+      prefetch_files: Download window size. None → STREAM_PREFETCH_FILES.
+      dense_batch_rows: Dense-mode batch size. None → STREAM_DENSE_BATCH_ROWS.
 
   Yields:
       DataFrames of matching rows, in file order.
   """
+  download_workers = STREAM_DOWNLOAD_WORKERS if download_workers is None else download_workers
+  prefetch_files = STREAM_PREFETCH_FILES if prefetch_files is None else prefetch_files
+  dense_batch_rows = STREAM_DENSE_BATCH_ROWS if dense_batch_rows is None else dense_batch_rows
   wanted_set = set(wanted) if not isinstance(wanted, set) else wanted
   remaining = len(wanted_set)
   wanted_arr = pa.array(list(wanted_set))
@@ -114,8 +143,8 @@ def stream_parquet_filtered(
     # the downstream local-MinIO write. Only downloads run on the pool; all arrow/
     # pandas work stays on this thread. The window bounds disk use and caps wasted
     # downloads at `window` files past the point all wanted inputs are resolved.
-    executor = ThreadPoolExecutor(max_workers=max(1, STREAM_DOWNLOAD_WORKERS))
-    window = max(1, STREAM_PREFETCH_FILES)
+    executor = ThreadPoolExecutor(max_workers=max(1, download_workers))
+    window = max(1, prefetch_files)
     inflight = deque()
     next_submit = 0
 
@@ -162,9 +191,16 @@ def stream_parquet_filtered(
         schema_names = set(pf.schema_arrow.names)
         parquet_col = next((c for c in [header] + INPUT_C if c in schema_names), header)
 
+        # Bound the per-batch RAM from the file's ACTUAL bytes/row: keeps peak
+        # memory safe even for models whose numeric outputs were stored as wide
+        # string columns. Numeric/narrow files leave safe_rows at the ceiling, so
+        # _dec/_emit reduce to the previous values (behaviour unchanged there).
+        safe_rows = _safe_decode_rows(pf)
+        _dec = min(max(batch_size, dense_batch_rows), safe_rows)
+        _emit = min(batch_size, safe_rows)
+
         if use_dense:
-          dense_batch_rows = max(batch_size, STREAM_DENSE_BATCH_ROWS)
-          for batch in pf.iter_batches(batch_size=dense_batch_rows):
+          for batch in pf.iter_batches(batch_size=_dec):
             if remaining <= 0:
               break
             table = pa.Table.from_batches([batch])
@@ -174,8 +210,8 @@ def stream_parquet_filtered(
             filtered = table.filter(mask)
             if filtered.num_rows == 0:
               continue
-            for start in range(0, filtered.num_rows, batch_size):
-              chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
+            for start in range(0, filtered.num_rows, _emit):
+              chunk = filtered.slice(start, _emit).to_pandas(split_blocks=True, self_destruct=True)
               if parquet_col != header:
                 chunk = chunk.rename(columns={parquet_col: header})
               matched = set(chunk[header].astype(str).str.strip())
@@ -199,36 +235,50 @@ def stream_parquet_filtered(
             if remaining <= 0:
               break
             key_col = pf.read_row_group(rg_idx, columns=[parquet_col]).column(parquet_col)
-            mask = pc.is_in(key_col, wanted_arr)
-            if pc.any(mask).as_py() is not True:
-              del key_col, mask
+            has_match = pc.any(pc.is_in(key_col, wanted_arr)).as_py() is True
+            del key_col
+            if not has_match:
               continue
-            filtered = pf.read_row_group(rg_idx).filter(mask)
-            del key_col, mask
-            if filtered.num_rows == 0:
+            # Read the whole row group when it fits the RAM budget (narrow/typed,
+            # unchanged); otherwise decode it in safe-sized sub-batches so a wide
+            # string row group never lands in memory all at once.
+            if safe_rows >= pf.metadata.row_group(rg_idx).num_rows:
+              group_tables = [pf.read_row_group(rg_idx)]
+            else:
+              group_tables = (
+                pa.Table.from_batches([b])
+                for b in pf.iter_batches(batch_size=_dec, row_groups=[rg_idx])
+              )
+            for table in group_tables:
+              if remaining <= 0:
+                break
+              mask = pc.is_in(table.column(parquet_col), wanted_arr)
+              if pc.any(mask).as_py() is not True:
+                continue
+              filtered = table.filter(mask)
+              if filtered.num_rows == 0:
+                continue
+              for start in range(0, filtered.num_rows, _emit):
+                chunk = filtered.slice(start, _emit).to_pandas(split_blocks=True, self_destruct=True)
+                if parquet_col != header:
+                  chunk = chunk.rename(columns={parquet_col: header})
+                matched = set(chunk[header].astype(str).str.strip())
+                remaining -= len(matched & wanted_set)
+                wanted_set -= matched
+                n_chunks_yielded += 1
+                total_rows_yielded += len(chunk)
+                if progress is not None:
+                  progress.update(
+                    stage=f"yielding matches {ki + 1}/{len(keys)}",
+                    files_done=ki + 1,
+                    files_total=len(keys),
+                    found_rows=total_rows_yielded,
+                    emitted_rows=total_rows_yielded,
+                    unresolved=remaining,
+                  )
+                yield chunk
+                del chunk
               del filtered
-              continue
-            for start in range(0, filtered.num_rows, batch_size):
-              chunk = filtered.slice(start, batch_size).to_pandas(split_blocks=True, self_destruct=True)
-              if parquet_col != header:
-                chunk = chunk.rename(columns={parquet_col: header})
-              matched = set(chunk[header].astype(str).str.strip())
-              remaining -= len(matched & wanted_set)
-              wanted_set -= matched
-              n_chunks_yielded += 1
-              total_rows_yielded += len(chunk)
-              if progress is not None:
-                progress.update(
-                  stage=f"yielding matches {ki + 1}/{len(keys)}",
-                  files_done=ki + 1,
-                  files_total=len(keys),
-                  found_rows=total_rows_yielded,
-                  emitted_rows=total_rows_yielded,
-                  unresolved=remaining,
-                )
-              yield chunk
-              del chunk
-            del filtered
 
         logger.debug(
           f"[stream] file {ki + 1}/{len(keys)} done key={key.split('/')[-1]} "

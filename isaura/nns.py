@@ -197,15 +197,15 @@ def get_apprx(inputs, collection, fallback_search=None):
 def group_inputs(wanted, index, bloom=None, force=False):
   """Group wanted molecule inputs by their (row, chunk) coordinates from the JSON index.
 
-  Used in approximate read mode to map NNS-resolved SMILES to the right
-  Parquet chunk file. If force=True, molecules missing from the index have
-  their coordinates computed from SMILES via tranche_coordinates().
+  DEPRECATED: part of the nearest-neighbour (NNS) approximate-read path, which
+  is no longer wired into the CLI. Kept for reference only. The SMILES-based
+  coordinate fallback (MW/LogP via tranche_coordinates) was removed.
 
   Args:
       wanted: List of molecule SMILES strings to group.
       index: JSON index dict mapping SMILES to (row, chunk) tuples.
       bloom: Optional BloomIndex used to detect missing inputs.
-      force: If True, compute coordinates for missing inputs instead of exiting.
+      force: Unused; retained for signature compatibility.
 
   Returns:
       Dict mapping (row, chunk) tuples to sets of SMILES strings, or None on error.
@@ -215,20 +215,13 @@ def group_inputs(wanted, index, bloom=None, force=False):
     if bloom:
       miss = [s for s in wanted if not bloom.seen(s)]
     g = defaultdict(set)
-    if miss and not force:
+    if miss:
       logger.error(f"inputs not indexed: {miss[:5]} total_missing={len(miss)}")
       sys.exit(1)
-    if not force:
-      for s in wanted:
-        r, c = index[s]
-        g[int(r), int(c)].add(s)
-      return g
-    if miss and force:
-      from isaura.metadata import tranche_coordinates
-      for s in miss:
-        r, c, _, _ = tranche_coordinates(s)
-        g[int(r), int(c)].add(s)
-      return g
+    for s in wanted:
+      r, c = index[s]
+      g[int(r), int(c)].add(s)
+    return g
   except Exception as e:
     logger.error(e)
     return None

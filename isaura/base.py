@@ -19,12 +19,15 @@ from isaura.helpers import (
   MINIO_MULTIPART_THRESHOLD,
   MINIO_MULTIPART_CHUNKSIZE,
   MINIO_MAX_CONCURRENCY,
+  MINIO_MAX_POOL_CONNECTIONS,
   logger,
   console,
   rss_mb,
   chunk_row_limit,
   chunk_write_batch_rows,
   parquet_writer_kwargs,
+  build_typed_array,
+  resolve_write_types,
   fetch_schema_from_github,
   get_acc_key,
   get_base,
@@ -199,7 +202,13 @@ class MinioStore:
       aws_access_key_id=self.access,
       aws_secret_access_key=self.secret,
       region_name="us-east-1",
-      config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+      config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"},
+        max_pool_connections=MINIO_MAX_POOL_CONNECTIONS,
+        tcp_keepalive=True,
+        retries={"mode": "adaptive", "max_attempts": 5},
+      ),
     )
     self.transfer_config = TransferConfig(
       multipart_threshold=multipart_threshold or MINIO_MULTIPART_THRESHOLD,
@@ -526,6 +535,9 @@ class ChunkState:
     self.max_rows = max_rows
     self.write_batch_rows = chunk_write_batch_rows(output_dimension)
     self.pq_ctor_kw, self.pq_wt_kw = parquet_writer_kwargs(output_dimension)
+    # {column_name: arrow type} from run_columns.csv; set by the writer once the
+    # schema is known. Empty => fall back to per-column type inference.
+    self.column_types = {}
     self.state = {}
 
   def _rows_to_frame(self, rows, schema_cols):
@@ -559,12 +571,16 @@ class ChunkState:
       return json.dumps(list(value), ensure_ascii=False)
     return str(value)
 
-  def _build_array(self, values):
+  def _build_array(self, values, col=None):
     """Build a PyArrow array from a list of Python values.
 
-    Tries native type inference first; falls back to string conversion for
-    heterogeneous or non-serialisable columns.
+    When the column has a declared type (from run_columns.csv via the writer),
+    build that exact type and hard-fail on bad data. Otherwise fall back to native
+    type inference, then to string for heterogeneous/non-serialisable columns.
     """
+    target = self.column_types.get(col) if col is not None else None
+    if target is not None:
+      return build_typed_array(values, target)
     normalized = [self._normalize_scalar(v) for v in values]
     try:
       return pa.array(normalized, from_pandas=True)
@@ -574,13 +590,13 @@ class ChunkState:
   def _frame_to_table(self, df, schema_cols):
     """Convert a DataFrame slice to a PyArrow Table with schema_cols columns."""
     df = self._ensure_cols(df, schema_cols)
-    arrays = [self._build_array(df[col].tolist()) for col in schema_cols]
+    arrays = [self._build_array(df[col].tolist(), col) for col in schema_cols]
     return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _rows_to_table(self, rows, schema_cols):
     """Convert a list of row dicts to a PyArrow Table with schema_cols columns."""
     cols = {col: [row.get(col) if isinstance(row, dict) else None for row in rows] for col in schema_cols}
-    arrays = [self._build_array(cols[col]) for col in schema_cols]
+    arrays = [self._build_array(cols[col], col) for col in schema_cols]
     return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _ensure_cols(self, df, schema_cols):
@@ -915,6 +931,9 @@ class _SinkWriter:
       n_in = len(df)
       if self.schema_cols is None:
         self.schema_cols = list(df.columns)
+        # Resolve declared column types from run_columns.csv (enforces the contract
+        # and self-heals string-typed numeric data on pull write-back).
+        self.chunk_state.column_types = resolve_write_types(self.model_id, self.schema_cols)
       if "input" in df.columns:
         inputs = df["input"].astype(str).str.strip()
       elif "smiles" in df.columns:
@@ -943,6 +962,8 @@ class _SinkWriter:
       if self.buf_rows >= self.max_rows:
         self._flush()
       return added
+    except RuntimeError:
+      raise  # column-contract violation must surface, never be silently swallowed
     except Exception as e:
       logger.error(f"[sink] error: {e}")
       return 0

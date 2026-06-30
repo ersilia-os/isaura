@@ -1,3 +1,4 @@
+import csv
 import json
 import subprocess
 
@@ -6,14 +7,11 @@ import yaml
 from io import StringIO
 from pathlib import Path
 
-from rdkit import Chem
-from rdkit.Chem import Descriptors, Crippen
-
 from isaura.const import (
   DEFAULT_BUCKET_NAME, DEFAULT_PRIVATE_BUCKET_NAME,
-  GITHUB_CONTENT_URL, LOGP_BINS, METADATA_JSON, METADATA_YML,
+  GITHUB_CONTENT_URL, METADATA_JSON, METADATA_YML,
   MINIO_ENDPOINT, MINIO_LOCAL_AK, MINIO_LOCAL_SK,
-  MKEYS, MW_BINS, _INT_KEYS, _KEYMAP,
+  MKEYS, RUN_COLUMNS_FILE, _INT_KEYS, _KEYMAP,
 )
 from isaura.logging import logger
 
@@ -21,6 +19,50 @@ from isaura.logging import logger
 def _github_get(mid, file):
   """Fetch a raw file from the Ersilia model GitHub repository."""
   return requests.get(f"{GITHUB_CONTENT_URL}/{mid}/main/{file}")
+
+
+def fetch_run_columns(model_id):
+  """Fetch and parse a model's run_columns.csv from GitHub.
+
+  run_columns.csv is the authoritative declaration of a model's output columns
+  (header: name,type,direction,description). Returns an ordered dict mapping each
+  declared output column name to its lower-cased declared type (e.g. "float",
+  "integer", "string"), or None if the file is missing / unreadable so the caller
+  can log loudly and fall back to inference.
+
+  Args:
+      model_id: Ersilia model identifier (e.g. "eos4u6p").
+
+  Returns:
+      dict[str, str] of {column_name: declared_type}, or None if unavailable.
+  """
+  try:
+    r = _github_get(model_id, RUN_COLUMNS_FILE)
+  except Exception as e:
+    logger.warning(f"[run_columns] fetch failed for {model_id}: {e}")
+    return None
+  if r.status_code != 200:
+    logger.warning(f"[run_columns] {model_id}: HTTP {r.status_code} for {RUN_COLUMNS_FILE}")
+    return None
+  out = {}
+  try:
+    reader = csv.DictReader(StringIO(r.text))
+    if not reader.fieldnames or "name" not in reader.fieldnames or "type" not in reader.fieldnames:
+      logger.warning(f"[run_columns] {model_id}: unexpected header {reader.fieldnames}")
+      return None
+    for row in reader:
+      name = (row.get("name") or "").strip()
+      typ = (row.get("type") or "").strip().lower()
+      if name:
+        out[name] = typ
+  except Exception as e:
+    logger.warning(f"[run_columns] {model_id}: parse error: {e}")
+    return None
+  if not out:
+    logger.warning(f"[run_columns] {model_id}: no columns parsed from {RUN_COLUMNS_FILE}")
+    return None
+  logger.debug(f"[run_columns] {model_id}: {len(out)} declared columns")
+  return out
 
 
 def pick_meta(d):
@@ -108,31 +150,6 @@ def write_access_file(existed, data, access, dir):
         json.dump(m, f, indent=2)
   except Exception as e:
     logger.error(e)
-
-
-def tranche_coordinates(smiles):
-  """Compute the (row, col, mw, logp) tranche coordinates for a SMILES string.
-
-  Bins molecular weight and LogP into grid coordinates used to assign a
-  molecule to a specific Parquet tranche. Used as a fallback when a molecule
-  is missing from the JSON index.
-
-  Args:
-      smiles: A valid SMILES string.
-
-  Returns:
-      Tuple of (row, col, mw, logp).
-
-  Raises:
-      ValueError: If the SMILES string cannot be parsed by RDKit.
-  """
-  mol = Chem.MolFromSmiles(smiles)
-  if mol is None:
-    raise ValueError("Invalid SMILES")
-  mw, logp = Descriptors.MolWt(mol), Crippen.MolLogP(mol)
-  col = next((i + 1 for i, edge in enumerate(MW_BINS) if mw <= edge), len(MW_BINS) + 1)
-  row = next((j + 1 for j, edge in enumerate(LOGP_BINS) if logp <= edge), len(LOGP_BINS) + 1)
-  return (row, col, mw, logp)
 
 
 def docker_is_installed() -> bool:

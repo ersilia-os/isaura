@@ -34,10 +34,12 @@ from isaura.helpers import (
   bind_temp_dirs,
   release_temp_dirs,
   chunk_row_limit,
+  resolve_write_types,
   logger,
   console,
   output_dimension_from_metadata,
   rss_mb,
+  avail_mem,
   fetch_schema_from_github,
   get_acc_key,
   get_apprx,
@@ -62,6 +64,13 @@ from isaura.const import (
   WIDE_REORDER_BUCKET_ROWS,
   WIDE_REORDER_MAX_OPEN_BUCKETS,
   WIDE_REORDER_MIN_FREE_MB,
+  WIDE_STREAM_DOWNLOAD_WORKERS,
+  WIDE_STREAM_PREFETCH_FILES,
+  WIDE_STREAM_DENSE_BATCH_ROWS,
+  WIDE_READ_BATCH_ROWS,
+  WIDE_READ_BATCH_MEM_FRACTION,
+  WIDE_READ_BATCH_ROWS_MIN,
+  WIDE_READ_BATCH_ROWS_MAX,
 )
 from isaura.query import chunked_query_batched
 
@@ -197,9 +206,20 @@ class IsauraWriter:
     self.buffers = []
     self.buf_rows = 0
     self.schema_cols = None
+    self._types_resolved = False
     logger.debug(
       f"writer init: bucket={self.bucket} base={self.base_prefix} csv={self.input_csv} output_dim={self.output_dimension} chunk_limit={self.max_rows}"
     )
+
+  def _apply_column_types(self):
+    """Resolve declared run_columns types for the schema and enforce the contract (once).
+
+    Raises RuntimeError on a column-contract mismatch (unless ISAURA_SKIP_COLUMN_CHECK);
+    falls back to inferred types (empty map) when run_columns.csv is unavailable.
+    """
+    if self.schema_cols and not self._types_resolved:
+      self._types_resolved = True
+      self.chunk_state.column_types = resolve_write_types(self.model_id, self.schema_cols)
 
   def _read_bucket_access(self):
     """Resolve access level: hardcoded for canonical buckets, read from access.json for custom ones."""
@@ -247,6 +267,7 @@ class IsauraWriter:
     if self.schema_cols is None:
       self.schema_cols = list(row.keys())
       logger.debug(f"writer schema: {self.schema_cols[:10]}")
+      self._apply_column_types()
 
   def _flush_if_needed(self):
     """Flush the in-memory buffer to MinIO if it has reached max_rows."""
@@ -309,6 +330,7 @@ class IsauraWriter:
         if self.schema_cols is None:
           self.schema_cols = list(chunk.columns)
           logger.debug(f"writer schema: {self.schema_cols[:10]}")
+          self._apply_column_types()
         if "input" in chunk.columns:
           inputs = chunk["input"].astype(str).str.strip()
         elif "smiles" in chunk.columns:
@@ -602,6 +624,42 @@ class IsauraReader:
       return "duckdb", raw
     return "duckdb", _rename(raw, parquet_col, header)
 
+  def _wide_stream_kwargs(self):
+    """Auto-scaled download/decode knobs for the wide-model streaming path.
+
+    Returns the kwargs to pass to stream_parquet_filtered so wide reads/pulls
+    get more parallel downloads, a deeper prefetch window, and larger dense
+    batches. Values come from const (machine-computed, env-overridable) and
+    apply ONLY here — narrow models keep stream_parquet_filtered's defaults.
+    """
+    return {
+      "download_workers": WIDE_STREAM_DOWNLOAD_WORKERS,
+      "prefetch_files": WIDE_STREAM_PREFETCH_FILES,
+      "dense_batch_rows": WIDE_STREAM_DENSE_BATCH_ROWS,
+    }
+
+  def _wide_batch_size(self):
+    """Rows per batch for a wide read, sized to keep one batch within a RAM budget.
+
+    A pinned WIDE_READ_BATCH_ROWS env value wins; otherwise compute from
+    available RAM and the model's output width (a wider model → fewer rows per
+    batch for the same memory), clamped to [MIN, MAX]. Reduces the number of
+    .to_pandas() conversions on capable machines while staying safe on a
+    low-resource laptop.
+    """
+    width = self.output_dimension or 100
+    if WIDE_READ_BATCH_ROWS > 0:
+      rows = WIDE_READ_BATCH_ROWS
+    else:
+      # ~8 bytes/cell; the Arrow→pandas copy is transient on top of this budget.
+      rows = int(avail_mem() * WIDE_READ_BATCH_MEM_FRACTION / (max(1, width) * 8))
+      rows = max(WIDE_READ_BATCH_ROWS_MIN, min(WIDE_READ_BATCH_ROWS_MAX, rows))
+    logger.debug(
+      f"[read] wide knobs: batch_size={rows} width={width} workers={WIDE_STREAM_DOWNLOAD_WORKERS} "
+      f"prefetch={WIDE_STREAM_PREFETCH_FILES} dense_batch={WIDE_STREAM_DENSE_BATCH_ROWS}"
+    )
+    return rows
+
   def _load_index(self):
     """Download and parse the JSON index for this model. Returns [] on failure."""
     local = os.path.join(self.tmpdir, f"{uuid.uuid4().hex}.json")
@@ -830,6 +888,7 @@ class IsauraReader:
       with ReadProgress(total_inputs=len(wanted), console=logger.console, description=f"Reading [bold]{self.model_id}[/bold] → [bold]{self.bucket}[/bold]") as progress:
         if mode == "wide":
           # Memory-bounded external sort yields rows already in input order.
+          wbs = self._wide_batch_size()
           source = self._reorder_external(
             wanted,
             header,
@@ -839,10 +898,11 @@ class IsauraReader:
               payload,
               wanted,
               header=header,
-              batch_size=10000,
+              batch_size=wbs,
               progress=progress,
+              **self._wide_stream_kwargs(),
             ),
-            10000,
+            wbs,
           )
         elif mode == "stream":
           source = stream_parquet_filtered_ordered(
@@ -924,6 +984,9 @@ class IsauraReader:
         writing_description=(f"Writing [bold]{self.model_id}[/bold] → [bold]{output_csv}[/bold]" if output_csv else None),
       ) as progress:
         if mode == "wide":
+          # Wide path gets the auto-scaled batch size + download/decode knobs;
+          # narrow paths below keep the caller's batch_size and stream defaults.
+          wbs = self._wide_batch_size()
           if ordered:
             # Memory-bounded external sort: scatter found rows to on-disk
             # buckets keyed by input position, then gather in order. Replaces
@@ -937,10 +1000,11 @@ class IsauraReader:
                 payload,
                 wanted,
                 header=header,
-                batch_size=batch_size,
+                batch_size=wbs,
                 progress=progress,
+                **self._wide_stream_kwargs(),
               ),
-              batch_size,
+              wbs,
             )
           else:
             source = stream_parquet_filtered(
@@ -949,8 +1013,9 @@ class IsauraReader:
               payload,
               wanted,
               header=header,
-              batch_size=batch_size,
+              batch_size=wbs,
               progress=progress,
+              **self._wide_stream_kwargs(),
             )
         elif mode == "stream":
           if ordered:
@@ -1115,6 +1180,7 @@ class IsauraMolRemover:
         Tuple of (rows_before, rows_after).
     """
     import pyarrow as pa
+    import pyarrow.compute as pc
     local = os.path.join(self.tmpdir, f"chunk_dl_{uuid.uuid4().hex}.parquet")
     local_out = os.path.join(self.tmpdir, f"chunk_out_{uuid.uuid4().hex}.parquet")
     try:
@@ -1122,17 +1188,31 @@ class IsauraMolRemover:
       pf = pq.ParquetFile(local)
       schema_names = pf.schema_arrow.names
       input_col = next((c for c in ["input", "smiles"] if c in schema_names), schema_names[0])
+      input_idx = schema_names.index(input_col)
       rows_before = pf.metadata.num_rows
-      df = pf.read().to_pandas()
-      mask = ~df[input_col].astype(str).str.strip().isin(to_remove)
-      filtered = df.loc[mask].reset_index(drop=True)
-      rows_after = len(filtered)
+      # Stream the chunk in row batches rather than pf.read().to_pandas(), so
+      # peak RAM stays bounded no matter how large the chunk is (legacy chunks
+      # can hold 100k+ rows of a very wide model — a full read would OOM).
+      remove_set = pa.array(list(to_remove), type=pa.string())
+      writer = None
+      rows_after = 0
+      try:
+        for batch in pf.iter_batches(batch_size=10000):
+          col = pc.utf8_trim_whitespace(batch.column(input_idx).cast(pa.string()))
+          kept = batch.filter(pc.invert(pc.is_in(col, value_set=remove_set)))
+          if kept.num_rows == 0:
+            continue
+          if writer is None:
+            writer = pq.ParquetWriter(local_out, batch.schema)
+          writer.write_batch(kept)
+          rows_after += kept.num_rows
+      finally:
+        if writer is not None:
+          writer.close()
       if rows_after == 0:
         self.store.client.delete_object(Bucket=self.bucket, Key=chunk_key)
         logger.debug(f"[remove] deleted empty chunk {chunk_key}")
       else:
-        table = pa.Table.from_pandas(filtered, preserve_index=False)
-        pq.write_table(table, local_out)
         self.store.upload_file(local_out, self.bucket, chunk_key)
         logger.debug(f"[remove] rewrote chunk {chunk_key}: {rows_before}→{rows_after} rows")
       return (rows_before, rows_after)
@@ -1694,9 +1774,13 @@ class IsauraInspect:
       return self._inspect_models_from_listing(bucket, prefix_filter)
     out = []
     for mid, mv in self.iter_models(bucket, prefix_filter=prefix_filter):
+      chunks = sum(
+        1 for k in self.list_objects(bucket, get_pref(mid, mv))
+        if "/chunk_" in k and k.endswith(".parquet")
+      )
       out.append({
         "bucket": bucket, "model_id": mid, "model_version": mv,
-        "model": f"{mid}/{mv}", "entries": len(self.load_index(bucket, mid, mv)), "chunks": None,
+        "model": f"{mid}/{mv}", "entries": len(self.load_index(bucket, mid, mv)), "chunks": chunks,
       })
     return out
 
