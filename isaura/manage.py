@@ -1101,31 +1101,6 @@ class IsauraMover(_BaseTransfer):
     logger.success(f"[move] done wiped={n} elapsed={time.time() - t0:.1f}s")
 
 
-class IsauraRemover(_BaseTransfer):
-  """Deletes a model's data from a bucket, or all objects in a project bucket.
-
-  If project_name is set, deletes the entire project bucket without needing
-  a model_id or model_version. Otherwise delegates to _BaseTransfer._delete().
-  """
-
-  def __init__(self, model_id=None, model_version=None, bucket=None, project_name=None):
-    self._project_name = project_name
-    if project_name:
-      self._store = MinioStore()
-    else:
-      super().__init__(model_id, model_version, bucket)
-
-  def remove(self):
-    """Delete all objects for this model (or entire project bucket if project_name is set)."""
-    if self._project_name:
-      store = self._store
-      n = store.delete_prefix(self._project_name, "")
-      logger.info(f"removed all objects in project={self._project_name} count={n}")
-    else:
-      n = self._delete()
-      logger.info(f"removed objects={n}")
-
-
 class IsauraMolRemover:
   """Removes specific molecules from a model's stored data in a bucket.
 

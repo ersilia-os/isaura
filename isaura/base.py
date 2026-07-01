@@ -554,6 +554,12 @@ class ChunkState:
     self._open_schema = None
     self._open_idx = None
     self._open_rows = 0
+    # Rows accumulated across flushes but not yet cut into a row group; coalesced
+    # to whole row groups (write_batch_rows) so the byte-sized row-group target is
+    # honored regardless of how small each incoming flush is.
+    self._pending = []
+    self._pending_rows = 0
+    self._pending_schema = None
 
   def _rows_to_frame(self, rows, schema_cols):
     """Convert a list of row dicts to a DataFrame with exactly schema_cols columns."""
@@ -802,6 +808,7 @@ class ChunkState:
     file_rows = max(1, int(WIDE_TARGET_FILE_BYTES / bytes_per_row))
     rg_rows = max(1, int(WIDE_TARGET_ROWGROUP_BYTES / bytes_per_row))
     rg_rows = min(rg_rows, file_rows)
+    file_rows = max(rg_rows, (file_rows // rg_rows) * rg_rows)  # whole row groups per file
     self.max_rows = file_rows
     self.write_batch_rows = rg_rows
     self.pq_wt_kw["row_group_size"] = rg_rows
@@ -836,26 +843,63 @@ class ChunkState:
     self._open_rows = 0
 
   def _flush_accum(self, tables):
-    """Write typed tables into the open chunk, uploading and rolling to a new chunk
-    each time it reaches file_rows; the trailing partial waits for finalize_chunks()."""
+    """Accumulate typed tables and cut them into whole row groups (write_batch_rows) as
+    they fill, streaming into the open chunk and rolling at file_rows. This makes the
+    byte-sized row-group target real even when each incoming flush is small; pyarrow
+    never merges across write_table calls, so we coalesce here instead. The trailing
+    partial row group + chunk are flushed by finalize_chunks(); peak RAM ~= one row group."""
     for table in tables:
       if table.num_rows == 0:
         continue
       if not self._calibrated:
         self._calibrate(table)
+      if self._pending_schema is None:
+        self._pending_schema = table.schema
+      self._pending.append(table.cast(self._pending_schema))
+      self._pending_rows += table.num_rows
+      if self._pending_rows >= self.write_batch_rows:
+        self._drain_pending(final=False)
+
+  def _drain_pending(self, final):
+    """Write accumulated rows into the open chunk in whole row groups. Mid-run writes
+    only complete row groups (write_batch_rows); the trailing partial is written when final."""
+    if not self._pending_rows:
+      return
+    rg = self.write_batch_rows
+    combined = self._pending[0] if len(self._pending) == 1 else pa.concat_tables(self._pending)
+    n_write = combined.num_rows if final else (combined.num_rows // rg) * rg
+    if n_write <= 0:
+      return
+    self._write_to_open(combined.slice(0, n_write))
+    remainder = combined.slice(n_write)
+    self._pending = [remainder.combine_chunks()] if remainder.num_rows else []
+    self._pending_rows = remainder.num_rows
+
+  def _write_to_open(self, table):
+    """Append a table to the open chunk, rolling to a new chunk at file_rows; row groups
+    are sized by pq_wt_kw['row_group_size'] (= write_batch_rows)."""
+    n = table.num_rows
+    offset = 0
+    while offset < n:
       if self._open_writer is None:
         self._open_new_writer(table.schema)
-      self._open_writer.write_table(table.cast(self._open_schema), **self.pq_wt_kw)
-      self._open_rows += table.num_rows
+      take = min(self.max_rows - self._open_rows, n - offset)
+      self._open_writer.write_table(table.slice(offset, take).cast(self._open_schema), **self.pq_wt_kw)
+      self._open_rows += take
+      offset += take
       if self._open_rows >= self.max_rows:
         self._close_and_upload_open()
 
   def finalize_chunks(self):
-    """Upload the trailing partial wide chunk, if any. Call once after all flushes.
+    """Flush the trailing partial row group and open chunk. Call once after all flushes.
 
     No-op for narrow models (which upload every chunk inside flush/flush_df).
     """
-    if self.wide and self._open_writer is not None and self._open_rows > 0:
+    if not self.wide:
+      return
+    if self._pending_rows:
+      self._drain_pending(final=True)
+    if self._open_writer is not None and self._open_rows > 0:
       self._close_and_upload_open()
 
   def flush(self, rows, schema_cols):

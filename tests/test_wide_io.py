@@ -194,6 +194,45 @@ def test_wide_chunk_calibrates_chunk_size_from_bytes(tmp_path, monkeypatch):
   assert list(out["input"]) == [f"s{i}" for i in range(n)]
 
 
+def _all_row_group_sizes(tmp_path, bucket="bucket", base="model/v1/tranches"):
+  import glob
+  d = os.path.join(str(tmp_path), bucket, base, "data")
+  paths = sorted(
+    glob.glob(os.path.join(d, "chunk_*.parquet")),
+    key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]),
+  )
+  sizes = []
+  for p in paths:
+    md = pq.ParquetFile(p).metadata
+    sizes += [md.row_group(i).num_rows for i in range(md.num_row_groups)]
+  return sizes
+
+
+def test_wide_chunk_row_groups_coalesced_to_target(tmp_path, monkeypatch):
+  # Row groups must be coalesced to the calibrated write_batch_rows regardless of how
+  # small each flush is; pre-fix each tiny flush became its own row group (the 64 MB
+  # WIDE_TARGET_ROWGROUP_BYTES knob was dead). Assert uniform rg-sized groups + one partial.
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_FILE_BYTES", 400_000)
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_ROWGROUP_BYTES", 100_000)
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(
+    store, "bucket", "model/v1/tranches", str(tmp_path), 999999, output_dimension=150
+  )
+  cols = ["input"] + [f"d{j}" for j in range(150)]
+  n = 500
+  for start in range(n):  # one row per flush -> must NOT yield 500 one-row row groups
+    tranche.flush(_wide_chunk_rows(1, start=start), cols)
+  tranche.finalize_chunks()
+
+  rg = tranche.write_batch_rows
+  assert rg > 1  # calibration derived a real row-group size
+  assert tranche.max_rows % rg == 0  # file is a whole number of row groups
+  sizes = _all_row_group_sizes(tmp_path)
+  assert sum(sizes) == n  # no rows lost
+  assert all(s == rg for s in sizes[:-1])  # coalesced to the target, not per-flush
+  assert 0 < sizes[-1] <= rg  # single trailing partial group
+
+
 def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
   class FakeStore:
     def __init__(self, *args, **kwargs):
