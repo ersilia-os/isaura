@@ -364,6 +364,8 @@ class IsauraWriter:
       self.chunk_state.flush(self.buffers, self.schema_cols)
       self.buffers = []
       self.buf_rows = 0
+    # Upload the trailing partial wide chunk held open across flushes (no-op for narrow).
+    self.chunk_state.finalize_chunks()
     self.bi.persist()
     if new:
       self._upload_metadata(new)

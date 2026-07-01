@@ -135,10 +135,15 @@ WIDE_REORDER_MIN_FREE_MB = int(os.getenv("WIDE_REORDER_MIN_FREE_MB", "2048"))
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50000"))
 
 PARQUET_ROW_GROUP_SIZE = int(os.getenv("PARQUET_ROW_GROUP_SIZE", "500000"))
-# Match the wide chunk row limit (MAX_ROWS_PER_FILE) so each wide chunk is a
-# single row group. The read path reads a whole row group at a time
-# (stream.py read_row_group), so this — not file size — is what bounds read RAM.
+# Fallback wide row-group size; used only if byte calibration can't run (empty batch).
 WIDE_PARQUET_ROW_GROUP_SIZE = int(os.getenv("WIDE_PARQUET_ROW_GROUP_SIZE", "10000"))
+
+# Wide chunk file / row-group byte targets (Workstream 3). Row counts are derived
+# at write time from the first typed table's measured bytes/row (see ChunkState),
+# so these replace the fixed MAX_ROWS_PER_FILE / WIDE_PARQUET_ROW_GROUP_SIZE for
+# wide models. 1 GB files = fewest round-trips; 64 MB row groups = lowest read RAM.
+WIDE_TARGET_FILE_BYTES = int(os.getenv("WIDE_TARGET_FILE_BYTES", str(1024 * 1024 * 1024)))
+WIDE_TARGET_ROWGROUP_BYTES = int(os.getenv("WIDE_TARGET_ROWGROUP_BYTES", str(64 * 1024 * 1024)))
 PARQUET_COMPRESSION = os.getenv("PARQUET_COMPRESSION", "zstd")
 PARQUET_COMPRESSION_LEVEL = int(os.getenv("PARQUET_COMPRESSION_LEVEL", "1"))
 PARQUET_DATA_PAGE_SIZE = int(os.getenv("PARQUET_DATA_PAGE_SIZE", "1048576"))

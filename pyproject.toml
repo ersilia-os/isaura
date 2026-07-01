@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [
   { name = "Miquel Duran Frigola", email = "miquel@ersilia.io" },
-  { name = "Abel Legese Shibiru", email = "abel@ersilia.io" },
   { name = "Marina Miñarro Lleonar", email = "marina@ersilia.io"},
+  { name = "Abel Legese Shibiru", email = "abel@ersilia.io" },
   { name = "Ersilia Open Source Initiative", email = "hello@ersilia.io"}
 ]
 dependencies = [
@@ -20,7 +20,6 @@ dependencies = [
     "pybloom-live>=4.0.0",
     "python-dotenv>=1.1.1",
     "pyyaml>=6.0.3",
-    "rdkit>=2024.3.6",
     "requests>=2.32.5",
     "rich>=14.1.0",
     "questionary>=2.0.1",

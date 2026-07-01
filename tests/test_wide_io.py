@@ -6,6 +6,7 @@ import pytest
 pq = pytest.importorskip("pyarrow.parquet")
 
 from isaura.base import TrancheState, _BaseTransfer
+from isaura.const import MAX_ROWS, MAX_ROWS_PER_FILE
 from isaura.helpers import chunk_row_limit, stream_parquet_filtered_ordered
 from isaura.manage import IsauraReader, IsauraWriter
 from isaura.stream import stream_parquet_filtered
@@ -121,6 +122,76 @@ def test_tranche_flush_supports_heterogeneous_column_types(tmp_path):
   assert list(out["payload"]) == ['{"x": 1}', '["u", "v"]']
   assert list(out["blob"]) == [b"abc", None]
   assert list(out["flag"]) == [True, None]
+
+
+def _wide_chunk_rows(n, ncols=150, start=0):
+  rows = []
+  for i in range(start, start + n):
+    row = {"input": f"s{i}"}
+    for j in range(ncols):
+      row[f"d{j}"] = float(i * 1000 + j)
+    rows.append(row)
+  return rows
+
+
+def _read_all_chunks(tmp_path, bucket="bucket", base="model/v1/tranches"):
+  import glob
+  d = os.path.join(str(tmp_path), bucket, base, "data")
+  paths = sorted(
+    glob.glob(os.path.join(d, "chunk_*.parquet")),
+    key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]),
+  )
+  return [pq.read_table(p).to_pandas() for p in paths]
+
+
+def test_wide_chunk_writes_full_chunks_then_one_partial(tmp_path):
+  # output_dimension >= 100 => wide byte-sized accumulation path. Rows from many
+  # separate flushes must ACCUMULATE into full chunks, not each be abandoned as
+  # its own tiny partial (the pre-W3 ensure()-resets-open bug -> ~2x files).
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(
+    store, "bucket", "model/v1/tranches", str(tmp_path), 999999, output_dimension=150
+  )
+  tranche._calibrated = True  # pin file_rows deterministically; skip byte calibration
+  tranche.max_rows = 4
+  cols = ["input"] + [f"d{j}" for j in range(150)]
+  for i in range(13):
+    tranche.flush(_wide_chunk_rows(1, start=i), cols)
+  tranche.finalize_chunks()
+
+  chunks = _read_all_chunks(tmp_path)
+  # Full chunks of 4, then a single trailing partial — never alternating full/tiny.
+  assert [len(c) for c in chunks] == [4, 4, 4, 1]
+  out = pd.concat(chunks, ignore_index=True)
+  assert list(out["input"]) == [f"s{i}" for i in range(13)]
+
+
+def test_wide_chunk_calibrates_chunk_size_from_bytes(tmp_path, monkeypatch):
+  # Tiny byte targets so file_rows is derived small and files roll over; assert
+  # every non-final chunk is exactly the calibrated file_rows (bytes, not a fixed
+  # row count) with a single trailing partial, and all rows survive in order.
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_FILE_BYTES", 200_000)
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_ROWGROUP_BYTES", 50_000)
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(
+    store, "bucket", "model/v1/tranches", str(tmp_path), 999999, output_dimension=150
+  )
+  cols = ["input"] + [f"d{j}" for j in range(150)]
+  n = 300
+  for start in range(n):  # one row per flush -> exact chunk boundaries
+    tranche.flush(_wide_chunk_rows(1, start=start), cols)
+  tranche.finalize_chunks()
+
+  assert tranche._calibrated
+  file_rows = tranche.max_rows
+  chunks = _read_all_chunks(tmp_path)
+  sizes = [len(c) for c in chunks]
+  assert len(chunks) >= 2  # calibration made file_rows small enough to roll over
+  assert all(s == file_rows for s in sizes[:-1])  # full chunks, none abandoned early
+  assert 0 < sizes[-1] <= file_rows  # single trailing partial
+  assert sum(sizes) == n
+  out = pd.concat(chunks, ignore_index=True)
+  assert list(out["input"]) == [f"s{i}" for i in range(n)]
 
 
 def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
@@ -318,9 +389,44 @@ def test_base_transfer_select_rows_batched_streaming_mode_skips_duckdb(monkeypat
 
 
 def test_chunk_row_limit_uses_output_dimension_threshold():
-  assert chunk_row_limit(150) == 100000
-  assert chunk_row_limit(99) == 2000000
-  assert chunk_row_limit(None) == 2000000
+  assert chunk_row_limit(150) == MAX_ROWS_PER_FILE
+  assert chunk_row_limit(99) == MAX_ROWS
+  assert chunk_row_limit(None) == MAX_ROWS
+
+
+def test_resolve_column_types_maps_declared_to_arrow():
+  import pyarrow as pa
+  from isaura.parquet import resolve_column_types
+  rc = {"d0": "float", "d1": "integer", "d2": "string"}
+  t = resolve_column_types(rc, ["key", "input", "d0", "d1", "d2"])
+  assert t["key"] == pa.string() and t["input"] == pa.string()
+  assert t["d0"] == pa.float32() and t["d1"] == pa.int32() and t["d2"] == pa.string()
+  # no run_columns -> empty (caller falls back to inference)
+  assert resolve_column_types(None, ["key", "d0"]) == {}
+
+
+def test_build_typed_array_casts_and_hard_fails():
+  import pyarrow as pa
+  from isaura.parquet import build_typed_array
+  # numeric-as-text -> float32, blanks/None -> null
+  a = build_typed_array(["0.5", "", None, "1.25"], pa.float32())
+  assert a.type == pa.float32() and a.to_pylist()[1] is None and a.to_pylist()[0] == 0.5
+  # integers
+  assert build_typed_array(["3", "-7"], pa.int32()).to_pylist() == [3, -7]
+  # hard-fail: non-numeric in float, float in int, int32 overflow
+  for vals, t in [(["x"], pa.float32()), (["1.5"], pa.int32()), (["3000000000"], pa.int32())]:
+    with pytest.raises(ValueError):
+      build_typed_array(vals, t)
+
+
+def test_validate_columns_contract():
+  from isaura.parquet import validate_columns
+  rc = {"d0": "float", "d1": "float"}
+  ok, _ = validate_columns(rc, ["key", "input", "d0", "d1"])
+  assert ok
+  bad, msg = validate_columns(rc, ["key", "input", "d0"])  # missing d1
+  assert not bad and "mismatch" in msg
+  assert validate_columns(None, ["key", "d0"])[0]  # no contract -> ok
 
 
 def test_reader_wide_model_uses_fast_stream_then_reorders(monkeypatch):
@@ -655,7 +761,7 @@ def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
   monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": 150})
 
   writer = IsauraWriter(input_csv="unused.csv", model_id="m", model_version="v1", bucket="bucket")
-  assert writer.max_rows == 100000
+  assert writer.max_rows == MAX_ROWS_PER_FILE
 
 
 def test_writer_buffers_raw_rows_until_flush(monkeypatch):
@@ -701,6 +807,9 @@ def test_writer_buffers_raw_rows_until_flush(monkeypatch):
     def flush(self, rows, schema_cols):
       flushed["rows"] = list(rows)
       flushed["schema_cols"] = list(schema_cols)
+
+    def finalize_chunks(self):
+      return None
 
   monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
   monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)

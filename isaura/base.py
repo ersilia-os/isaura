@@ -20,9 +20,12 @@ from isaura.helpers import (
   MINIO_MULTIPART_CHUNKSIZE,
   MINIO_MAX_CONCURRENCY,
   MINIO_MAX_POOL_CONNECTIONS,
+  WIDE_TARGET_FILE_BYTES,
+  WIDE_TARGET_ROWGROUP_BYTES,
   logger,
   console,
   rss_mb,
+  is_wide,
   chunk_row_limit,
   chunk_write_batch_rows,
   parquet_writer_kwargs,
@@ -533,12 +536,24 @@ class ChunkState:
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
+    self.wide = is_wide(output_dimension)
     self.write_batch_rows = chunk_write_batch_rows(output_dimension)
     self.pq_ctor_kw, self.pq_wt_kw = parquet_writer_kwargs(output_dimension)
     # {column_name: arrow type} from run_columns.csv; set by the writer once the
     # schema is known. Empty => fall back to per-column type inference.
     self.column_types = {}
     self.state = {}
+    # Wide byte-sized accumulation (Workstream 3): file/row-group sizes are
+    # derived from the first typed table (_calibrate); rows stream into one
+    # ParquetWriter kept open on local disk across flushes and uploaded at
+    # file_rows, with the trailing partial flushed by finalize_chunks().
+    self._ensured = False
+    self._calibrated = False
+    self._open_writer = None
+    self._open_path = None
+    self._open_schema = None
+    self._open_idx = None
+    self._open_rows = 0
 
   def _rows_to_frame(self, rows, schema_cols):
     """Convert a list of row dicts to a DataFrame with exactly schema_cols columns."""
@@ -765,6 +780,84 @@ class ChunkState:
         pass
     return os_key
 
+  def _ensure_once(self):
+    """Initialise chunk state from MinIO on the first wide flush only.
+
+    Unlike the narrow path (which re-lists on every flush), the wide path keeps
+    a writer open across flushes, so it must inspect the existing chunks exactly
+    once to learn the next chunk index.
+    """
+    if not self._ensured:
+      self.ensure()
+      self._ensured = True
+
+  def _calibrate(self, table):
+    """Size the chunk file (self.max_rows) and row group from the table's measured
+    bytes/row, so both are bounded in bytes regardless of width/dtype."""
+    self._calibrated = True
+    n = table.num_rows
+    if n <= 0:
+      return
+    bytes_per_row = max(1.0, table.nbytes / n)
+    file_rows = max(1, int(WIDE_TARGET_FILE_BYTES / bytes_per_row))
+    rg_rows = max(1, int(WIDE_TARGET_ROWGROUP_BYTES / bytes_per_row))
+    rg_rows = min(rg_rows, file_rows)
+    self.max_rows = file_rows
+    self.write_batch_rows = rg_rows
+    self.pq_wt_kw["row_group_size"] = rg_rows
+    logger.debug(
+      f"[chunk] calibrated bytes/row={bytes_per_row:.0f} file_rows={file_rows} rg_rows={rg_rows}"
+    )
+
+  def _open_new_writer(self, schema):
+    """Open a fresh ParquetWriter on local disk for the next chunk index."""
+    self._open_idx = self.state["data"]["next"]
+    self._open_path = os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
+    self._open_schema = schema
+    self._open_writer = pq.ParquetWriter(self._open_path, schema, **self.pq_ctor_kw)
+    self._open_rows = 0
+
+  def _close_and_upload_open(self):
+    """Close the open chunk writer, upload it to MinIO, and advance the index."""
+    if self._open_writer is None:
+      return
+    self._open_writer.close()
+    self._open_writer = None
+    os_key = f"{hive_prefix(self.base)}/chunk_{self._open_idx}.parquet"
+    self.store.upload_file(self._open_path, self.bucket, os_key)
+    logger.debug(f"[chunk] uploaded chunk idx={self._open_idx} rows={self._open_rows}")
+    try:
+      os.remove(self._open_path)
+    except Exception:
+      pass
+    self.state["data"]["next"] = self._open_idx + 1
+    self._open_path = None
+    self._open_idx = None
+    self._open_rows = 0
+
+  def _flush_accum(self, tables):
+    """Write typed tables into the open chunk, uploading and rolling to a new chunk
+    each time it reaches file_rows; the trailing partial waits for finalize_chunks()."""
+    for table in tables:
+      if table.num_rows == 0:
+        continue
+      if not self._calibrated:
+        self._calibrate(table)
+      if self._open_writer is None:
+        self._open_new_writer(table.schema)
+      self._open_writer.write_table(table.cast(self._open_schema), **self.pq_wt_kw)
+      self._open_rows += table.num_rows
+      if self._open_rows >= self.max_rows:
+        self._close_and_upload_open()
+
+  def finalize_chunks(self):
+    """Upload the trailing partial wide chunk, if any. Call once after all flushes.
+
+    No-op for narrow models (which upload every chunk inside flush/flush_df).
+    """
+    if self.wide and self._open_writer is not None and self._open_rows > 0:
+      self._close_and_upload_open()
+
   def flush(self, rows, schema_cols):
     """Write a list of row dicts to MinIO as one or more Parquet chunk files.
 
@@ -776,6 +869,11 @@ class ChunkState:
         rows: List of row dicts to write.
         schema_cols: Ordered column names for the Parquet schema.
     """
+    if self.wide:
+      self._ensure_once()
+      if rows:
+        self._flush_accum(self._iter_tables(rows, schema_cols))
+      return
     if not rows:
       return self.ensure()
     self.ensure()
@@ -831,6 +929,11 @@ class ChunkState:
         df: DataFrame to write.
         schema_cols: Ordered column names for the Parquet schema.
     """
+    if self.wide:
+      self._ensure_once()
+      if df is not None and not df.empty:
+        self._flush_accum(self._iter_tables_df(df, schema_cols))
+      return
     if df is None or df.empty:
       return self.ensure()
     self.ensure()
@@ -997,6 +1100,8 @@ class _SinkWriter:
       self.buffers = []
       self.buf_rows = 0
       del merged
+    # Upload the trailing partial wide chunk held open across flushes (no-op for narrow).
+    self.chunk_state.finalize_chunks()
     gc.collect()
     self.bi.persist()
     if metadata_local:
