@@ -372,7 +372,17 @@ def destroy(project_name, model, version, yes):
   if model:
     with console.status(f"Deleting {model}/{version} from {project_name}...", spinner="dots"):
       n = store.delete_prefix(project_name, f"{model}/{version}/")
-    console.print(f"[green]✓[/green] [bold]{model}/{version}[/bold] deleted from [bold]{project_name}[/bold]: {n} objects removed")
+    if n == 0:
+      # Nothing matched — almost always a wrong version/model. Surface it instead of a
+      # misleading success, and show which versions do exist (e.g. "v1" vs a typo'd "1").
+      versions = sorted({
+        parts[1] for k in store.list_keys(project_name, f"{model}/")
+        if len(parts := k["Key"].split("/")) > 2 and parts[0] == model
+      })
+      hint = f" Existing versions: {', '.join(versions)}." if versions else f" No data for {model} in {project_name}."
+      console.print(f"[yellow]![/yellow] Nothing deleted — no objects under [bold]{model}/{version}[/bold] in [bold]{project_name}[/bold].{hint}")
+    else:
+      console.print(f"[green]✓[/green] [bold]{model}/{version}[/bold] deleted from [bold]{project_name}[/bold]: {n} objects removed")
   else:
     with console.status(f"Destroying {project_name}...", spinner="dots"):
       n = store.delete_prefix(project_name, "")

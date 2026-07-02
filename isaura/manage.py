@@ -1,4 +1,4 @@
-import csv, datetime, json, os, shutil, sys, time, uuid, pyarrow.parquet as pq, pandas as pd
+import csv, datetime, json, os, shutil, sqlite3, sys, time, uuid, pyarrow.parquet as pq, pandas as pd
 from collections import defaultdict, Counter
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +11,7 @@ from rich.progress import (
   TimeElapsedColumn,
   TimeRemainingColumn,
 )
-from isaura.base import _BaseTransfer, BloomIndex, TrancheState, MinioStore, DuckDBMinio, _S3RangeFile, upload_catalog_json
+from isaura.base import _BaseTransfer, BloomIndex, TrancheState, LocationSink, build_location_index, scan_chunk_locations, read_index_keys, MinioStore, DuckDBMinio, _S3RangeFile, upload_catalog_json
 from isaura.helpers import (
   ACCESS_FILE,
   BLOOM_FILENAME,
@@ -34,6 +34,8 @@ from isaura.helpers import (
   bind_temp_dirs,
   release_temp_dirs,
   chunk_row_limit,
+  is_wide,
+  parquet_writer_kwargs,
   resolve_write_types,
   logger,
   console,
@@ -60,6 +62,8 @@ from isaura.helpers import (
   write_access_file,
 )
 from isaura.const import (
+  INDEX_SQLITE_FILE,
+  INDEX_FORMAT,
   WIDE_READ_SLICE,
   WIDE_REORDER_BUCKET_ROWS,
   WIDE_REORDER_MAX_OPEN_BUCKETS,
@@ -188,12 +192,15 @@ class IsauraWriter:
     self.access = self._read_bucket_access()
     bind_temp_dirs(self, self.tmpdir)
     self.metadata_path = os.path.join(self.tmpdir, ACCESS_FILE)
+    # W4: wide models track molecules via index.sqlite + bloom, not the JSON index — skip
+    # loading/writing it (saves ~300 MB RAM on wide writes). Narrow keeps the JSON index.
     self.bi = BloomIndex(
       self.store,
       self.bucket,
       self.base_prefix,
       self.tmpdir,
       bloom_filename=os.getenv("BLOOM_FILENAME", BLOOM_FILENAME),
+      load_index=not is_wide(self.output_dimension),
     )
     self.chunk_state = TrancheState(
       self.store,
@@ -203,6 +210,10 @@ class IsauraWriter:
       self.max_rows,
       output_dimension=self.output_dimension,
     )
+    # W4: capture real (chunk, row_group) locations during wide writes (step 2 builds
+    # index.sqlite from this). Wide-only; narrow path untouched.
+    if getattr(self.chunk_state, "wide", False):
+      self.chunk_state.loc_sink = LocationSink(os.path.join(self.tmpdir, "loc_index.sqlite"))
     self.buffers = []
     self.buf_rows = 0
     self.schema_cols = None
@@ -291,7 +302,7 @@ class IsauraWriter:
     """
     total = dupes = 0
     new = []
-    old_entries = len(self.bi.index) if self.bi.index is not None else 0
+    old_entries = len(self.bi.index) if self.bi.index is not None else len(self.bi.sbf)
     if df is not None:
       total_rows = len(df)
       chunk_iter = (
@@ -366,10 +377,12 @@ class IsauraWriter:
       self.buf_rows = 0
     # Upload the trailing partial wide chunk held open across flushes (no-op for narrow).
     self.chunk_state.finalize_chunks()
+    # W4 step 2: build + upload index.sqlite from the captured locations (wide-only).
+    build_location_index(getattr(self.chunk_state, "loc_sink", None), self.store, self.bucket, self.base_prefix)
     self.bi.persist()
     if new:
       self._upload_metadata(new)
-    entries = len(self.bi.index) if self.bi.index is not None else 0
+    entries = len(self.bi.index) if self.bi.index is not None else len(self.bi.sbf)
     chunks = len(self.chunk_state._list_chunks())
     upload_catalog_json(self.store, self.bucket, self.base_prefix, entries, chunks, self.tmpdir)
     actual_new = entries - old_entries
@@ -690,6 +703,61 @@ class IsauraReader:
       except Exception as e:
         logger.error(f"Exception occurred when removing temp index file (local={local}): {e}")
 
+  def _wide_locations(self, wanted):
+    """Allow-set {chunk: set(row_groups)} for `wanted` from index.sqlite, or None → full scan.
+
+    Correctness-first: returns None (scan everything, exactly as before) whenever the index
+    can't be fully trusted — absent, wrong format, query error, OR any wanted key not found
+    in it (a partial/stale index must never silently drop a present molecule). The per-row-group
+    is_in re-check in the streamer guards against index false positives. Kill switch:
+    ISAURA_DISABLE_INDEX_PRUNE=1.
+    """
+    if os.getenv("ISAURA_DISABLE_INDEX_PRUNE"):
+      return None
+    if not hasattr(self, "_cached_locations"):
+      self._cached_locations = self._compute_wide_locations(wanted)
+    return self._cached_locations
+
+  def _compute_wide_locations(self, wanted):
+    local = os.path.join(self.tmpdir, f"index_{uuid.uuid4().hex}.sqlite")
+    try:
+      self.store.download_file(self.bucket, f"{self.base}/{INDEX_SQLITE_FILE}", local)
+    except Exception:
+      logger.debug("[read] no index.sqlite — full scan")
+      return None
+    try:
+      conn = sqlite3.connect(f"file:{local}?mode=ro", uri=True)
+      try:
+        fmt = conn.execute("SELECT v FROM meta WHERE k='format'").fetchone()
+        if not fmt or fmt[0] != INDEX_FORMAT:
+          logger.debug(f"[read] index.sqlite format={fmt!r} != {INDEX_FORMAT!r} — full scan")
+          return None
+        uniq = list(set(wanted))
+        locs, found = {}, 0
+        for i in range(0, len(uniq), 900):  # under SQLite's default host-parameter limit
+          batch = uniq[i : i + 900]
+          rows = conn.execute(
+            f"SELECT chunk, rg FROM loc WHERE key IN ({','.join('?' * len(batch))})", batch
+          ).fetchall()
+          found += len(rows)
+          for c, g in rows:
+            locs.setdefault(c, set()).add(g)
+      finally:
+        conn.close()
+    except Exception as e:
+      logger.warning(f"[read] index.sqlite lookup failed: {e} — full scan")
+      return None
+    finally:
+      try:
+        os.remove(local)
+      except Exception:
+        pass
+    if found < len(uniq):
+      logger.debug(f"[read] index covers {found}/{len(uniq)} keys — full scan (fallback)")
+      return None
+    logger.debug(f"[read] index prune: {len(uniq)} keys -> {len(locs)} chunks selected")
+    return locs
+
   def _reorder(self, wanted, header, result_df):
     """Reorder result_df rows to match the order of wanted inputs.
 
@@ -902,6 +970,7 @@ class IsauraReader:
               header=header,
               batch_size=wbs,
               progress=progress,
+              locations=self._wide_locations(wanted),
               **self._wide_stream_kwargs(),
             ),
             wbs,
@@ -1004,6 +1073,7 @@ class IsauraReader:
                 header=header,
                 batch_size=wbs,
                 progress=progress,
+                locations=self._wide_locations(wanted),
                 **self._wide_stream_kwargs(),
               ),
               wbs,
@@ -1017,6 +1087,7 @@ class IsauraReader:
               header=header,
               batch_size=wbs,
               progress=progress,
+              locations=self._wide_locations(wanted),
               **self._wide_stream_kwargs(),
             )
         elif mode == "stream":
@@ -1167,6 +1238,11 @@ class IsauraMolRemover:
       input_col = next((c for c in ["input", "smiles"] if c in schema_names), schema_names[0])
       input_idx = schema_names.index(input_col)
       rows_before = pf.metadata.num_rows
+      # Rewrite with the SAME codec/settings the write path uses (zstd + wide dict/stats off),
+      # derived from the descriptor width — otherwise ParquetWriter defaults to snappy and the
+      # surviving chunk re-compresses larger (a delete would grow the model on disk).
+      output_dim = sum(1 for c in schema_names if c not in ("key", "input", "smiles"))
+      ctor_kw, _ = parquet_writer_kwargs(output_dim)
       # Stream the chunk in row batches rather than pf.read().to_pandas(), so
       # peak RAM stays bounded no matter how large the chunk is (legacy chunks
       # can hold 100k+ rows of a very wide model — a full read would OOM).
@@ -1180,7 +1256,7 @@ class IsauraMolRemover:
           if kept.num_rows == 0:
             continue
           if writer is None:
-            writer = pq.ParquetWriter(local_out, batch.schema)
+            writer = pq.ParquetWriter(local_out, batch.schema, **ctor_kw)
           writer.write_batch(kept)
           rows_after += kept.num_rows
       finally:
@@ -1238,11 +1314,17 @@ class IsauraMolRemover:
     to_remove = set(to_remove_list)
 
     bi = BloomIndex(self.store, self.bucket, self.base_prefix, self.tmpdir)
-    if not bi.index:
-      logger.error(f"No index found for {self.model_id}/{self.model_version} in {self.bucket}.")
-      sys.exit(1)
-
-    actually_present = to_remove & set(bi.index.keys())
+    # New-style wide models have no JSON index (only index.sqlite); membership then comes
+    # from the bloom filter, and the bloom + index.sqlite are rebuilt from the rewritten
+    # chunks below. Legacy/narrow models keep using the JSON index unchanged.
+    has_json_index = bool(bi.index)
+    if has_json_index:
+      actually_present = to_remove & set(bi.index.keys())
+    else:
+      if len(bi.sbf) == 0:
+        logger.error(f"No index found for {self.model_id}/{self.model_version} in {self.bucket}.")
+        sys.exit(1)
+      actually_present = {k for k in to_remove if bi.seen(k)}
     n_not_found = len(to_remove) - len(actually_present)
 
     if not actually_present:
@@ -1281,24 +1363,51 @@ class IsauraMolRemover:
       if progress is not None:
         progress.__exit__(None, None, None)
 
-    for k in actually_present:
-      bi.index.pop(k, None)
     from pybloom_live import ScalableBloomFilter
-    bi.sbf = ScalableBloomFilter(
-      mode=ScalableBloomFilter.SMALL_SET_GROWTH,
-      initial_capacity=max(1000000, len(bi.index)),
-      error_rate=1e-14,
-    )
-    for k in bi.index:
-      bi.sbf.add(k)
-    bi._added = 1
-    bi.persist()
+
+    def _rebuild_bloom(keys):
+      keys = list(keys)
+      sbf = ScalableBloomFilter(
+        mode=ScalableBloomFilter.SMALL_SET_GROWTH,
+        initial_capacity=max(1000000, len(keys)),
+        error_rate=1e-14,
+      )
+      for k in keys:
+        sbf.add(k)
+      return sbf, len(keys)
+
+    if has_json_index:
+      for k in actually_present:
+        bi.index.pop(k, None)
+      bi.sbf, entries = _rebuild_bloom(bi.index.keys())
+      bi._added = 1
+      bi.persist()  # writes bloom + index.json
+    else:
+      # Rebuild bloom + index.sqlite from the ACTUAL surviving chunks (locations shifted
+      # when rows were removed). Set index=None so persist() never re-creates a JSON index.
+      sink = scan_chunk_locations(self.store, self.bucket, self.base_prefix, self.tmpdir)
+      sink._drain()
+      remaining_keys = [r[0] for r in sink.conn.execute("SELECT key FROM loc")]
+      bi.sbf, entries = _rebuild_bloom(remaining_keys)
+      bi.index = None
+      bi._added = 1
+      bi.persist()  # writes bloom only
+      if entries > 0:
+        build_location_index(sink, self.store, self.bucket, self.base_prefix)  # finalizes + uploads
+      else:
+        sink.close()
+        try:
+          self.store.client.delete_object(
+            Bucket=self.bucket, Key=f"{self.base_prefix}/{INDEX_SQLITE_FILE}"
+          )
+        except Exception:
+          pass
 
     self._update_access_json(actually_present)
 
     remaining_chunks = self._list_chunk_keys()
     upload_catalog_json(
-      self.store, self.bucket, self.base_prefix, len(bi.index), len(remaining_chunks), self.tmpdir
+      self.store, self.bucket, self.base_prefix, entries, len(remaining_chunks), self.tmpdir
     )
 
     return (total_removed, n_not_found)
@@ -1403,15 +1512,25 @@ class IsauraPush:
     cloud_bi = BloomIndex(cloud_store, dst_bucket, base, os.path.join(tmpdir, "cloud"))
     local_bi = BloomIndex(local_store, src_bucket, base, os.path.join(tmpdir, "local"))
     if local_bi.index:
+      # Legacy/narrow: merge the JSON index + bloom as before.
       for k, v in local_bi.index.items():
         if cloud_bi.index is not None and k not in cloud_bi.index:
           cloud_bi.index[k] = v
-    if local_bi.index:
       for k in local_bi.index:
         cloud_bi.sbf.add(k)
-    cloud_bi._added = 1
-    cloud_bi.persist()
-    merged_entries = len(cloud_bi.index or {})
+      cloud_bi._added = 1
+      cloud_bi.persist()
+      merged_entries = len(cloud_bi.index or {})
+    else:
+      # New-style wide: local has only index.sqlite (already relayed to cloud by the file
+      # loop above). Union local's keys into the cloud bloom and keep the cloud JSON-free.
+      local_keys = read_index_keys(local_store, src_bucket, base, tmpdir) or []
+      for k in local_keys:
+        cloud_bi.sbf.add(k)
+      cloud_bi.index = None  # do not (re)create a cloud index.json for a wide model
+      cloud_bi._added = 1
+      cloud_bi.persist()  # writes cloud bloom only
+      merged_entries = len(cloud_bi.sbf)
     # count cloud chunks from listing
     pref = hive_prefix(base) + "/"
     cloud_chunks = sum(
@@ -1628,13 +1747,24 @@ class IsauraInspect:
         if mv:
           yield (mid, mv)
 
-  def load_index(self, bucket, model_id, model_version):
-    """Load the JSON index for a model. Returns {} in cloud mode unless heavy_index=True."""
+  def _tmp(self):
+    """Lazily create a temp dir for this inspector (used for index.sqlite fallback downloads)."""
+    if not getattr(self, "_tmpdir", None):
+      self._tmpdir = make_temp("isaura_inspect_")
+    return self._tmpdir
+
+  def load_index(self, bucket, model_id, model_version, force=False):
+    """Return a {key: True}-style membership map for a model. Prefers the legacy JSON index;
+    for new-style wide models (no JSON) falls back to keys from index.sqlite. Returns {} in
+    cloud mode unless heavy_index/force (keeps cloud inspects lightweight)."""
     base = get_base(model_id, model_version)
-    key = get_idx_key(base)
-    if self.heavy_index or not self.cloud:
-      return self.get_json(bucket, key, max_bytes=10**18) or {}
-    return {}
+    if not (force or self.heavy_index or not self.cloud):
+      return {}
+    j = self.get_json(bucket, get_idx_key(base), max_bytes=10**18)
+    if j:
+      return j
+    keys = read_index_keys(self._clients(bucket)[0], bucket, base, self._tmp())
+    return {k: True for k in keys} if keys else {}
 
   def load_metadata(self, bucket, model_id, model_version):
     """Load the access metadata file for a model. Returns None if absent."""
@@ -1645,10 +1775,7 @@ class IsauraInspect:
     union, owner = ({}, {})
     for b in self.buckets():
       for mid, mv in self.iter_models(b):
-        if force:
-          idx = self.get_json(b, get_idx_key(get_base(mid, mv)), max_bytes=10**18) or {}
-        else:
-          idx = self.load_index(b, mid, mv)
+        idx = self.load_index(b, mid, mv, force=force)
         for smi in idx.keys():
           if smi not in union:
             union[smi] = True

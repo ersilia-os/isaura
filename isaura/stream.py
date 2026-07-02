@@ -37,6 +37,14 @@ def _safe_decode_rows(pf, target_bytes=WIDE_READ_TARGET_BYTES, floor=256, ceil=1
   return max(floor, min(ceil, int(target_bytes // bytes_per_row)))
 
 
+def _chunk_idx_of(key):
+  """Parse the integer chunk index N from a `.../chunk_<N>.parquet` key, or None."""
+  try:
+    return int(key.rsplit("/chunk_", 1)[1].split(".")[0])
+  except Exception:
+    return None
+
+
 def _yield_filtered_chunks(filtered, header, batch_size, wanted_set, progress_cb):
   """Slice a filtered PyArrow Table into DataFrames and track resolved molecules.
 
@@ -78,6 +86,7 @@ def stream_parquet_filtered(
   download_workers=None,
   prefetch_files=None,
   dense_batch_rows=None,
+  locations=None,
 ):
   """Stream matching rows from Parquet chunk files on MinIO without loading all files into memory.
 
@@ -103,6 +112,11 @@ def stream_parquet_filtered(
           The wide-model call site passes the auto-scaled WIDE_STREAM_DOWNLOAD_WORKERS.
       prefetch_files: Download window size. None → STREAM_PREFETCH_FILES.
       dense_batch_rows: Dense-mode batch size. None → STREAM_DENSE_BATCH_ROWS.
+      locations: Optional {chunk_idx: set(row_group_idx)} allow-set from the W4 index.
+          When given, only those chunks are downloaded and only those row groups scanned
+          (the per-row-group is_in re-check below stays as superset safety). None → scan
+          every chunk/row group exactly as before. The caller passes None to force a full
+          scan whenever the index can't be trusted to cover all wanted keys.
 
   Yields:
       DataFrames of matching rows, in file order.
@@ -117,6 +131,9 @@ def stream_parquet_filtered(
   keys = []
   total_rows_yielded = 0
   n_chunks_yielded = 0
+  chunks_total = 0
+  rgs_scanned = 0
+  rgs_available = 0
   executor = None
   try:
     keys = sorted(
@@ -126,6 +143,12 @@ def stream_parquet_filtered(
         if obj["Key"].endswith(".parquet") and "/chunk_" in obj["Key"]
       )
     )
+
+    # W4 chunk-level prune: skip whole chunk files the index says hold no wanted key.
+    chunks_total = len(keys)
+    if locations is not None:
+      keys = [k for k in keys if _chunk_idx_of(k) in locations]
+      logger.debug(f"[stream] index prune: {len(keys)}/{chunks_total} chunks selected")
 
     logger.debug(f"[stream] starting: {len(keys)} files, {remaining} wanted, batch_size={batch_size}")
     if progress is not None:
@@ -184,6 +207,16 @@ def stream_parquet_filtered(
         pf = pq.ParquetFile(local)
         n_rg = pf.metadata.num_row_groups
         n_rows = pf.metadata.num_rows
+        # W4 row-group prune: within a selected chunk, scan only the row groups the index
+        # points at (default = all). The per-row-group is_in re-check below is unchanged.
+        allowed_rgs = locations.get(_chunk_idx_of(key)) if locations is not None else None
+        rg_list = (
+          sorted(r for r in allowed_rgs if 0 <= r < n_rg) if allowed_rgs is not None else list(range(n_rg))
+        )
+        rgs_available += n_rg
+        rgs_scanned += len(rg_list)
+        if not rg_list:
+          continue
         use_dense = (
           bool(dense_file_ratio) and n_rows > 0 and remaining >= max(1, int(n_rows * dense_file_ratio))
         )
@@ -200,7 +233,7 @@ def stream_parquet_filtered(
         _emit = min(batch_size, safe_rows)
 
         if use_dense:
-          for batch in pf.iter_batches(batch_size=_dec):
+          for batch in pf.iter_batches(batch_size=_dec, row_groups=rg_list):
             if remaining <= 0:
               break
             table = pa.Table.from_batches([batch])
@@ -231,7 +264,7 @@ def stream_parquet_filtered(
               yield chunk
               del chunk
         else:
-          for rg_idx in range(n_rg):
+          for rg_idx in rg_list:
             if remaining <= 0:
               break
             key_col = pf.read_row_group(rg_idx, columns=[parquet_col]).column(parquet_col)
@@ -299,9 +332,14 @@ def stream_parquet_filtered(
     # download thread writing into a directory being removed (early-exit / close).
     if executor is not None:
       executor.shutdown(wait=True, cancel_futures=True)
+    prune = (
+      f" pruned chunks={len(keys)}/{chunks_total} rowgroups={rgs_scanned}/{rgs_available}"
+      if locations is not None
+      else ""
+    )
     logger.debug(
       f"[stream] finished: files={len(keys)} yielded={total_rows_yielded} "
-      f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB"
+      f"chunks={n_chunks_yielded} remaining={remaining} rss={rss_mb():.0f}MB{prune}"
     )
     cleanup_temp_dir(tmpdir)
 

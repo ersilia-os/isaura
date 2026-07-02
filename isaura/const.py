@@ -23,6 +23,11 @@ except Exception:
 ACCESS_FILE = "access.json"
 CATALOG_FILE = "catalog.json"
 INDEX_FILE = "index.json"
+# Workstream 4: real molecule->(chunk, row_group) index for wide models. Presence of
+# this file with meta.format == INDEX_FORMAT marks a "real" index; absence => legacy full scan.
+INDEX_SQLITE_FILE = "index.sqlite"
+INDEX_FORMAT = "loc-v1"
+INDEX_GRANULARITY = "chunk_rowgroup"
 MIN_NNS_RESULT_SIZE = 1000
 MAX_ROWS = 2000000
 
@@ -141,8 +146,11 @@ WIDE_PARQUET_ROW_GROUP_SIZE = int(os.getenv("WIDE_PARQUET_ROW_GROUP_SIZE", "1000
 # Wide chunk file / row-group byte targets (Workstream 3). Row counts are derived
 # at write time from the first typed table's measured bytes/row (see ChunkState),
 # so these replace the fixed MAX_ROWS_PER_FILE / WIDE_PARQUET_ROW_GROUP_SIZE for
-# wide models. 1 GB files = fewest round-trips; 64 MB row groups = lowest read RAM.
-WIDE_TARGET_FILE_BYTES = int(os.getenv("WIDE_TARGET_FILE_BYTES", str(1024 * 1024 * 1024)))
+# wide models. 256 MB files: the eos4u6p (3200-col) benchmark showed ~16 files
+# saturate the download pool/prefetch window, keeping the heavy single-threaded
+# decode fed — ~17% faster than 1 GB (4 files) on the widest models, and finer
+# for W4 pruning. 64 MB row groups = lowest read RAM (safest at high width).
+WIDE_TARGET_FILE_BYTES = int(os.getenv("WIDE_TARGET_FILE_BYTES", str(256 * 1024 * 1024)))
 WIDE_TARGET_ROWGROUP_BYTES = int(os.getenv("WIDE_TARGET_ROWGROUP_BYTES", str(64 * 1024 * 1024)))
 PARQUET_COMPRESSION = os.getenv("PARQUET_COMPRESSION", "zstd")
 PARQUET_COMPRESSION_LEVEL = int(os.getenv("PARQUET_COMPRESSION_LEVEL", "1"))

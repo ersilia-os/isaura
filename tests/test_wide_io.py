@@ -4,8 +4,9 @@ import pandas as pd
 import pytest
 
 pq = pytest.importorskip("pyarrow.parquet")
+pa = pytest.importorskip("pyarrow")
 
-from isaura.base import TrancheState, _BaseTransfer
+from isaura.base import TrancheState, _BaseTransfer, LocationSink, build_location_index
 from isaura.const import MAX_ROWS, MAX_ROWS_PER_FILE
 from isaura.helpers import chunk_row_limit, stream_parquet_filtered_ordered
 from isaura.manage import IsauraReader, IsauraWriter
@@ -231,6 +232,235 @@ def test_wide_chunk_row_groups_coalesced_to_target(tmp_path, monkeypatch):
   assert sum(sizes) == n  # no rows lost
   assert all(s == rg for s in sizes[:-1])  # coalesced to the target, not per-flush
   assert 0 < sizes[-1] <= rg  # single trailing partial group
+
+
+def test_wide_loc_capture_matches_actual_layout(tmp_path, monkeypatch):
+  # W4 step 1: as wide chunks are written, the LocationSink must record each key's
+  # ACTUAL (chunk, row_group). Cross-check against the real layout by reading the input
+  # column back per row group from every chunk. Many one-row flushes exercise coalescing.
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_FILE_BYTES", 400_000)
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_ROWGROUP_BYTES", 100_000)
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(
+    store, "bucket", "model/v1/tranches", str(tmp_path), 999999, output_dimension=150
+  )
+  loc_path = os.path.join(str(tmp_path), "loc.sqlite")
+  tranche.loc_sink = LocationSink(loc_path)
+  cols = ["input"] + [f"d{j}" for j in range(150)]
+  n = 500
+  for start in range(n):
+    tranche.flush(_wide_chunk_rows(1, start=start), cols)
+  tranche.finalize_chunks()
+  tranche.loc_sink.close()
+
+  import glob, sqlite3
+  truth = {}  # key -> (chunk_idx, rg_ordinal), read back from the actual parquet layout
+  d = os.path.join(str(tmp_path), "bucket", "model/v1/tranches", "data")
+  for p in glob.glob(os.path.join(d, "chunk_*.parquet")):
+    cidx = int(os.path.splitext(os.path.basename(p))[0].split("_")[1])
+    pf = pq.ParquetFile(p)
+    for rg in range(pf.metadata.num_row_groups):
+      for k in pf.read_row_group(rg, columns=["input"]).column("input").to_pylist():
+        truth[k] = (cidx, rg)
+
+  conn = sqlite3.connect(loc_path)
+  captured = {k: (c, g) for k, c, g in conn.execute("SELECT key, chunk, rg FROM loc")}
+  conn.close()
+
+  assert len(captured) == n  # every written key captured exactly once
+  assert captured == truth  # captured (chunk, row_group) == the real layout
+
+
+def test_wide_loc_capture_guard_rejects_unaligned_write(tmp_path):
+  # A mislocated key returns a silent blank row on read (the full-scan fallback only fires
+  # on keys fully ABSENT), so a non-final write off a row-group boundary must fail loud.
+  store = LocalStore(str(tmp_path))
+  tranche = TrancheState(
+    store, "bucket", "model/v1/tranches", str(tmp_path), 999999, output_dimension=150
+  )
+  tranche.loc_sink = LocationSink(os.path.join(str(tmp_path), "loc.sqlite"))
+  tranche.write_batch_rows = 4  # row-group size
+  tbl = pa.table({"input": ["a", "b"], "d0": [1.0, 2.0]})
+  with pytest.raises(RuntimeError, match="mislocate"):
+    tranche._capture_locs(tbl, chunk_idx=0, start_row=1, final=False)
+
+
+def test_wide_location_index_built_and_uploaded(tmp_path, monkeypatch):
+  # W4 step 2: finalize the captured locations into index.sqlite (unique key index + meta
+  # marker) and upload it. Its loc rows must match the actual parquet layout.
+  import glob, sqlite3
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_FILE_BYTES", 400_000)
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_ROWGROUP_BYTES", 100_000)
+  store = LocalStore(str(tmp_path))
+  base = "model/v1/tranches"
+  tranche = TrancheState(store, "bucket", base, str(tmp_path), 999999, output_dimension=150)
+  tranche.loc_sink = LocationSink(os.path.join(str(tmp_path), "loc.sqlite"))
+  cols = ["input"] + [f"d{j}" for j in range(150)]
+  n = 400
+  for start in range(n):
+    tranche.flush(_wide_chunk_rows(1, start=start), cols)
+  tranche.finalize_chunks()
+  entries = build_location_index(tranche.loc_sink, store, "bucket", base)
+  assert entries == n
+
+  idx_path = os.path.join(str(tmp_path), "bucket", base, "index.sqlite")
+  assert os.path.exists(idx_path)  # uploaded to {base}/index.sqlite
+  conn = sqlite3.connect(idx_path)
+  meta = dict(conn.execute("SELECT k, v FROM meta"))
+  assert meta["format"] == "loc-v1"
+  assert meta["granularity"] == "chunk_rowgroup"
+  assert int(meta["entries"]) == n
+  captured = {k: (c, g) for k, c, g in conn.execute("SELECT key, chunk, rg FROM loc")}
+  conn.close()
+
+  truth = {}
+  for p in glob.glob(os.path.join(str(tmp_path), "bucket", base, "data", "chunk_*.parquet")):
+    cidx = int(os.path.splitext(os.path.basename(p))[0].split("_")[1])
+    pf = pq.ParquetFile(p)
+    for rg in range(pf.metadata.num_row_groups):
+      for k in pf.read_row_group(rg, columns=["input"]).column("input").to_pylist():
+        truth[k] = (cidx, rg)
+  assert len(captured) == n
+  assert captured == truth  # index locations == real parquet layout
+
+
+def test_wide_location_index_skips_upload_when_empty(tmp_path):
+  # No captured rows must NOT overwrite an existing index with an empty one.
+  store = LocalStore(str(tmp_path))
+  base = "model/v1/tranches"
+  sink = LocationSink(os.path.join(str(tmp_path), "loc.sqlite"))
+  entries = build_location_index(sink, store, "bucket", base)
+  assert entries == 0
+  assert not os.path.exists(os.path.join(str(tmp_path), "bucket", base, "index.sqlite"))
+
+
+def _build_wide_store_with_index(tmp_path, monkeypatch, n=400, ncols=150):
+  # Small byte targets so the data rolls into several chunks (pruning is observable).
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_FILE_BYTES", 200_000)
+  monkeypatch.setattr("isaura.base.WIDE_TARGET_ROWGROUP_BYTES", 50_000)
+  store = LocalStore(str(tmp_path))
+  base = "model/v1/tranches"
+  tr = TrancheState(store, "bucket", base, str(tmp_path), 999999, output_dimension=ncols)
+  tr.loc_sink = LocationSink(os.path.join(str(tmp_path), "loc.sqlite"))
+  cols = ["input"] + [f"d{j}" for j in range(ncols)]
+  for start in range(n):
+    tr.flush(_wide_chunk_rows(1, start=start), cols)
+  tr.finalize_chunks()
+  build_location_index(tr.loc_sink, store, "bucket", base)
+  return store, base
+
+
+def _reader_stub(store, base, tmp_path):
+  import types
+  return types.SimpleNamespace(store=store, bucket="bucket", base=base, tmpdir=str(tmp_path))
+
+
+def _concat_stream(store, base, wanted, locations):
+  parts = list(
+    stream_parquet_filtered(store, "bucket", base + "/data/", wanted, header="input", locations=locations)
+  )
+  df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+  return df.sort_values("input").reset_index(drop=True) if not df.empty else df
+
+
+def test_wide_index_prune_matches_full_scan(tmp_path, monkeypatch):
+  # A clustered read must (a) select fewer chunks than the total and (b) return output
+  # byte-identical to a full scan (locations=None). Correctness first, speed second.
+  from isaura.manage import IsauraReader
+  store, base = _build_wide_store_with_index(tmp_path, monkeypatch, n=400)
+  import glob
+  n_chunks = len(glob.glob(os.path.join(str(tmp_path), "bucket", base, "data", "chunk_*.parquet")))
+  assert n_chunks >= 2  # multiple chunks so pruning is meaningful
+
+  wanted = [f"s{i}" for i in range(8)]  # contiguous -> clustered into few chunks
+  locs = IsauraReader._compute_wide_locations(_reader_stub(store, base, tmp_path), wanted)
+  assert locs is not None
+  assert len(locs) < n_chunks  # pruned away at least one chunk
+
+  full = _concat_stream(store, base, wanted, None)
+  pruned = _concat_stream(store, base, wanted, locs)
+  assert list(pruned["input"]) == sorted(wanted)  # found them all
+  assert full.equals(pruned)  # identical output despite skipping chunks
+
+
+def test_wide_index_coverage_fallback_returns_none(tmp_path, monkeypatch):
+  # A wanted key absent from the index (stale/partial) must force a full scan, never a
+  # silent miss. _compute_wide_locations returns None so the streamer scans everything.
+  from isaura.manage import IsauraReader
+  store, base = _build_wide_store_with_index(tmp_path, monkeypatch, n=200)
+  stub = _reader_stub(store, base, tmp_path)
+  assert IsauraReader._compute_wide_locations(stub, ["s1", "s2"]) is not None
+  assert IsauraReader._compute_wide_locations(stub, ["s1", "NOT_IN_INDEX"]) is None
+
+
+def test_rewrite_chunk_preserves_zstd_compression(tmp_path):
+  # A delete rewrites chunks; it must re-compress with the write path's codec (zstd), not
+  # ParquetWriter's snappy default — otherwise removing rows grows the model on disk.
+  import types
+  from isaura.manage import IsauraMolRemover
+  store = LocalStore(str(tmp_path))
+  base = "model/v1/tranches"
+  chunk_key = f"{base}/data/chunk_1.parquet"
+  df = pd.DataFrame(_wide_chunk_rows(50, ncols=150))  # wide (150 output cols)
+  tbl = pa.Table.from_pandas(df, preserve_index=False)
+  src = str(tmp_path / "src.parquet")
+  pq.write_table(tbl, src, compression="snappy")  # simulate the wrong-codec starting point
+  store.upload_file(src, "bucket", chunk_key)
+  assert pq.ParquetFile(src).metadata.row_group(0).column(0).compression == "SNAPPY"
+
+  stub = types.SimpleNamespace(store=store, bucket="bucket", tmpdir=str(tmp_path))
+  before, after = IsauraMolRemover._rewrite_chunk(stub, chunk_key, {"s5", "s6", "s7"})
+  assert (before, after) == (50, 47)  # 3 removed
+
+  out = str(tmp_path / "back.parquet")
+  store.download_file("bucket", chunk_key, out)
+  md = pq.ParquetFile(out).metadata
+  assert md.row_group(0).column(0).compression == "ZSTD"  # re-compressed with zstd, not snappy
+  assert md.num_rows == 47
+
+
+def test_wide_index_absent_returns_none(tmp_path):
+  # No index.sqlite at all -> full scan (legacy models).
+  from isaura.manage import IsauraReader
+  store = LocalStore(str(tmp_path))
+  base = "model/v1/tranches"
+  os.makedirs(os.path.join(str(tmp_path), "bucket", base, "data"), exist_ok=True)
+  stub = _reader_stub(store, base, tmp_path)
+  assert IsauraReader._compute_wide_locations(stub, ["s1"]) is None
+
+
+def test_wide_push_merge_unions_bloom_from_sqlite(tmp_path, monkeypatch):
+  # New-wide push (4d): source has index.sqlite + no index.json. The merge must union the
+  # source's keys into the cloud bloom (so pushed molecules are found) and NOT create a
+  # cloud index.json.
+  import types
+  from isaura.base import BloomIndex
+  from isaura.manage import IsauraPush
+  store, base = _build_wide_store_with_index(tmp_path, monkeypatch, n=200)  # source bucket="bucket"
+  assert not os.path.exists(os.path.join(str(tmp_path), "bucket", base, "index.json"))
+  push = types.SimpleNamespace(model_id="model", model_version="v1")
+  tmpd = str(tmp_path / "merge_tmp")
+  os.makedirs(tmpd, exist_ok=True)
+  entries, _ = IsauraPush._merge_bloom_index(push, store, "bucket", store, "cloud", tmpd)
+  assert entries == 200
+  assert not os.path.exists(os.path.join(str(tmp_path), "cloud", base, "index.json"))  # stays JSON-free
+  cloud_bi = BloomIndex(store, "cloud", base, str(tmp_path / "cloud_reload"), load_index=False)
+  assert all(cloud_bi.seen(f"s{i}") for i in range(200))  # every pushed key now in cloud bloom
+
+
+def test_inspect_load_index_falls_back_to_sqlite(tmp_path, monkeypatch):
+  # Inspect (4e): a wide model with no index.json must enumerate its keys via index.sqlite.
+  from isaura.manage import IsauraInspect
+  store, base = _build_wide_store_with_index(tmp_path, monkeypatch, n=150)
+  insp = IsauraInspect(cloud=False)
+  insp._clients = lambda b: (store,)
+  insp.get_json = lambda *a, **k: None  # simulate absent JSON index
+  out = insp.load_index("bucket", "model", "v1")
+  assert set(out.keys()) == {f"s{i}" for i in range(150)}
+  insp.get_json = lambda *a, **k: {"X": [1, 1]}  # JSON present -> use it, don't touch sqlite
+  assert insp.load_index("bucket", "model", "v1") == {"X": [1, 1]}
+  insp_cloud = IsauraInspect(cloud=True)  # cloud + non-heavy + non-force -> lightweight empty
+  assert insp_cloud.load_index("bucket", "model", "v1") == {}
 
 
 def test_reader_read_batched_to_csv_skips_index_load(monkeypatch, tmp_path):
