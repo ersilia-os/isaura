@@ -1,6 +1,6 @@
 [project]
 name = "isaura"
-version = "2.3.0"
+version = "2.4.0"
 description = "A lake of precalculated properties of biomedical entities based on the Ersilia Model Hub"
 readme = "README.md"
 requires-python = ">=3.10"
