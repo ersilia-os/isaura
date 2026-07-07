@@ -14,7 +14,7 @@ from isaura.manage import (
   IsauraWriter,
   IsauraReader,
   IsauraCopy,
-  IsauraRemover,
+  IsauraMolRemover,
   IsauraInspect,
   IsauraPull,
   IsauraPush,
@@ -136,14 +136,20 @@ models = insp.inspect_models(bucket="myproject")
 These are server-side operations on stored artifacts for a model/version/bucket.
 
 ```python
-from isaura.manage import IsauraCopy, IsauraRemover
+from isaura.manage import IsauraCopy, IsauraMolRemover
 
 # Persist: route rows from a project bucket into isaura-public / isaura-private
 IsauraCopy(model_id="eos8a4x", model_version="v1", bucket="myproject").copy()
 
-# Remove a model/version from a bucket
-IsauraRemover(model_id="eos8a4x", model_version="v1", bucket="myproject").remove()
+# Remove specific molecules (listed in a CSV) from a model/version in a bucket
+with IsauraMolRemover(
+  model_id="eos8a4x", model_version="v1", bucket="myproject", input_csv="data/to_remove.csv"
+) as r:
+  n_removed, n_not_found = r.remove()
 ```
+
+> To delete an entire model/version or a whole project bucket, use the CLI:
+> `isaura destroy -pn myproject -m eos8a4x -v v1` (or `isaura destroy -pn myproject`).
 
 ---
 

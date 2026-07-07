@@ -1,5 +1,5 @@
-import boto3, duckdb, gc, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sys, time, uuid
-from isaura.const import INPUT_C as _INPUT_C
+import boto3, duckdb, gc, json, os, pandas as pd, pickle, pyarrow as pa, pyarrow.parquet as pq, requests, sqlite3, sys, time, uuid
+from isaura.const import INPUT_C as _INPUT_C, INDEX_SQLITE_FILE, INDEX_FORMAT, INDEX_GRANULARITY
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from pybloom_live import ScalableBloomFilter
@@ -19,12 +19,18 @@ from isaura.helpers import (
   MINIO_MULTIPART_THRESHOLD,
   MINIO_MULTIPART_CHUNKSIZE,
   MINIO_MAX_CONCURRENCY,
+  MINIO_MAX_POOL_CONNECTIONS,
+  WIDE_TARGET_FILE_BYTES,
+  WIDE_TARGET_ROWGROUP_BYTES,
   logger,
   console,
   rss_mb,
+  is_wide,
   chunk_row_limit,
   chunk_write_batch_rows,
   parquet_writer_kwargs,
+  build_typed_array,
+  resolve_write_types,
   fetch_schema_from_github,
   get_acc_key,
   get_base,
@@ -199,7 +205,13 @@ class MinioStore:
       aws_access_key_id=self.access,
       aws_secret_access_key=self.secret,
       region_name="us-east-1",
-      config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+      config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"},
+        max_pool_connections=MINIO_MAX_POOL_CONNECTIONS,
+        tcp_keepalive=True,
+        retries={"mode": "adaptive", "max_attempts": 5},
+      ),
     )
     self.transfer_config = TransferConfig(
       multipart_threshold=multipart_threshold or MINIO_MULTIPART_THRESHOLD,
@@ -497,6 +509,159 @@ class BloomIndex:
     self._added = 0
 
 
+class LocationSink:
+  """On-disk capture of {key -> (chunk, row_group)} as wide chunks are written (Workstream 4).
+
+  Backed by a local SQLite `loc` table with NO index yet — step 2 adds the unique index
+  and `meta` marker and uploads it as index.sqlite. Rows are inserted in batches so peak
+  RAM stays ~one batch, never the full ~1.35M-key set (the ~300 MB the JSON location dict
+  cost — the OOM this workstream removes)."""
+
+  def __init__(self, path, batch=50000):
+    self.path = path
+    self.batch = batch
+    self.count = 0
+    self._buf = []
+    self.conn = sqlite3.connect(path)
+    self.conn.execute("PRAGMA journal_mode=OFF")
+    self.conn.execute("PRAGMA synchronous=OFF")
+    self.conn.execute("CREATE TABLE IF NOT EXISTS loc (key TEXT, chunk INTEGER, rg INTEGER)")
+
+  def add(self, keys, chunk, rgs):
+    """Buffer (key, chunk, rg) triples; keys and rgs are equal-length sequences."""
+    self._buf.extend((k, chunk, rg) for k, rg in zip(keys, rgs))
+    self.count += len(keys)
+    if len(self._buf) >= self.batch:
+      self._drain()
+
+  def _drain(self):
+    if not self._buf:
+      return
+    self.conn.executemany("INSERT INTO loc(key, chunk, rg) VALUES (?, ?, ?)", self._buf)
+    self.conn.commit()
+    self._buf = []
+
+  def finalize_index(self):
+    """Turn the raw loc table into the queryable index: a unique key index for fast
+    batched lookups + a `meta` marker table (format/granularity/indexed_chunks/entries).
+    Commits and closes; the file at self.path is then ready to upload. Returns entries."""
+    self._drain()
+    self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_loc_key ON loc(key)")
+    (entries,) = self.conn.execute("SELECT COUNT(*) FROM loc").fetchone()
+    chunks = [r[0] for r in self.conn.execute("SELECT DISTINCT chunk FROM loc ORDER BY chunk")]
+    self.conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    self.conn.executemany(
+      "INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)",
+      [
+        ("format", INDEX_FORMAT),
+        ("granularity", INDEX_GRANULARITY),
+        ("indexed_chunks", json.dumps(chunks)),
+        ("entries", str(entries)),
+      ],
+    )
+    self.conn.commit()
+    self.conn.close()
+    return entries
+
+  def close(self):
+    self._drain()
+    self.conn.close()
+
+
+def build_location_index(loc_sink, store, bucket, base, retries=3):
+  """Workstream 4 step 2: finalize a LocationSink into index.sqlite and upload it to
+  {base}/index.sqlite (a single-object PUT is atomic). No-op when nothing was captured —
+  we do NOT overwrite an existing index with an empty one. Returns entries indexed.
+
+  Covers only the keys written in THIS session; an incremental merge that adds to existing
+  chunks yields a partial index (correct via the read-side full-scan fallback). Full-rewrite
+  paths (precalc, pull, W5) write everything in one session, so the index is complete."""
+  if loc_sink is None:
+    return 0
+  if loc_sink.count == 0:
+    loc_sink.close()
+    return 0
+  entries = loc_sink.finalize_index()
+  key = f"{base.strip('/')}/{INDEX_SQLITE_FILE}"
+  for attempt in range(1, retries + 1):
+    try:
+      store.upload_file(loc_sink.path, bucket, key)
+      break
+    except Exception as e:
+      if attempt < retries:
+        logger.warning(f"index.sqlite upload attempt {attempt}/{retries} failed: {e}")
+        time.sleep(1)
+      else:
+        raise RuntimeError(f"index.sqlite upload failed after {retries} attempts: {e}") from e
+  logger.debug(f"[loc] uploaded index.sqlite entries={entries} -> {bucket}/{key}")
+  return entries
+
+
+def read_index_keys(store, bucket, base, tmpdir):
+  """Return the key list from {base}/index.sqlite (a loc-v1 index), or None if there is no
+  usable index. Materializes the key list — for admin/merge paths (push, inspect), NOT the
+  hot read path (which uses the bounded batched lookup instead)."""
+  local = os.path.join(tmpdir, f"idxkeys_{uuid.uuid4().hex}.sqlite")
+  try:
+    store.download_file(bucket, f"{base.strip('/')}/{INDEX_SQLITE_FILE}", local)
+  except Exception:
+    return None
+  try:
+    conn = sqlite3.connect(f"file:{local}?mode=ro", uri=True)
+    try:
+      fmt = conn.execute("SELECT v FROM meta WHERE k='format'").fetchone()
+      if not fmt or fmt[0] != INDEX_FORMAT:
+        return None
+      return [r[0] for r in conn.execute("SELECT key FROM loc")]
+    finally:
+      conn.close()
+  except Exception:
+    return None
+  finally:
+    try:
+      os.remove(local)
+    except Exception:
+      pass
+
+
+def scan_chunk_locations(store, bucket, base, tmpdir, key_cols=_INPUT_C):
+  """Rebuild-from-data counterpart to write-time capture (Option B): read the input/smiles
+  column back from every chunk_*.parquet under {base}/data/, one row group at a time (no
+  output decode), into a fresh LocationSink recording exact (key, chunk, row_group). Used to
+  rebuild the index after a delete rewrites chunks, and as the offline backfill for legacy
+  models. Bounded RAM — one chunk file + one string column at a time. Returns the sink."""
+  sink = LocationSink(os.path.join(tmpdir, f"rescan_{uuid.uuid4().hex}.sqlite"))
+  prefix = f"{hive_prefix(base)}/"
+  keys = sorted(
+    k["Key"]
+    for k in store.list_keys(bucket, prefix)
+    if k["Key"].endswith(".parquet") and "/chunk_" in k["Key"]
+  )
+  for okey in keys:
+    try:
+      cidx = int(os.path.basename(okey).split("_")[1].split(".")[0])
+    except Exception:
+      continue
+    local = os.path.join(tmpdir, f"rescan_{uuid.uuid4().hex}.parquet")
+    try:
+      store.download_file(bucket, okey, local)
+      pf = pq.ParquetFile(local)
+      kc = next((c for c in key_cols if c in pf.schema_arrow.names), None)
+      if kc is None:
+        continue
+      for rg in range(pf.metadata.num_row_groups):
+        col = pf.read_row_group(rg, columns=[kc]).column(kc).to_pylist()
+        sink.add(col, cidx, [rg] * len(col))
+    except Exception as e:
+      logger.warning(f"[rescan] skip {okey}: {e}")
+    finally:
+      try:
+        os.remove(local)
+      except Exception:
+        pass
+  return sink
+
+
 class ChunkState:
   """Manages chunked Parquet writes to MinIO for a single model.
 
@@ -524,9 +689,35 @@ class ChunkState:
     self.base = base_prefix.strip("/")
     self.tmpdir = tmpdir
     self.max_rows = max_rows
+    self.wide = is_wide(output_dimension)
     self.write_batch_rows = chunk_write_batch_rows(output_dimension)
     self.pq_ctor_kw, self.pq_wt_kw = parquet_writer_kwargs(output_dimension)
+    # {column_name: arrow type} from run_columns.csv; set by the writer once the
+    # schema is known. Empty => fall back to per-column type inference.
+    self.column_types = {}
+    # W4 location capture (wide-only): the writer attaches a LocationSink and rows'
+    # (chunk, row_group) are recorded as they are written. key_col is resolved from
+    # the schema on first capture. None => no capture (narrow / not wired).
+    self.loc_sink = None
+    self.key_col = None
     self.state = {}
+    # Wide byte-sized accumulation (Workstream 3): file/row-group sizes are
+    # derived from the first typed table (_calibrate); rows stream into one
+    # ParquetWriter kept open on local disk across flushes and uploaded at
+    # file_rows, with the trailing partial flushed by finalize_chunks().
+    self._ensured = False
+    self._calibrated = False
+    self._open_writer = None
+    self._open_path = None
+    self._open_schema = None
+    self._open_idx = None
+    self._open_rows = 0
+    # Rows accumulated across flushes but not yet cut into a row group; coalesced
+    # to whole row groups (write_batch_rows) so the byte-sized row-group target is
+    # honored regardless of how small each incoming flush is.
+    self._pending = []
+    self._pending_rows = 0
+    self._pending_schema = None
 
   def _rows_to_frame(self, rows, schema_cols):
     """Convert a list of row dicts to a DataFrame with exactly schema_cols columns."""
@@ -559,12 +750,16 @@ class ChunkState:
       return json.dumps(list(value), ensure_ascii=False)
     return str(value)
 
-  def _build_array(self, values):
+  def _build_array(self, values, col=None):
     """Build a PyArrow array from a list of Python values.
 
-    Tries native type inference first; falls back to string conversion for
-    heterogeneous or non-serialisable columns.
+    When the column has a declared type (from run_columns.csv via the writer),
+    build that exact type and hard-fail on bad data. Otherwise fall back to native
+    type inference, then to string for heterogeneous/non-serialisable columns.
     """
+    target = self.column_types.get(col) if col is not None else None
+    if target is not None:
+      return build_typed_array(values, target)
     normalized = [self._normalize_scalar(v) for v in values]
     try:
       return pa.array(normalized, from_pandas=True)
@@ -574,13 +769,13 @@ class ChunkState:
   def _frame_to_table(self, df, schema_cols):
     """Convert a DataFrame slice to a PyArrow Table with schema_cols columns."""
     df = self._ensure_cols(df, schema_cols)
-    arrays = [self._build_array(df[col].tolist()) for col in schema_cols]
+    arrays = [self._build_array(df[col].tolist(), col) for col in schema_cols]
     return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _rows_to_table(self, rows, schema_cols):
     """Convert a list of row dicts to a PyArrow Table with schema_cols columns."""
     cols = {col: [row.get(col) if isinstance(row, dict) else None for row in rows] for col in schema_cols}
-    arrays = [self._build_array(cols[col]) for col in schema_cols]
+    arrays = [self._build_array(cols[col], col) for col in schema_cols]
     return pa.Table.from_arrays(arrays, names=schema_cols)
 
   def _ensure_cols(self, df, schema_cols):
@@ -749,6 +944,148 @@ class ChunkState:
         pass
     return os_key
 
+  def _ensure_once(self):
+    """Initialise chunk state from MinIO on the first wide flush only.
+
+    Unlike the narrow path (which re-lists on every flush), the wide path keeps
+    a writer open across flushes, so it must inspect the existing chunks exactly
+    once to learn the next chunk index.
+    """
+    if not self._ensured:
+      self.ensure()
+      self._ensured = True
+
+  def _calibrate(self, table):
+    """Size the chunk file (self.max_rows) and row group from the table's measured
+    bytes/row, so both are bounded in bytes regardless of width/dtype."""
+    self._calibrated = True
+    n = table.num_rows
+    if n <= 0:
+      return
+    bytes_per_row = max(1.0, table.nbytes / n)
+    file_rows = max(1, int(WIDE_TARGET_FILE_BYTES / bytes_per_row))
+    rg_rows = max(1, int(WIDE_TARGET_ROWGROUP_BYTES / bytes_per_row))
+    rg_rows = min(rg_rows, file_rows)
+    file_rows = max(rg_rows, (file_rows // rg_rows) * rg_rows)  # whole row groups per file
+    self.max_rows = file_rows
+    self.write_batch_rows = rg_rows
+    self.pq_wt_kw["row_group_size"] = rg_rows
+    logger.debug(
+      f"[chunk] calibrated bytes/row={bytes_per_row:.0f} file_rows={file_rows} rg_rows={rg_rows}"
+    )
+
+  def _open_new_writer(self, schema):
+    """Open a fresh ParquetWriter on local disk for the next chunk index."""
+    self._open_idx = self.state["data"]["next"]
+    self._open_path = os.path.join(self.tmpdir, f"chunk_{uuid.uuid4().hex}.parquet")
+    self._open_schema = schema
+    self._open_writer = pq.ParquetWriter(self._open_path, schema, **self.pq_ctor_kw)
+    self._open_rows = 0
+
+  def _close_and_upload_open(self):
+    """Close the open chunk writer, upload it to MinIO, and advance the index."""
+    if self._open_writer is None:
+      return
+    self._open_writer.close()
+    self._open_writer = None
+    os_key = f"{hive_prefix(self.base)}/chunk_{self._open_idx}.parquet"
+    self.store.upload_file(self._open_path, self.bucket, os_key)
+    logger.debug(f"[chunk] uploaded chunk idx={self._open_idx} rows={self._open_rows}")
+    try:
+      os.remove(self._open_path)
+    except Exception:
+      pass
+    self.state["data"]["next"] = self._open_idx + 1
+    self._open_path = None
+    self._open_idx = None
+    self._open_rows = 0
+
+  def _flush_accum(self, tables):
+    """Accumulate typed tables and cut them into whole row groups (write_batch_rows) as
+    they fill, streaming into the open chunk and rolling at file_rows. This makes the
+    byte-sized row-group target real even when each incoming flush is small; pyarrow
+    never merges across write_table calls, so we coalesce here instead. The trailing
+    partial row group + chunk are flushed by finalize_chunks(); peak RAM ~= one row group."""
+    for table in tables:
+      if table.num_rows == 0:
+        continue
+      if not self._calibrated:
+        self._calibrate(table)
+      if self._pending_schema is None:
+        self._pending_schema = table.schema
+      self._pending.append(table.cast(self._pending_schema))
+      self._pending_rows += table.num_rows
+      if self._pending_rows >= self.write_batch_rows:
+        self._drain_pending(final=False)
+
+  def _drain_pending(self, final):
+    """Write accumulated rows into the open chunk in whole row groups. Mid-run writes
+    only complete row groups (write_batch_rows); the trailing partial is written when final."""
+    if not self._pending_rows:
+      return
+    rg = self.write_batch_rows
+    combined = self._pending[0] if len(self._pending) == 1 else pa.concat_tables(self._pending)
+    n_write = combined.num_rows if final else (combined.num_rows // rg) * rg
+    if n_write <= 0:
+      return
+    self._write_to_open(combined.slice(0, n_write), final=final)
+    remainder = combined.slice(n_write)
+    self._pending = [remainder.combine_chunks()] if remainder.num_rows else []
+    self._pending_rows = remainder.num_rows
+
+  def _write_to_open(self, table, final=False):
+    """Append a table to the open chunk, rolling to a new chunk at file_rows; row groups
+    are sized by pq_wt_kw['row_group_size'] (= write_batch_rows)."""
+    n = table.num_rows
+    offset = 0
+    while offset < n:
+      if self._open_writer is None:
+        self._open_new_writer(table.schema)
+      take = min(self.max_rows - self._open_rows, n - offset)
+      sub = table.slice(offset, take)
+      self._open_writer.write_table(sub.cast(self._open_schema), **self.pq_wt_kw)
+      if self.loc_sink is not None:
+        self._capture_locs(sub, self._open_idx, self._open_rows, final)
+      self._open_rows += take
+      offset += take
+      if self._open_rows >= self.max_rows:
+        self._close_and_upload_open()
+
+  def _capture_locs(self, table, chunk_idx, start_row, final):
+    """Record (key, chunk_idx, row_group) for each row in `table` into the location sink.
+
+    Rows occupy [start_row, start_row + n) within chunk_idx; row_group = row // rg_rows.
+    The W3 write path only ever cuts whole row groups (write_batch_rows) except the final
+    trailing partial, so mid-run writes MUST be row-group-aligned for the ordinal to be
+    exact. Assert it: a mislocated key is not caught by the read-side full-scan fallback
+    (that only fires on keys fully absent), so it would return a silent blank row."""
+    rg = self.write_batch_rows
+    n = table.num_rows
+    if not final and (start_row % rg or n % rg):
+      raise RuntimeError(
+        f"[loc] unaligned wide write (start_row={start_row} n={n} rg={rg}); "
+        "row-group index would mislocate keys — aborting"
+      )
+    if self.key_col is None:
+      self.key_col = next((c for c in _INPUT_C if c in table.schema.names), None)
+    if self.key_col is None:
+      return
+    keys = table.column(self.key_col).to_pylist()
+    rgs = [(start_row + i) // rg for i in range(n)]
+    self.loc_sink.add(keys, chunk_idx, rgs)
+
+  def finalize_chunks(self):
+    """Flush the trailing partial row group and open chunk. Call once after all flushes.
+
+    No-op for narrow models (which upload every chunk inside flush/flush_df).
+    """
+    if not self.wide:
+      return
+    if self._pending_rows:
+      self._drain_pending(final=True)
+    if self._open_writer is not None and self._open_rows > 0:
+      self._close_and_upload_open()
+
   def flush(self, rows, schema_cols):
     """Write a list of row dicts to MinIO as one or more Parquet chunk files.
 
@@ -760,6 +1097,11 @@ class ChunkState:
         rows: List of row dicts to write.
         schema_cols: Ordered column names for the Parquet schema.
     """
+    if self.wide:
+      self._ensure_once()
+      if rows:
+        self._flush_accum(self._iter_tables(rows, schema_cols))
+      return
     if not rows:
       return self.ensure()
     self.ensure()
@@ -815,6 +1157,11 @@ class ChunkState:
         df: DataFrame to write.
         schema_cols: Ordered column names for the Parquet schema.
     """
+    if self.wide:
+      self._ensure_once()
+      if df is not None and not df.empty:
+        self._flush_accum(self._iter_tables_df(df, schema_cols))
+      return
     if df is None or df.empty:
       return self.ensure()
     self.ensure()
@@ -889,10 +1236,16 @@ class _SinkWriter:
     self.tmpdir = tmpdir
     self.max_rows = int(max_rows or MAX_ROWS)
     self.store.ensure_bucket(self.bucket)
-    self.bi = BloomIndex(self.store, self.bucket, self.base, tmpdir)
+    # W4: wide models track molecules via index.sqlite + bloom, not the JSON index — skip
+    # loading/writing it (saves ~300 MB RAM on wide writes/pulls). Narrow keeps the JSON index.
+    self.bi = BloomIndex(self.store, self.bucket, self.base, tmpdir, load_index=not is_wide(output_dimension))
     self.chunk_state = ChunkState(
       self.store, self.bucket, self.base, tmpdir, self.max_rows, output_dimension=output_dimension
     )
+    # W4: capture real (chunk, row_group) locations during wide writes (step 2 builds
+    # index.sqlite from this). Wide-only; narrow path untouched.
+    if self.chunk_state.wide:
+      self.chunk_state.loc_sink = LocationSink(os.path.join(tmpdir, "loc_index.sqlite"))
     self.buffers = []
     self.buf_rows = 0
     self.schema_cols = None
@@ -915,6 +1268,9 @@ class _SinkWriter:
       n_in = len(df)
       if self.schema_cols is None:
         self.schema_cols = list(df.columns)
+        # Resolve declared column types from run_columns.csv (enforces the contract
+        # and self-heals string-typed numeric data on pull write-back).
+        self.chunk_state.column_types = resolve_write_types(self.model_id, self.schema_cols)
       if "input" in df.columns:
         inputs = df["input"].astype(str).str.strip()
       elif "smiles" in df.columns:
@@ -943,6 +1299,8 @@ class _SinkWriter:
       if self.buf_rows >= self.max_rows:
         self._flush()
       return added
+    except RuntimeError:
+      raise  # column-contract violation must surface, never be silently swallowed
     except Exception as e:
       logger.error(f"[sink] error: {e}")
       return 0
@@ -976,6 +1334,10 @@ class _SinkWriter:
       self.buffers = []
       self.buf_rows = 0
       del merged
+    # Upload the trailing partial wide chunk held open across flushes (no-op for narrow).
+    self.chunk_state.finalize_chunks()
+    # W4 step 2: build + upload index.sqlite from the captured locations (wide-only).
+    build_location_index(self.chunk_state.loc_sink, self.store, self.bucket, self.base)
     gc.collect()
     self.bi.persist()
     if metadata_local:
@@ -983,7 +1345,7 @@ class _SinkWriter:
         self.store.upload_file(metadata_local, self.bucket, f"{self.base}/{ACCESS_FILE}")
       except Exception:
         pass
-    entries = len(self.bi.index) if self.bi.index is not None else 0
+    entries = len(self.bi.index) if self.bi.index is not None else len(self.bi.sbf)
     chunks = len(self.chunk_state._list_chunks())
     upload_catalog_json(self.store, self.bucket, self.base, entries, chunks, self.tmpdir)
 
@@ -1264,7 +1626,7 @@ class _BaseTransfer:
         apprx_inputs.extend(chunk[mol_col].astype(str).tolist())
     with console.status("Storing to local MinIO...", spinner="dots"):
       wt.finalize(schema_cols=schema_cols)
-    actual = len(wt.bi.index) if wt.bi.index is not None else tp
+    actual = len(wt.bi.index) if wt.bi.index is not None else len(wt.bi.sbf)
     if apprx_inputs:
       try:
         post_apprx(pd.DataFrame({"input": apprx_inputs}), self.collection)

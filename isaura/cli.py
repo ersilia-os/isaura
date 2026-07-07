@@ -221,14 +221,14 @@ def read(input_file, project_name, model, output_file, version, verbose):
 
 
 @cli.command("pull")
-@apply_opts(opt_input_file, opt_project, opt_model)
+@apply_opts(opt_input_file, opt_project_req, opt_model)
 @click.option("--version", "-v", required=False, default=None, help="Model version (default: latest stored version in the remote bucket)")
 @click.option("--verbose", "-V", is_flag=True, default=False, help="Show detailed internal logs")
 def pull(input_file, project_name, model, version, verbose):
   """Pull model outputs from the cloud store to local."""
   if verbose:
     logger.set_verbosity(True)
-  pn = project_name or DEFAULT_BUCKET_NAME
+  pn = project_name
   if version is None:
     from isaura.base import MinioStore
     from isaura.const import MINIO_ENDPOINT_CLOUD, MINIO_CLOUD_AK, MINIO_CLOUD_SK
@@ -372,7 +372,17 @@ def destroy(project_name, model, version, yes):
   if model:
     with console.status(f"Deleting {model}/{version} from {project_name}...", spinner="dots"):
       n = store.delete_prefix(project_name, f"{model}/{version}/")
-    console.print(f"[green]✓[/green] [bold]{model}/{version}[/bold] deleted from [bold]{project_name}[/bold]: {n} objects removed")
+    if n == 0:
+      # Nothing matched — almost always a wrong version/model. Surface it instead of a
+      # misleading success, and show which versions do exist (e.g. "v1" vs a typo'd "1").
+      versions = sorted({
+        parts[1] for k in store.list_keys(project_name, f"{model}/")
+        if len(parts := k["Key"].split("/")) > 2 and parts[0] == model
+      })
+      hint = f" Existing versions: {', '.join(versions)}." if versions else f" No data for {model} in {project_name}."
+      console.print(f"[yellow]![/yellow] Nothing deleted — no objects under [bold]{model}/{version}[/bold] in [bold]{project_name}[/bold].{hint}")
+    else:
+      console.print(f"[green]✓[/green] [bold]{model}/{version}[/bold] deleted from [bold]{project_name}[/bold]: {n} objects removed")
   else:
     with console.status(f"Destroying {project_name}...", spinner="dots"):
       n = store.delete_prefix(project_name, "")
