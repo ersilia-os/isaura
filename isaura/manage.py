@@ -493,16 +493,17 @@ class IsauraReader:
     """Parse molecule inputs from input_csv or a DataFrame.
 
     Returns:
-        Tuple of (list_of_input_strings, column_header_name).
+        Tuple of (list_of_input_strings, column_header_name). The header is
+        always "input" (canonical output label) regardless of whether the
+        source column was named "input" or "smiles".
     """
     if df is None and hasattr(self, "_cached_wanted"):
       return self._cached_wanted
     wanted = []
     if df is not None:
       logger.debug(f"[read:wanted] parsing inputs from dataframe rows={len(df)}")
-      columns = list(df.columns)
-      header = self._resolve_input_header(columns, source="input dataframe")
-      for v in df[header].tolist():
+      in_col = self._resolve_input_header(list(df.columns), source="input dataframe")
+      for v in df[in_col].tolist():
         v = ("" if v is None else str(v)).strip()
         if v:
           wanted.append(v)
@@ -510,12 +511,15 @@ class IsauraReader:
       logger.debug(f"[read:wanted] parsing inputs from csv={self.input_csv}")
       with open(self.input_csv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        header = self._resolve_input_header(reader.fieldnames or [], source=self.input_csv)
+        in_col = self._resolve_input_header(reader.fieldnames or [], source=self.input_csv)
         for row in reader:
-          v = (row.get(header) or "").strip()
+          v = (row.get(in_col) or "").strip()
           if v:
             wanted.append(v)
-    logger.debug(f"[read:wanted] collected inputs={len(wanted)} header={header}")
+    # Downstream (streamer rename, reorder, output CSV) uses this only as the
+    # molecule column label — always emit "input", never the stored "smiles".
+    header = "input"
+    logger.debug(f"[read:wanted] collected inputs={len(wanted)} in_col={in_col} header={header}")
     if df is None:
       self._cached_wanted = (wanted, header)
     return (wanted, header)
