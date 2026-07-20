@@ -1280,6 +1280,9 @@ class _SinkWriter:
       non_blank = inputs != ""
       sbf = self.bi.sbf
       not_seen = non_blank & ~inputs.map(lambda v: v in sbf)
+      # Bloom check runs before registration, so inputs repeated within one batch all read
+      # as new; keep only the first (avoids dup rows + wide UNIQUE(key) index crash).
+      not_seen &= ~inputs.duplicated(keep="first")
       skipped_blank = int((~non_blank).sum())
       skipped_seen = int(non_blank.sum() - not_seen.sum())
       new_df = df.loc[not_seen]

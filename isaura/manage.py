@@ -354,6 +354,9 @@ class IsauraWriter:
           not_seen = non_blank & ~inputs.map(lambda v: v in sbf)
         else:
           not_seen = non_blank & ~inputs.map(self.bi.seen)
+        # Bloom check runs before registration, so inputs repeated within one batch all read
+        # as new; keep only the first (avoids dup rows + wide UNIQUE(key) index crash).
+        not_seen &= ~inputs.duplicated(keep="first")
         new_df = chunk.loc[not_seen]
         added = len(new_df)
         total += added
