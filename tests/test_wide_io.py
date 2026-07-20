@@ -993,6 +993,16 @@ def test_reorder_external_cleans_spill_dir(monkeypatch):
   assert not [d for d in after - before if d.startswith("reorder_")]
 
 
+def test_writer_requires_explicit_bucket():
+  # API must not silently default to the canonical isaura-public bucket (the CLI requires -pn).
+  # The check fires before any store/metadata work, so no mocks are needed.
+  from isaura.manage import IsauraWriter
+  with pytest.raises(ValueError, match="bucket"):
+    IsauraWriter(input_csv="x.csv", model_id="m", model_version="v1")
+  with pytest.raises(ValueError, match="bucket"):
+    IsauraWriter(input_csv="x.csv", model_id="m", model_version="v1", bucket=None)
+
+
 def test_writer_uses_small_chunks_for_wide_models(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):

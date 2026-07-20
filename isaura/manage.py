@@ -180,7 +180,14 @@ class IsauraWriter:
     self.input_csv = input_csv
     self.model_id = model_id
     self.model_version = model_version
-    self.bucket = bucket or PUB
+    # Require an explicit bucket (like the CLI's required -pn); don't silently default to
+    # the canonical isaura-public.
+    if not bucket:
+      raise ValueError(
+        "IsauraWriter requires an explicit bucket (project name), e.g. "
+        "bucket='isaura-public' or a staging project like 'ersilia-hiv'."
+      )
+    self.bucket = bucket
     self.base_prefix = get_base(self.model_id, model_version)
     self.access_key = get_acc_key(self.base_prefix)
     self.model_meta = fetch_schema_from_github(self.model_id)
