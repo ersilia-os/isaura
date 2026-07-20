@@ -1519,28 +1519,29 @@ class IsauraPush:
   def _merge_bloom_index(self, local_store, src_bucket, cloud_store, dst_bucket, tmpdir):
     """Load cloud bloom+index, merge local entries in, persist back to cloud. Returns (entries, chunks)."""
     base = get_base(self.model_id, self.model_version)
-    cloud_bi = BloomIndex(cloud_store, dst_bucket, base, os.path.join(tmpdir, "cloud"))
-    local_bi = BloomIndex(local_store, src_bucket, base, os.path.join(tmpdir, "local"))
-    if local_bi.index:
-      # Legacy/narrow: merge the JSON index + bloom as before.
-      for k, v in local_bi.index.items():
-        if cloud_bi.index is not None and k not in cloud_bi.index:
-          cloud_bi.index[k] = v
-      for k in local_bi.index:
+    # New-style wide models have index.sqlite; use its keys + load_index=False (skip the
+    # legacy cloud index.json download). read_index_keys returns None when absent.
+    local_keys = read_index_keys(local_store, src_bucket, base, tmpdir)
+    if local_keys is not None:
+      cloud_bi = BloomIndex(cloud_store, dst_bucket, base, os.path.join(tmpdir, "cloud"), load_index=False)
+      for k in local_keys:
         cloud_bi.sbf.add(k)
       cloud_bi._added = 1
       cloud_bi.persist()
-      merged_entries = len(cloud_bi.index or {})
-    else:
-      # New-style wide: local has only index.sqlite (already relayed to cloud by the file
-      # loop above). Union local's keys into the cloud bloom and keep the cloud JSON-free.
-      local_keys = read_index_keys(local_store, src_bucket, base, tmpdir) or []
-      for k in local_keys:
-        cloud_bi.sbf.add(k)
-      cloud_bi.index = None  # do not (re)create a cloud index.json for a wide model
-      cloud_bi._added = 1
-      cloud_bi.persist()  # writes cloud bloom only
       merged_entries = len(cloud_bi.sbf)
+    else:
+      # Legacy/narrow: merge the JSON index + bloom.
+      cloud_bi = BloomIndex(cloud_store, dst_bucket, base, os.path.join(tmpdir, "cloud"))
+      local_bi = BloomIndex(local_store, src_bucket, base, os.path.join(tmpdir, "local"))
+      if local_bi.index:
+        for k, v in local_bi.index.items():
+          if cloud_bi.index is not None and k not in cloud_bi.index:
+            cloud_bi.index[k] = v
+        for k in local_bi.index:
+          cloud_bi.sbf.add(k)
+      cloud_bi._added = 1
+      cloud_bi.persist()
+      merged_entries = len(cloud_bi.index or {})
     # count cloud chunks from listing
     pref = hive_prefix(base) + "/"
     cloud_chunks = sum(
