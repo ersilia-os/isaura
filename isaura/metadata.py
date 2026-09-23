@@ -246,8 +246,9 @@ def run_docker_compose(up=True) -> bool:
 
   if up:
     try:
+      image = yaml.safe_load(path.read_text())["services"]["minio"]["image"]
       check = subprocess.run(
-        ["docker", "image", "inspect", "minio/minio:latest"],
+        ["docker", "image", "inspect", image],
         capture_output=True, timeout=5,
       )
       if check.returncode != 0:
