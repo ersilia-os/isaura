@@ -252,7 +252,7 @@ def run_docker_compose(up=True) -> bool:
         capture_output=True, timeout=5,
       )
       if check.returncode != 0:
-        logger.info("MinIO image not found locally — it will be downloaded now. This may take a few minutes on first run.")
+        logger.info("MinIO image not found locally — building it from source now. This takes ~2 minutes on first run and needs internet.")
     except Exception:
       pass
     logger.info("Spinning up Docker containers...")
