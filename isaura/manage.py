@@ -1293,6 +1293,21 @@ class IsauraMolRemover:
         except Exception:
           pass
 
+  def _has_index_sqlite(self):
+    """Return True if this model has an index.sqlite in the bucket."""
+    try:
+      self.store.client.head_object(Bucket=self.bucket, Key=f"{self.base_prefix}/{INDEX_SQLITE_FILE}")
+      return True
+    except Exception:
+      return False
+
+  def _delete_index_sqlite(self):
+    """Drop index.sqlite (readers then fall back to a full scan)."""
+    try:
+      self.store.client.delete_object(Bucket=self.bucket, Key=f"{self.base_prefix}/{INDEX_SQLITE_FILE}")
+    except Exception:
+      pass
+
   def _update_access_json(self, to_remove):
     """Remove deleted molecules from the per-model access.json and re-upload."""
     acc_key = get_acc_key(self.base_prefix)
@@ -1396,6 +1411,15 @@ class IsauraMolRemover:
       bi.sbf, entries = _rebuild_bloom(bi.index.keys())
       bi._added = 1
       bi.persist()  # writes bloom + index.json
+      # Legacy models can also carry a backfilled index.sqlite; the chunk rewrite shifted its
+      # row-group locations, so rebuild it from the surviving chunks (stale = silent misses).
+      if self._has_index_sqlite():
+        sink = scan_chunk_locations(self.store, self.bucket, self.base_prefix, self.tmpdir)
+        if sink.count:
+          build_location_index(sink, self.store, self.bucket, self.base_prefix)
+        else:
+          sink.close()
+          self._delete_index_sqlite()
     else:
       # Rebuild bloom + index.sqlite from the ACTUAL surviving chunks (locations shifted
       # when rows were removed). Set index=None so persist() never re-creates a JSON index.
@@ -1410,12 +1434,7 @@ class IsauraMolRemover:
         build_location_index(sink, self.store, self.bucket, self.base_prefix)  # finalizes + uploads
       else:
         sink.close()
-        try:
-          self.store.client.delete_object(
-            Bucket=self.bucket, Key=f"{self.base_prefix}/{INDEX_SQLITE_FILE}"
-          )
-        except Exception:
-          pass
+        self._delete_index_sqlite()
 
     self._update_access_json(actually_present)
 
