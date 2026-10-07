@@ -3,6 +3,7 @@ import os
 import time
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from isaura.const import (
   DEFAULT_WRITE_BATCH_ROWS,
@@ -184,7 +185,11 @@ def build_typed_array(values, target_type):
     else:
       norm.append(v)
   try:
-    return pa.array(norm).cast(target_type)  # safe cast: raises on overflow/parse failure
+    arr = pa.array(norm)
+    if pa.types.is_integer(target_type) and pa.types.is_string(arr.type):
+      # "535.0" (ints printed by a float column) -> "535"; truly fractional text still fails
+      arr = pc.replace_substring_regex(pc.utf8_trim_whitespace(arr), r"^([+-]?\d+)\.0*$", r"\1")
+    return arr.cast(target_type)  # safe cast: raises on overflow/parse failure
   except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as e:
     raise ValueError(f"failed to cast column to {target_type}: {e}") from e
 
@@ -214,4 +219,57 @@ def resolve_write_types(model_id, schema_cols):
   types = resolve_column_types(run_columns, schema_cols)
   n_typed = sum(1 for t in types.values() if not pa.types.is_string(t))
   logger.debug(f"[dtype] {model_id}: applied run_columns types ({n_typed} numeric columns)")
+  return types
+
+
+# Lossless targets when healing numeric-as-text on copy (never downcast stored data).
+_COPY_HEAL_TYPES = {"float": pa.float64(), "integer": pa.int64(), "int": pa.int64()}
+
+
+def _declared_for_copy(model_id, output_cols):
+  """Declared run_columns type per stored output column; name drift is a warning, not fatal.
+
+  Stored names win (models keep their ingestion-time names). When names differ but the
+  count matches and every declared type is the same, that type applies to all columns.
+  """
+  from isaura.metadata import fetch_run_columns  # local import avoids any import-cycle risk
+
+  run_columns = fetch_run_columns(model_id)
+  if not run_columns:
+    logger.warning(f"[dtype] {model_id}: run_columns.csv unavailable — text columns stay text")
+    return {}
+  if set(output_cols) == set(run_columns):
+    return run_columns
+  kinds = set(run_columns.values())
+  if len(run_columns) == len(output_cols) and len(kinds) == 1:
+    logger.info(f"[dtype] {model_id}: stored names differ from run_columns; all declared {next(iter(kinds))!r}")
+    return {c: next(iter(kinds)) for c in output_cols}
+  _, msg = validate_columns(run_columns, ["key", "input", *output_cols])
+  logger.warning(f"[dtype] {model_id}: {msg} — copying as stored, text columns stay text")
+  return {}
+
+
+def resolve_copy_types(model_id, df):
+  """{column: arrow type} for copying already-stored rows (pull/copy) faithfully.
+
+  Numeric/bool columns keep their source type exactly (float32 stays float32, float64 is
+  never downcast). Only text columns that run_columns declares numeric are healed, losslessly
+  (float->float64, integer->int64). The run_columns contract is never enforced on a copy.
+  """
+  src = pa.Schema.from_pandas(df.iloc[:0], preserve_index=False)
+  types, text = {}, []
+  for col in df.columns:
+    t = src.field(col).type
+    if col in PREFIX_STRING_COLS:
+      types[col] = pa.string()
+    elif pa.types.is_floating(t) or pa.types.is_integer(t) or pa.types.is_boolean(t):
+      types[col] = t
+    else:
+      text.append(col)
+  if text:
+    declared = _declared_for_copy(model_id, [c for c in df.columns if c not in PREFIX_STRING_COLS])
+    for col in text:
+      types[col] = _COPY_HEAL_TYPES.get((declared.get(col) or "").strip().lower(), pa.string())
+  n_kept = sum(1 for c in df.columns if c not in text and c not in PREFIX_STRING_COLS)
+  logger.debug(f"[dtype] {model_id}: copy types — {n_kept} numeric kept as stored, {len(text)} text columns resolved")
   return types

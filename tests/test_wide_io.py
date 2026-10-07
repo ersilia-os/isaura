@@ -698,6 +698,90 @@ def test_validate_columns_contract():
   assert validate_columns(None, ["key", "d0"])[0]  # no contract -> ok
 
 
+def test_build_typed_array_int_from_float_text():
+  import pyarrow as pa
+  from isaura.parquet import build_typed_array
+  assert build_typed_array(["535.0", " 12 ", None, "-3.00"], pa.int64()).to_pylist() == [535, 12, None, -3]
+  with pytest.raises(ValueError):
+    build_typed_array(["1.5"], pa.int64())
+
+
+def _no_run_columns(monkeypatch):
+  def boom(model_id):
+    raise AssertionError("run_columns must not be consulted for already-numeric columns")
+  monkeypatch.setattr("isaura.metadata.fetch_run_columns", boom)
+
+
+def test_resolve_copy_types_keeps_stored_numeric_types(monkeypatch):
+  import numpy as np
+  from isaura.parquet import resolve_copy_types
+  _no_run_columns(monkeypatch)
+  df = pd.DataFrame({
+    "key": ["k"], "input": ["C"],
+    "f32": np.array([0.1], dtype=np.float32), "f64": [0.07906478055842883], "i64": [535], "b": [True],
+  })
+  t = resolve_copy_types("eosTEST", df)
+  assert t["key"] == pa.string() and t["input"] == pa.string()
+  assert t["f32"] == pa.float32() and t["f64"] == pa.float64() and t["i64"] == pa.int64() and t["b"] == pa.bool_()
+
+
+def test_resolve_copy_types_heals_text_losslessly_and_tolerates_renames(monkeypatch):
+  from isaura.parquet import resolve_copy_types
+  text = lambda cols: pd.DataFrame({"key": ["k"], "input": ["C"], **{c: ["1.0"] for c in cols}})  # noqa: E731
+  # names match: declared types, widened to lossless targets
+  monkeypatch.setattr("isaura.metadata.fetch_run_columns", lambda m: {"d0": "float", "d1": "integer"})
+  t = resolve_copy_types("eosTEST", text(["d0", "d1"]))
+  assert t["d0"] == pa.float64() and t["d1"] == pa.int64()
+  # renamed (dim_* stored, feat_* declared), all float: applied, no error
+  monkeypatch.setattr("isaura.metadata.fetch_run_columns", lambda m: {"feat_0": "float", "feat_1": "float"})
+  t = resolve_copy_types("eosTEST", text(["dim_0", "dim_1"]))
+  assert t["dim_0"] == pa.float64() and t["dim_1"] == pa.float64()
+  # ambiguous mismatch: copied as stored (text), never a contract error
+  monkeypatch.setattr("isaura.metadata.fetch_run_columns", lambda m: {"a": "float", "b": "integer"})
+  t = resolve_copy_types("eosTEST", text(["x", "y"]))
+  assert t["x"] == pa.string() and t["y"] == pa.string()
+
+
+class _SinkStore(LocalStore):
+  def ensure_bucket(self, bucket):
+    return None
+
+
+def _sink_roundtrip(tmp_path, df, model_id="eosTEST", output_dimension=None):
+  from isaura.base import _SinkWriter
+  store = _SinkStore(str(tmp_path))
+  w = _SinkWriter(store, "bucket", model_id, "v1", str(tmp_path / "tmp"), max_rows=1000, output_dimension=output_dimension)
+  w.add_rows(df)
+  w.finalize(schema_cols=list(df.columns))
+  keys = sorted(k["Key"] for k in store.list_keys("bucket", f"{model_id}/v1/tranches/data/"))
+  return pq.read_table(os.path.join(str(tmp_path), "bucket", keys[0]))
+
+
+def test_sink_writer_copy_keeps_float64_float32_int64_exactly(tmp_path, monkeypatch):
+  import numpy as np
+  _no_run_columns(monkeypatch)
+  f64 = [0.07906478055842883, 0.15336530280627494, 0.14560787556227472]
+  f32 = np.array([1.86261, 0.06811386, -0.006400453], dtype=np.float32)
+  df = pd.DataFrame({"key": ["a", "b", "c"], "input": ["CC", "CO", "CN"], "f64": f64, "f32": f32, "i64": [535, 431, 546]})
+  t = _sink_roundtrip(tmp_path, df)
+  assert t.schema.field("f64").type == pa.float64()  # previously downcast to float32
+  assert t.schema.field("f32").type == pa.float32()
+  assert t.schema.field("i64").type == pa.int64()
+  assert t.column("f64").to_pylist() == f64
+  assert np.array_equal(t.column("f32").to_numpy(), f32)
+
+
+def test_sink_writer_copy_renamed_wide_model_no_contract_error(tmp_path, monkeypatch):
+  import numpy as np
+  monkeypatch.setattr("isaura.metadata.fetch_run_columns", lambda m: {f"feat_{j:03d}": "float" for j in range(120)})
+  X = np.random.default_rng(0).standard_normal((4, 120))
+  df = pd.DataFrame({"key": list("abcd"), "input": ["C", "CC", "CCC", "CCCC"], **{f"dim_{j:03d}": X[:, j] for j in range(120)}})
+  t = _sink_roundtrip(tmp_path, df, output_dimension=120)
+  assert t.column_names[2] == "dim_000"  # stored names kept
+  assert t.schema.field("dim_000").type == pa.float64()
+  assert np.array_equal(np.column_stack([t.column(f"dim_{j:03d}").to_numpy() for j in range(120)]), X)
+
+
 def test_reader_wide_model_uses_fast_stream_then_reorders(monkeypatch):
   class FakeStore:
     def __init__(self, *args, **kwargs):

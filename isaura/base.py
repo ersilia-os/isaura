@@ -30,7 +30,7 @@ from isaura.helpers import (
   chunk_write_batch_rows,
   parquet_writer_kwargs,
   build_typed_array,
-  resolve_write_types,
+  resolve_copy_types,
   fetch_schema_from_github,
   get_acc_key,
   get_base,
@@ -1268,9 +1268,9 @@ class _SinkWriter:
       n_in = len(df)
       if self.schema_cols is None:
         self.schema_cols = list(df.columns)
-        # Resolve declared column types from run_columns.csv (enforces the contract
-        # and self-heals string-typed numeric data on pull write-back).
-        self.chunk_state.column_types = resolve_write_types(self.model_id, self.schema_cols)
+        # pull/copy re-write already-stored rows: keep source types exactly, heal only
+        # numeric-as-text losslessly; the run_columns contract is for new ingestions only.
+        self.chunk_state.column_types = resolve_copy_types(self.model_id, df)
       if "input" in df.columns:
         inputs = df["input"].astype(str).str.strip()
       elif "smiles" in df.columns:
