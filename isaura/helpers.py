@@ -3,7 +3,7 @@ from isaura.logging import logger, console, Logger  # noqa: F401
 from isaura.utils import *  # noqa: F401,F403
 from isaura.parquet import (  # noqa: F401
   build_typed_array, chunk_row_limit, chunk_write_batch_rows, is_wide,
-  list_parquet_keys, parquet_writer_kwargs, resolve_write_types,
+  list_parquet_keys, parquet_writer_kwargs, resolve_write_types, resolve_copy_types,
 )
 from isaura.query import query, query_batched, chunked_query_batched  # noqa: F401
 from isaura.stream import stream_parquet_filtered, stream_parquet_filtered_ordered  # noqa: F401
