@@ -28,6 +28,7 @@ from isaura.helpers import (
   MINIO_CLOUD_SK as mcsk,
   MINIO_PRIV_CLOUD_AK as mcpak,
   MINIO_PRIV_CLOUD_SK as mcpsk,
+  PUSH_WORKERS,
   ReadProgress,
   StreamingCsvSink,
   WRITE_INPUT_CHUNK_ROWS,
@@ -1608,7 +1609,7 @@ class IsauraPush:
         with logger.console.status(
           f"Pushing {len(keys)} objects to cloud ({access})...", spinner="dots"
         ):
-          with ThreadPoolExecutor(max_workers=4) as pool:
+          with ThreadPoolExecutor(max_workers=PUSH_WORKERS) as pool:
             futs = [
               pool.submit(self._relay_file, local_store, src_bucket, cloud_store, dst_bucket, k, tmpdir)
               for k in keys
@@ -1622,6 +1623,14 @@ class IsauraPush:
         for err in errors:
           logger.warning(err)
         logger.debug(f"[push] {access} done: {done}/{len(keys)} objects uploaded to cloud")
+        if errors:
+          # Do not merge the bloom filter / catalog: the cloud would then list molecules
+          # whose data never arrived. Re-running push uploads every object again.
+          logger.error(
+            f"{len(errors)}/{len(keys)} objects failed to upload for "
+            f"{self.model_id}/{self.model_version} ({access}). Aborting push."
+          )
+          sys.exit(1)
         with logger.console.status("Merging bloom filter and index...", spinner="dots"):
           merged_entries, cloud_chunks = self._merge_bloom_index(
             local_store, src_bucket, cloud_store, dst_bucket, tmpdir
