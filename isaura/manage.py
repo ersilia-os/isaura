@@ -552,7 +552,8 @@ class IsauraReader:
     Returns:
         Tuple of (start_time, resolved_wanted_list, header_column_name).
     """
-    if hasattr(self, "_cached_prepare"):
+    # Only the input_csv path (df=None) is cached; a df may differ on every call.
+    if df is None and hasattr(self, "_cached_prepare"):
       return self._cached_prepare
     index = None
     t0 = time.time()
@@ -583,8 +584,9 @@ class IsauraReader:
         sys.exit(1)
     prep_dt = time.time() - t0
     logger.debug(f"[read:prepare] ready inputs={len(wanted)} header={header} prep_time={prep_dt:.2f}s")
-    self._cached_prepare = (t0, wanted, header)
-    return self._cached_prepare
+    if df is None:
+      self._cached_prepare = (t0, wanted, header)
+    return (t0, wanted, header)
 
   def _detect_parquet_col(self, header):
     """Return the molecule column name actually used in stored Parquet files.
@@ -728,9 +730,12 @@ class IsauraReader:
     """
     if os.getenv("ISAURA_DISABLE_INDEX_PRUNE"):
       return None
-    if not hasattr(self, "_cached_locations"):
-      self._cached_locations = self._compute_wide_locations(wanted)
-    return self._cached_locations
+    # Reuse the allow-set only for the same `wanted` list it was built from; a reader
+    # reused across read(df=...) calls gets a new list each time.
+    cached = getattr(self, "_cached_locations", None)
+    if cached is None or cached[0] is not wanted:
+      self._cached_locations = (wanted, self._compute_wide_locations(wanted))
+    return self._cached_locations[1]
 
   def _compute_wide_locations(self, wanted):
     local = os.path.join(self.tmpdir, f"index_{uuid.uuid4().hex}.sqlite")

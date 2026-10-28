@@ -1432,3 +1432,83 @@ def test_stream_parquet_filtered_early_exit_bounds_downloads(monkeypatch, tmp_pa
   # Early-exit caps wasted downloads at the prefetch window past the resolving file.
   assert len(store.downloaded) < len(files)
   assert len(store.downloaded) <= 1 + 3
+
+
+def _fake_reader(monkeypatch, tmp_path):
+  class FakeStore:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
+  class FakeDuck:
+    def __init__(self, *args, **kwargs):
+      self.con = object()
+
+  class FakeBloom:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def seen(self, v):
+      return True
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeStore)
+  monkeypatch.setattr("isaura.manage.DuckDBMinio", FakeDuck)
+  monkeypatch.setattr("isaura.manage.BloomIndex", FakeBloom)
+  csv_path = tmp_path / "inputs.csv"
+  csv_path.write_text("input\nc1\nc2\n")
+  return IsauraReader(
+    model_id="m", model_version="v1", bucket="bucket", input_csv=str(csv_path), approximate=False
+  )
+
+
+def test_reader_prepare_read_uses_each_df(monkeypatch, tmp_path):
+  # Issue #29: a reader reused across read(df=...) calls must resolve each df, not the first.
+  reader = _fake_reader(monkeypatch, tmp_path)
+  _, first, _ = reader._prepare_read(df=pd.DataFrame({"input": ["a", "b"]}))
+  _, second, _ = reader._prepare_read(df=pd.DataFrame({"input": ["x", "y", "z"]}))
+  assert first == ["a", "b"]
+  assert second == ["x", "y", "z"]
+
+
+def test_reader_prepare_read_caches_input_csv(monkeypatch, tmp_path):
+  # pull calls _prepare_read() before read_batched(); the input_csv path stays cached.
+  reader = _fake_reader(monkeypatch, tmp_path)
+  _, a, _ = reader._prepare_read()
+  _, b, _ = reader._prepare_read()
+  assert a == ["c1", "c2"]
+  assert a is b
+  _, c, _ = reader._prepare_read(df=pd.DataFrame({"input": ["x"]}))
+  assert c == ["x"]
+  _, d, _ = reader._prepare_read()
+  assert d is a  # a df call does not overwrite the input_csv cache
+
+
+def test_wide_locations_recomputed_for_new_wanted(tmp_path, monkeypatch):
+  # Issue #29 (wide models): the row-group allow-set must follow the current inputs, or
+  # molecules outside the first call's row groups are silently dropped.
+  import types
+  store, base = _build_wide_store_with_index(tmp_path, monkeypatch, n=400)
+  stub = _reader_stub(store, base, tmp_path)
+  calls = []
+
+  def compute(wanted):
+    calls.append(list(wanted))
+    return IsauraReader._compute_wide_locations(stub, wanted)
+
+  stub._compute_wide_locations = compute
+  wide_locations = types.MethodType(IsauraReader._wide_locations, stub)
+
+  first = [f"s{i}" for i in range(8)]
+  second = [f"s{i}" for i in range(392, 400)]
+  locs_first = wide_locations(first)
+  assert wide_locations(first) is locs_first  # same list -> cached
+  locs_second = wide_locations(second)
+  assert calls == [first, second]
+  assert locs_second != locs_first
+  got = _concat_stream(store, base, second, locs_second)
+  assert list(got["input"]) == sorted(second)
