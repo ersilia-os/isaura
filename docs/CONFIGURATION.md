@@ -96,6 +96,7 @@ MINIO_PRIV_CLOUD_SK="<secret_key>"
 | `BATCH`             |   `10000` | Batch size for streaming inputs to the NN service.             |
 | `FLUSH_EVERY`       |   `10000` | Flush frequency for NN streaming inserts.                      |
 | `MAX_ROWS`          | `2000000` | Hard cap used by the writer for buffer/flush logic (internal). |
+| `PUSH_WORKERS`      |       `4` | Files `push` uploads in parallel; lower it if throttled.       |
 
 ### 🔎 Indexing & deduplication
 

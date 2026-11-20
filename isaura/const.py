@@ -162,6 +162,9 @@ WIDE_PARQUET_WRITE_STATISTICS = os.getenv("WIDE_PARQUET_WRITE_STATISTICS", "fals
 MINIO_MULTIPART_THRESHOLD = int(os.getenv("MINIO_MULTIPART_THRESHOLD", str(8 * 1024 * 1024)))
 MINIO_MULTIPART_CHUNKSIZE = int(os.getenv("MINIO_MULTIPART_CHUNKSIZE", str(8 * 1024 * 1024)))
 MINIO_MAX_CONCURRENCY = int(os.getenv("MINIO_MAX_CONCURRENCY", "10"))
+# Files uploaded in parallel by `isaura push` (each one split into up to MINIO_MAX_CONCURRENCY
+# parallel parts). Lower it when the cloud answers "please reduce your request rate".
+PUSH_WORKERS = int(os.getenv("PUSH_WORKERS", "4"))
 # urllib3 connection-pool size for the boto3 S3 client. Default is botocore's 10,
 # which throttles concurrent transfers (each wide download worker can open up to
 # MINIO_MAX_CONCURRENCY part connections). Size it off the busiest path — the
