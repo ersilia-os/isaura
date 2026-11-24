@@ -402,7 +402,10 @@ class IsauraWriter:
     console.print(f"[green]✓[/green] [bold]{self.model_id}/{self.model_version}[/bold] → [bold]{self.bucket}[/bold]: [bold]{actual_new}[/bold] molecules written{dupes_str}")
 
   def close(self):
-    """Release temporary directories created during construction."""
+    """Close the location sink and release temporary directories created during construction."""
+    loc_sink = getattr(self.chunk_state, "loc_sink", None)
+    if loc_sink is not None:
+      loc_sink.close()
     release_temp_dirs(self)
 
   def __enter__(self):
@@ -1424,8 +1427,8 @@ class IsauraMolRemover:
         if sink.count:
           build_location_index(sink, self.store, self.bucket, self.base_prefix)
         else:
-          sink.close()
           self._delete_index_sqlite()
+        sink.close()
     else:
       # Rebuild bloom + index.sqlite from the ACTUAL surviving chunks (locations shifted
       # when rows were removed). Set index=None so persist() never re-creates a JSON index.
@@ -1439,8 +1442,8 @@ class IsauraMolRemover:
       if entries > 0:
         build_location_index(sink, self.store, self.bucket, self.base_prefix)  # finalizes + uploads
       else:
-        sink.close()
         self._delete_index_sqlite()
+      sink.close()
 
     self._update_access_json(actually_present)
 

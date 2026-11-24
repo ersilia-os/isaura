@@ -47,6 +47,28 @@ def _configure_conn(conn, tmpdir):
   return mem_lim, threads
 
 
+def _arrow_reader(conn, sql, batch_size):
+  """Stream a query as Arrow batches via the relation API, which works on duckdb 1.x and 2.x
+  (2.x dropped conn.execute(...).fetch_record_batch). Prefers the newer to_arrow_reader."""
+  rel = conn.sql(sql)
+  make = getattr(rel, "to_arrow_reader", None) or rel.fetch_arrow_reader
+  return make(batch_size)
+
+
+def _release(conn, reader, view):
+  """Close the reader (duckdb 2 keeps the connection busy until then), then drop the view.
+  Never raises, so cleanup can't mask the error that got us here."""
+  if reader is not None:
+    try:
+      reader.close()
+    except Exception as e:
+      logger.warning(f"[query] closing reader failed: {type(e).__name__}: {e}")
+  try:
+    conn.unregister(view)
+  except Exception as e:
+    logger.warning(f"[query] unregister {view} failed: {type(e).__name__}: {e}")
+
+
 def _src_expr(file_glob):
   """Build a DuckDB read_parquet() SQL expression from a glob string or list of URIs."""
   if isinstance(file_glob, list):
@@ -116,15 +138,17 @@ def query_batched(
   n_batches = 0
   t0 = time.perf_counter()
 
+  reader = None
   try:
-    for batch in conn.execute(sql).fetch_record_batch(batch_size):
+    reader = _arrow_reader(conn, sql, batch_size)
+    for batch in reader:
       n_batches += 1
       df = batch.to_pandas(split_blocks=True, self_destruct=True)
       total_rows += len(df)
       logger.debug(f"[query_batched] batch#{n_batches} rows={len(df)} total={total_rows} rss={rss_mb():.0f}MB")
       yield df
   finally:
-    conn.unregister("__wanted_inputs")
+    _release(conn, reader, "__wanted_inputs")
 
   dt = time.perf_counter() - t0
   logger.debug(f"[query_batched] done rows={total_rows} batches={n_batches} elapsed={dt:.2f}s rss={rss_mb():.0f}MB")
@@ -197,8 +221,10 @@ def chunked_query_batched(
 
     conn.register("__slice", wdf)
     slice_rows = {}
+    reader = None
     try:
-      for batch in conn.execute(sql).fetch_record_batch(batch_size):
+      reader = _arrow_reader(conn, sql, batch_size)
+      for batch in reader:
         df = batch.to_pandas(split_blocks=True, self_destruct=True)
         if preserve_order:
           for _, row in df.iterrows():
@@ -210,7 +236,7 @@ def chunked_query_batched(
           yield df
         del df
     finally:
-      conn.unregister("__slice")
+      _release(conn, reader, "__slice")
 
     if preserve_order and slice_rows:
       ordered = []
