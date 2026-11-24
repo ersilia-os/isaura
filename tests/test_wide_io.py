@@ -1512,3 +1512,59 @@ def test_wide_locations_recomputed_for_new_wanted(tmp_path, monkeypatch):
   assert locs_second != locs_first
   got = _concat_stream(store, base, second, locs_second)
   assert list(got["input"]) == sorted(second)
+
+
+def _local_wide_writer(tmp_path, monkeypatch, ncols=150):
+  # Real IsauraWriter/TrancheState/BloomIndex on a local fake store (no MinIO, no GitHub).
+  class FakeMinio(LocalStore):
+    def __init__(self, *args, **kwargs):
+      super().__init__(str(tmp_path / "store"))
+
+    def require_bucket(self, bucket):
+      return None
+
+    def ensure_bucket(self, bucket):
+      return None
+
+  monkeypatch.setattr("isaura.manage.MinioStore", FakeMinio)
+  monkeypatch.setattr("isaura.manage.fetch_schema_from_github", lambda model_id: {"OutputDimension": ncols})
+  monkeypatch.setattr("isaura.manage.resolve_write_types", lambda model_id, cols: {})
+  return IsauraWriter(input_csv="unused.csv", model_id="eosxxxx", model_version="v1", bucket="bucket")
+
+
+def _index_keys(writer):
+  import sqlite3
+  path = os.path.join(writer.store.root, "bucket", writer.base_prefix, "index.sqlite")
+  conn = sqlite3.connect(path)
+  try:
+    return {k for (k,) in conn.execute("SELECT key FROM loc")}
+  finally:
+    conn.close()
+
+
+def test_wide_writer_supports_repeated_write_calls(tmp_path, monkeypatch):
+  # Issue #32: a second write() on one wide writer hit a closed LocationSink and crashed
+  # after uploading its chunk, leaving rows the index/bloom never learned about.
+  with _local_wide_writer(tmp_path, monkeypatch) as writer:
+    cols = ["input"] + [f"d{j}" for j in range(150)]
+    writer.write(df=pd.DataFrame(_wide_chunk_rows(20, start=0), columns=cols), show_progress=False)
+    writer.write(df=pd.DataFrame(_wide_chunk_rows(20, start=20), columns=cols), show_progress=False)
+    writer.write(df=pd.DataFrame(_wide_chunk_rows(20, start=40), columns=cols), show_progress=False)
+    assert _index_keys(writer) == {f"s{i}" for i in range(60)}
+    assert all(f"s{i}" in writer.bi.sbf for i in range(60))
+  stored = pd.concat(_read_all_chunks(tmp_path / "store", base=writer.base_prefix))
+  assert sorted(stored["input"]) == sorted(f"s{i}" for i in range(60))
+
+
+def test_wide_writer_survives_all_duplicate_write(tmp_path, monkeypatch):
+  # Issue #32: a write() that adds nothing (all already stored) closed the sink, so the
+  # writer's next write() crashed.
+  cols = ["input"] + [f"d{j}" for j in range(150)]
+  first = pd.DataFrame(_wide_chunk_rows(10, start=0), columns=cols)
+  with _local_wide_writer(tmp_path, monkeypatch) as writer:
+    writer.write(df=first, show_progress=False)
+  with _local_wide_writer(tmp_path, monkeypatch) as writer:
+    writer.write(df=first, show_progress=False)  # all duplicates of stored rows
+    writer.write(df=pd.DataFrame(_wide_chunk_rows(10, start=10), columns=cols), show_progress=False)
+    assert _index_keys(writer) >= {f"s{i}" for i in range(10, 20)}
+    assert all(f"s{i}" in writer.bi.sbf for i in range(20))

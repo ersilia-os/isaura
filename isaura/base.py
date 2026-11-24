@@ -544,7 +544,7 @@ class LocationSink:
   def finalize_index(self):
     """Turn the raw loc table into the queryable index: a unique key index for fast
     batched lookups + a `meta` marker table (format/granularity/indexed_chunks/entries).
-    Commits and closes; the file at self.path is then ready to upload. Returns entries."""
+    Commits but stays open, so a writer can keep adding across write() calls. Returns entries."""
     self._drain()
     self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_loc_key ON loc(key)")
     (entries,) = self.conn.execute("SELECT COUNT(*) FROM loc").fetchone()
@@ -560,12 +560,14 @@ class LocationSink:
       ],
     )
     self.conn.commit()
-    self.conn.close()
     return entries
 
   def close(self):
+    if self.conn is None:
+      return
     self._drain()
     self.conn.close()
+    self.conn = None
 
 
 def build_location_index(loc_sink, store, bucket, base, retries=3):
@@ -573,13 +575,13 @@ def build_location_index(loc_sink, store, bucket, base, retries=3):
   {base}/index.sqlite (a single-object PUT is atomic). No-op when nothing was captured —
   we do NOT overwrite an existing index with an empty one. Returns entries indexed.
 
-  Covers only the keys written in THIS session; an incremental merge that adds to existing
-  chunks yields a partial index (correct via the read-side full-scan fallback). Full-rewrite
-  paths (precalc, pull, W5) write everything in one session, so the index is complete."""
+  Covers only the keys this sink captured (one writer, across all its write() calls); an
+  incremental merge that adds to existing chunks yields a partial index (correct via the
+  read-side full-scan fallback). Full-rewrite paths (precalc, pull, W5) write everything
+  in one session, so the index is complete."""
   if loc_sink is None:
     return 0
   if loc_sink.count == 0:
-    loc_sink.close()
     return 0
   entries = loc_sink.finalize_index()
   key = f"{base.strip('/')}/{INDEX_SQLITE_FILE}"
@@ -1341,6 +1343,8 @@ class _SinkWriter:
     self.chunk_state.finalize_chunks()
     # W4 step 2: build + upload index.sqlite from the captured locations (wide-only).
     build_location_index(self.chunk_state.loc_sink, self.store, self.bucket, self.base)
+    if self.chunk_state.loc_sink is not None:
+      self.chunk_state.loc_sink.close()
     gc.collect()
     self.bi.persist()
     if metadata_local:
